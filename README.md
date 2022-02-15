@@ -1,6 +1,10 @@
 # bevy_slinet
 A simple networking plugin for bevy.
 
+[![docs.rs](https://img.shields.io/docsrs/bevy_slinet)](https://docs.rs/bevy_slinet)
+[![Crates.io](https://img.shields.io/crates/v/bevy_slinet)](https://crates.io/crates/bevy_slinet)
+[![Crates.io](https://img.shields.io/crates/l/bevy_slinet)](https://github.com/Sliman4/bevy_slinet/tree/main/LICENSE)
+
 ## Features
 - You can choose TCP or UDP protocol, with websocket (or other wasm-friendly solution?) planned. Adding your own protocols is as easy as implementing a few traits.
 - Multiple clients/servers with different configs (config is a collection of a protocol, packet types, a serializer, etc.)
