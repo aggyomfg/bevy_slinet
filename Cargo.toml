@@ -10,6 +10,7 @@ homepage = "https://github.com/Sliman4/bevy_slinet#readme"
 documentation = "https://docs.rs/bevy_slinet"
 description = "A simple networking plugin for bevy."
 categories = [ "game-development", "network-programming" ]
+keywords = ["gamedev", "networking", "bevy"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
