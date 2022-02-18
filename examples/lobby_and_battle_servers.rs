@@ -170,7 +170,6 @@ fn battle_server_packet_handler(
 }
 
 fn lobby_client_packet_handler(
-    mut commands: Commands,
     mut event_reader: EventReader<client::PacketReceiveEvent<LobbyConfig>>,
     mut event_writer: EventWriter<ConnectionRequestEvent<BattleConfig>>,
 ) {
@@ -183,7 +182,7 @@ fn lobby_client_packet_handler(
             LobbyServerPacket::BattleServer(address) => {
                 // Disconnect from the lobby server
                 println!("Disconnecting from the lobby server");
-                commands.remove_resource::<ClientConnection<LobbyConfig>>();
+                event.connection.disconnect();
                 // Connect to the battle server
                 println!("Connecting to the battle server");
                 event_writer.send(ConnectionRequestEvent::new(address));

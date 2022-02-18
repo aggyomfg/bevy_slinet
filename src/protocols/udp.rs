@@ -1,78 +1,85 @@
 //! UDP protocol implementation based on [`std::net`]. You can enable it by adding `udp` feature.
 // The implementation is very poor and should be rewritten ASAP.
 
-use std::io::{Error, ErrorKind, Write};
-use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::future::Future;
+use std::io;
+use std::io::ErrorKind;
+use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
+use async_trait::async_trait;
 use dashmap::DashMap;
+use futures::task::AtomicWaker;
+use tokio::net::{ToSocketAddrs, UdpSocket};
+use tokio::sync::Mutex;
 
-use crate::protocol::{ClientStream, Listener, NetworkStream, Protocol, ServerStream};
+use crate::protocol::{
+    ClientStream, Listener, NetworkStream, ReadStream, ServerStream, WriteStream,
+};
+use crate::Protocol;
 
-type ListenerCache = Arc<DashMap<SocketAddr, Vec<u8>>>;
+const BUFFER_SIZE: usize = u16::MAX as usize;
 
-/// UDP protocol.
 pub struct UdpProtocol;
 
+#[async_trait]
 impl Protocol for UdpProtocol {
     type Listener = UdpNetworkListener;
-    type ServerStream = ListenerReader;
-    type ClientStream = WrappedUdpSocket;
+    type ServerStream = UdpServerStream;
+    type ClientStream = UdpClientStream;
 
-    fn bind<A>(addr: A) -> std::io::Result<Self::Listener>
+    async fn bind<A>(addr: A) -> std::io::Result<Self::Listener>
     where
-        A: ToSocketAddrs,
+        A: ToSocketAddrs + Send,
     {
         Ok(UdpNetworkListener {
-            socket: UdpSocket::bind(addr)?,
-            cache: Arc::new(DashMap::new()),
+            socket: Arc::new(UdpSocket::bind(addr).await?),
+            tasks: DashMap::new(),
         })
     }
 }
 
-/// A UDP listener. Packets that have length greater than max allowed by UDP may fail.
-/// It implements a "cache" that is used to disambiguate packets from different addresses
-/// because UDP doesn't have a stable connection.
-pub struct UdpNetworkListener {
-    socket: UdpSocket,
-    cache: ListenerCache,
+struct Inner {
+    waker: AtomicWaker,
+    bytes: Mutex<Vec<u8>>,
 }
 
-impl Listener<ListenerReader> for UdpNetworkListener {
-    fn accept(&self) -> std::io::Result<(ListenerReader, SocketAddr)> {
-        // Let's hope that the other side didn't send more data than MAX_UDP_PACKET_SIZE.
-        // There should be a better solution (a pr is welcome), but anyway, UDP packets can
-        // be lost and the app should be okay with that, or use alternative protocols like TCP
-        let mut buf = [0; MAX_UDP_PACKET_SIZE];
-        let (amt, addr) = self.socket.recv_from(&mut buf)?;
-        if let Some(mut cache) = self.cache.get_mut(&addr) {
-            // add the received data to cache and ListenerReader will read from this cache
-            cache.extend_from_slice(&buf[..amt]);
-            Err(std::io::Error::new(
-                ErrorKind::AlreadyExists,
-                "Data received from an existing connection",
-            ))
-        } else if amt == 0 {
-            // an empty packet is used to acknowledge server that the client has connected
-            self.cache.insert(addr, Vec::new());
-            Ok((
-                ListenerReader {
-                    socket: self.socket.try_clone().unwrap(),
-                    addr,
-                    cache: Arc::clone(&self.cache),
-                },
-                addr,
-            ))
-        } else {
-            Err(std::io::Error::new(
-                ErrorKind::InvalidData,
-                "Received something other than an empty handshake packet",
-            ))
-        }
-    }
+#[derive(Clone)]
+struct UdpRead(Arc<Inner>);
 
-    fn set_nonblocking(&self) {
-        self.socket.set_nonblocking(true).unwrap()
+pub struct UdpNetworkListener {
+    socket: Arc<UdpSocket>,
+    tasks: DashMap<SocketAddr, UdpRead>,
+}
+
+#[async_trait]
+impl Listener<UdpServerStream> for UdpNetworkListener {
+    async fn accept(&self) -> std::io::Result<UdpServerStream> {
+        let mut buf = [0; BUFFER_SIZE];
+        loop {
+            let (bytes, address) = self.socket.recv_from(&mut buf).await?;
+            let bytes = &buf[..bytes];
+            if let Some(task) = self.tasks.get(&address) {
+                {
+                    let mut task_bytes = task.0.bytes.lock().await;
+                    task_bytes.extend(bytes);
+                }
+                task.0.waker.wake();
+            } else {
+                let new_task = UdpRead(Arc::new(Inner {
+                    waker: AtomicWaker::new(),
+                    bytes: Mutex::new(Vec::new()),
+                }));
+                self.tasks.insert(address, new_task.clone());
+                return Ok(UdpServerStream {
+                    task: new_task,
+                    peer_addr: address,
+                    socket: Arc::clone(&self.socket),
+                });
+            }
+        }
     }
 
     fn address(&self) -> SocketAddr {
@@ -80,150 +87,197 @@ impl Listener<ListenerReader> for UdpNetworkListener {
     }
 }
 
-/// A wrapped [UDP socket](std::net::UdpSocket).
-pub struct WrappedUdpSocket {
-    socket: UdpSocket,
-    cache: Vec<u8>,
+pub struct UdpServerStream {
+    task: UdpRead,
+    peer_addr: SocketAddr,
+    socket: Arc<UdpSocket>,
 }
 
-/// A maximum number of bytes sent per one UDP packets, including serialized packet length.
-pub const MAX_UDP_PACKET_SIZE: usize = 65507;
+#[async_trait]
+impl NetworkStream for UdpServerStream {
+    type ReadHalf = UdpStreamReadHalf;
+    type WriteHalf = UdpServerWriteHalf;
 
-impl ClientStream for WrappedUdpSocket {
-    fn connect<A>(addr: A) -> std::io::Result<Self>
+    async fn into_split(self) -> io::Result<(Self::ReadHalf, Self::WriteHalf)> {
+        Ok((
+            UdpStreamReadHalf(self.task.clone()),
+            UdpServerWriteHalf {
+                peer_addr: self.peer_addr(),
+                socket: self.socket,
+            },
+        ))
+    }
+
+    fn peer_addr(&self) -> SocketAddr {
+        self.peer_addr
+    }
+
+    fn local_addr(&self) -> SocketAddr {
+        self.socket.local_addr().unwrap()
+    }
+}
+
+pub struct UdpStreamReadHalf(UdpRead);
+
+#[async_trait]
+impl ReadStream for UdpStreamReadHalf {
+    fn read_exact<'life0, 'life1, 'async_trait>(
+        &'life0 mut self,
+        buffer: &'life1 mut [u8],
+    ) -> Pin<Box<dyn Future<Output = Result<(), std::io::Error>> + std::marker::Send + 'async_trait>>
     where
-        A: ToSocketAddrs,
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
     {
-        let socket = UdpSocket::bind("127.0.0.1:0")?;
-        socket.connect(&addr)?;
-        socket.send(&[])?;
-        Ok(WrappedUdpSocket {
-            socket,
-            cache: Vec::new(),
+        Box::pin(UdpReadTask {
+            read: self.0.clone(),
+            buffer,
         })
     }
 }
 
-impl ServerStream for ListenerReader {}
+pub struct UdpReadTask<'a> {
+    read: UdpRead,
+    buffer: &'a mut [u8],
+}
 
-impl NetworkStream for ListenerReader {
-    fn set_nonblocking(&self) {
-        self.socket.set_nonblocking(true).unwrap()
-    }
+impl Future for UdpReadTask<'_> {
+    type Output = io::Result<()>;
 
-    fn try_peek_exact(&self, buffer: &mut [u8]) -> std::io::Result<()> {
-        if let Some(cache) = self.cache.get(&self.addr) {
-            if cache.len() < buffer.len() {
-                Err(std::io::Error::from(ErrorKind::WouldBlock))
-            } else {
-                buffer.clone_from_slice(&cache[..buffer.len()]);
-                Ok(())
-            }
-        } else {
-            Err(std::io::Error::new(
-                ErrorKind::NotFound,
-                "Connection to this socket not found",
-            ))
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let UdpReadTask { read, buffer } = &mut *self;
+        let mut bytes = read.0.bytes.try_lock().unwrap();
+
+        // quick check to avoid registration if already done.
+        if bytes.len() >= buffer.len() {
+            buffer.copy_from_slice(&bytes[..buffer.len()]);
+            *bytes = bytes[buffer.len()..].to_vec();
+            return Poll::Ready(Ok(()));
         }
-    }
 
-    fn read_exact(&mut self, buffer: &mut [u8]) -> std::io::Result<()> {
-        if let Some(mut cache) = self.cache.get_mut(&self.addr) {
-            if cache.is_empty() {
-                Err(std::io::Error::from(ErrorKind::WouldBlock))
-            } else {
-                let read = cache.len().min(buffer.len());
-                if read == buffer.len() {
-                    buffer.clone_from_slice(cache.drain(..read).as_slice());
-                    Ok(())
-                } else {
-                    Err(Error::from(ErrorKind::BrokenPipe))
-                }
-            }
+        read.0.waker.register(cx.waker());
+
+        if bytes.len() >= buffer.len() {
+            buffer.copy_from_slice(&bytes[..buffer.len()]);
+            *bytes = bytes[buffer.len()..].to_vec();
+            Poll::Ready(Ok(()))
         } else {
-            Err(std::io::Error::new(
-                ErrorKind::NotFound,
-                "Connection to this socket not found",
-            ))
+            Poll::Pending
         }
-    }
-
-    fn write_all(&mut self, buffer: &[u8]) -> std::io::Result<()> {
-        self.socket.send_to(buffer, self.addr).and_then(|i| {
-            if i == buffer.len() {
-                Ok(())
-            } else {
-                Err(Error::from(ErrorKind::BrokenPipe))
-            }
-        })
-    }
-
-    fn peer_addr(&self) -> SocketAddr {
-        self.addr
-    }
-
-    fn local_addr(&self) -> SocketAddr {
-        self.socket.local_addr().unwrap()
     }
 }
 
-impl NetworkStream for WrappedUdpSocket {
-    fn set_nonblocking(&self) {
-        self.socket.set_nonblocking(true).unwrap()
-    }
+pub struct UdpServerWriteHalf {
+    peer_addr: SocketAddr,
+    socket: Arc<UdpSocket>,
+}
 
-    fn try_peek_exact(&self, buffer: &mut [u8]) -> std::io::Result<()> {
-        if matches!(self.socket.peek(buffer), Ok(n) if n == buffer.len()) {
-            Ok(())
-        } else {
-            Err(std::io::Error::from(ErrorKind::WouldBlock))
-        }
-    }
-
-    fn read_exact(&mut self, buffer: &mut [u8]) -> std::io::Result<()> {
-        let mut size = buffer.len();
-        if size > self.cache.len() {
-            // If there's not enough data in the cache, try to recv from UdpSocket.
-            let mut buf = vec![0; MAX_UDP_PACKET_SIZE];
-            let len = self.socket.recv(&mut buf)?;
-            self.cache.write_all(&buf[..len])?;
-            size = size.min(self.cache.len());
-        }
-        if size == 0 {
-            Err(std::io::Error::from(ErrorKind::WouldBlock))
-        } else {
-            let read = self.cache.len().min(buffer.len());
-            if read == buffer.len() {
-                buffer.clone_from_slice(self.cache.drain(..read).as_slice());
-                Ok(())
-            } else {
-                Err(Error::from(ErrorKind::BrokenPipe))
-            }
-        }
-    }
-
-    fn write_all(&mut self, buffer: &[u8]) -> std::io::Result<()> {
-        self.socket.send(buffer).and_then(|i| {
-            if i == buffer.len() {
-                Ok(())
-            } else {
-                Err(Error::from(ErrorKind::BrokenPipe))
-            }
-        })
-    }
-
-    fn peer_addr(&self) -> SocketAddr {
-        self.socket.peer_addr().unwrap()
-    }
-
-    fn local_addr(&self) -> SocketAddr {
-        self.socket.local_addr().unwrap()
+#[async_trait]
+impl WriteStream for UdpServerWriteHalf {
+    async fn write_all(&mut self, buffer: &[u8]) -> std::io::Result<()> {
+        self.socket
+            .send_to(buffer, self.peer_addr)
+            .await
+            .and_then(|i| assert_all(i, buffer))
     }
 }
 
-/// ListenerReader reads data from the listener's cache
-pub struct ListenerReader {
+impl ServerStream for UdpServerStream {}
+
+pub struct UdpClientStream {
     socket: UdpSocket,
-    addr: SocketAddr,
-    cache: ListenerCache,
+    peer_addr: SocketAddr,
+}
+
+#[async_trait]
+impl NetworkStream for UdpClientStream {
+    type ReadHalf = UdpClientReadHalf;
+    type WriteHalf = UdpClientWriteHalf;
+
+    async fn into_split(mut self) -> io::Result<(Self::ReadHalf, Self::WriteHalf)> {
+        let std_socket = self.socket.into_std()?;
+        let std_socket2 = std_socket.try_clone()?;
+        let read_socket = UdpSocket::from_std(std_socket)?;
+        let write_socket = UdpSocket::from_std(std_socket2)?;
+        let write = UdpClientWriteHalf {
+            socket: write_socket,
+        };
+        let read = UdpClientReadHalf {
+            socket: read_socket,
+            buffer: Vec::new(),
+        };
+        Ok((read, write))
+    }
+
+    fn peer_addr(&self) -> SocketAddr {
+        self.peer_addr // self.0.peer_addr().unwrap(). Tokio added it in https://github.com/tokio-rs/tokio/pull/4362 and then reverted in https://github.com/tokio-rs/tokio/pull/4392
+    }
+
+    fn local_addr(&self) -> SocketAddr {
+        self.socket.local_addr().unwrap()
+    }
+}
+
+#[async_trait]
+impl ClientStream for UdpClientStream {
+    async fn connect<A>(addr: A) -> std::io::Result<Self>
+    where
+        Self: Sized,
+        A: ToSocketAddrs + Send,
+    {
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        socket.connect(addr).await?;
+
+        // TODO remove this
+        let std_socket = socket.into_std().unwrap();
+        let peer_addr = std_socket.peer_addr().unwrap();
+        let socket = UdpSocket::from_std(std_socket).unwrap();
+
+        socket.send(&[]).await?;
+        Ok(UdpClientStream { socket, peer_addr })
+    }
+}
+
+pub struct UdpClientReadHalf {
+    socket: UdpSocket,
+    buffer: Vec<u8>,
+}
+
+#[async_trait]
+impl ReadStream for UdpClientReadHalf {
+    async fn read_exact(&mut self, buffer: &mut [u8]) -> std::io::Result<()> {
+        loop {
+            if self.buffer.len() >= buffer.len() {
+                buffer.copy_from_slice(&self.buffer[..buffer.len()]);
+                self.buffer = self.buffer[buffer.len()..].to_vec();
+                return Ok(());
+            }
+            let mut buf = [0; BUFFER_SIZE];
+            let read = self.socket.recv(&mut buf).await?;
+            self.buffer.extend(&buf[..read]);
+        }
+    }
+}
+
+pub struct UdpClientWriteHalf {
+    socket: UdpSocket,
+}
+
+#[async_trait]
+impl WriteStream for UdpClientWriteHalf {
+    async fn write_all(&mut self, buffer: &[u8]) -> std::io::Result<()> {
+        self.socket
+            .send(buffer)
+            .await
+            .and_then(|i| assert_all(i, buffer))
+    }
+}
+
+fn assert_all(i: usize, buf: &[u8]) -> io::Result<()> {
+    if i == buf.len() {
+        Ok(())
+    } else {
+        Err(io::Error::from(ErrorKind::BrokenPipe))
+    }
 }

@@ -1,17 +1,19 @@
 //! This module contains structs that are used connection handling.
 
-use bevy::prelude::Res;
-use std::fmt::Debug;
-use std::io;
-use std::io::Write;
+use std::fmt::{Debug, Formatter};
+use std::future::Future;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use crossbeam_channel::{Receiver, Sender};
+use bevy::prelude::Res;
+use futures::task::AtomicWaker;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use crate::packet_length_serializer::{PacketLengthDeserializationError, PacketLengthSerializer};
+use crate::packet_length_serializer::PacketLengthSerializer;
 use crate::protocol::NetworkStream;
 use crate::serializer::Serializer;
 
@@ -23,8 +25,9 @@ pub struct EcsConnection<SendingPacket>
 where
     SendingPacket: Send + Sync + Debug + 'static,
 {
+    pub(crate) disconnect_task: DisconnectTask,
     pub(crate) id: ConnectionId,
-    pub(crate) packet_tx: Sender<SendingPacket>,
+    pub(crate) packet_tx: UnboundedSender<SendingPacket>,
     pub(crate) local_addr: SocketAddr,
     pub(crate) peer_addr: SocketAddr,
 }
@@ -35,11 +38,21 @@ where
 {
     fn clone(&self) -> Self {
         EcsConnection {
+            disconnect_task: self.disconnect_task.clone(),
             id: self.id,
             packet_tx: self.packet_tx.clone(),
             local_addr: self.local_addr,
             peer_addr: self.peer_addr,
         }
+    }
+}
+
+impl<SendingPacket> Debug for EcsConnection<SendingPacket>
+where
+    SendingPacket: Send + Sync + Debug + 'static,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Connection #{}", self.id().0)
     }
 }
 
@@ -66,6 +79,10 @@ where
     pub fn send(&self, packet: SendingPacket) {
         self.packet_tx.send(packet).unwrap();
     }
+
+    pub fn disconnect(&self) {
+        self.disconnect_task.disconnect();
+    }
 }
 
 pub(crate) struct RawConnection<ReceivingPacket, SendingPacket, NS, S, LS>
@@ -76,13 +93,28 @@ where
     S: Serializer<ReceivingPacket, SendingPacket>,
     LS: PacketLengthSerializer,
 {
+    pub disconnect_task: DisconnectTask,
     pub stream: NS,
     pub serializer: Arc<S>,
     pub packet_length_serializer: Arc<LS>,
-    pub packets_rx: Receiver<SendingPacket>,
+    pub packets_rx: UnboundedReceiver<SendingPacket>,
     pub id: ConnectionId,
     pub _receive_packet: PhantomData<ReceivingPacket>,
     pub _send_packet: PhantomData<SendingPacket>,
+}
+
+impl<ReceivingPacket, SendingPacket, NS, S, LS> Debug
+    for RawConnection<ReceivingPacket, SendingPacket, NS, S, LS>
+where
+    ReceivingPacket: Send + Sync + Debug + 'static,
+    SendingPacket: Send + Sync + Debug + 'static,
+    NS: NetworkStream,
+    S: Serializer<ReceivingPacket, SendingPacket>,
+    LS: PacketLengthSerializer,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RawConnection #{}", self.id().0)
+    }
 }
 
 /// A connection ID is an unique connection identifier that is mainly used
@@ -126,14 +158,15 @@ where
     S: Serializer<ReceivingPacket, SendingPacket>,
     LS: PacketLengthSerializer,
 {
+    #[cfg(feature = "client")]
     pub fn new(
         stream: NS,
         serializer: S,
         packet_length_serializer: LS,
-        packets_rx: Receiver<SendingPacket>,
+        packets_rx: UnboundedReceiver<SendingPacket>,
     ) -> Self {
-        stream.set_nonblocking();
         Self {
+            disconnect_task: DisconnectTask::default(),
             stream,
             serializer: Arc::new(serializer),
             packet_length_serializer: Arc::new(packet_length_serializer),
@@ -141,61 +174,6 @@ where
             id: ConnectionId::next(),
             _receive_packet: PhantomData,
             _send_packet: PhantomData,
-        }
-    }
-
-    pub fn send(&mut self, packet: SendingPacket) -> io::Result<()> {
-        let buf = self.serialize_packet(packet)?;
-        self.stream.write_all(&buf)?;
-        Ok(())
-    }
-
-    pub fn serialize_packet(&self, packet: SendingPacket) -> io::Result<Vec<u8>> {
-        let serialized = self
-            .serializer
-            .serialize(packet)
-            .expect("Error serializing packet");
-        let mut buf = self
-            .packet_length_serializer
-            .serialize_packet_length(serialized.len())
-            .expect("Error serializing packet length");
-        buf.write_all(&serialized)?;
-        Ok(buf)
-    }
-
-    pub fn receive(
-        &mut self,
-    ) -> Result<ReceivingPacket, ReceiveError<ReceivingPacket, SendingPacket, S, LS>> {
-        let mut size = 0;
-        let mut length = Err(PacketLengthDeserializationError::NeedMoreBytes(LS::SIZE));
-        while let Err(PacketLengthDeserializationError::NeedMoreBytes(amt)) = length {
-            size += amt;
-            let mut buf = vec![0; size];
-            self.stream
-                .try_peek_exact(&mut buf)
-                .map_err(ReceiveError::Io)?;
-            length = self
-                .packet_length_serializer
-                .deserialize_packet_length(&buf);
-        }
-
-        match length {
-            Ok(length) => {
-                if length > MAX_PACKET_SIZE.load(Ordering::Relaxed) {
-                    Err(ReceiveError::PacketTooBig)
-                } else {
-                    let mut buf = vec![0; length + size];
-                    self.stream.read_exact(&mut buf).map_err(ReceiveError::Io)?;
-                    Ok(self
-                        .serializer
-                        .deserialize(&buf[size..])
-                        .map_err(ReceiveError::Deserialization)?)
-                }
-            }
-            Err(PacketLengthDeserializationError::Err(err)) => {
-                Err(ReceiveError::LengthDeserialization(err))
-            }
-            Err(PacketLengthDeserializationError::NeedMoreBytes(_)) => unreachable!(),
         }
     }
 
@@ -212,17 +190,43 @@ where
     }
 }
 
-pub(crate) enum ReceiveError<ReceivingPacket, SendingPacket, S, LS>
-where
-    ReceivingPacket: Send + Sync + Debug + 'static,
-    SendingPacket: Send + Sync + Debug + 'static,
-    S: Serializer<ReceivingPacket, SendingPacket>,
-    LS: PacketLengthSerializer,
-{
-    Io(std::io::Error),
-    Deserialization(S::Error),
-    LengthDeserialization(LS::Error),
-    PacketTooBig,
+#[derive(Default, Clone)]
+pub(crate) struct DisconnectTask(Arc<DisconnectTaskInner>);
+
+#[derive(Default)]
+struct DisconnectTaskInner {
+    disconnect: AtomicBool,
+    waker: AtomicWaker,
+}
+
+impl DisconnectTask {
+    fn disconnect(&self) {
+        self.0.disconnect.store(true, Ordering::Relaxed);
+        self.0.waker.wake();
+    }
+}
+
+impl Future for DisconnectTask {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.0.disconnect.load(Ordering::Relaxed) {
+            return Poll::Ready(());
+        }
+
+        self.0.waker.register(cx.waker());
+
+        if self.0.disconnect.load(Ordering::Relaxed) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+pub enum IsDisconnected<T> {
+    No(T),
+    Yes,
 }
 
 pub(crate) fn max_packet_size_system(max_packet_size: Option<Res<MaxPacketSize>>) {
@@ -231,5 +235,11 @@ pub(crate) fn max_packet_size_system(max_packet_size: Option<Res<MaxPacketSize>>
             MAX_PACKET_SIZE.store(res.0, Ordering::Relaxed);
         }
         _ => (),
+    }
+}
+
+pub(crate) fn max_packet_size_warning_system(max_packet_size: Option<Res<MaxPacketSize>>) {
+    if max_packet_size.is_none() {
+        log::warn!("You haven't set \"MaxPacketSize\" resource! This is a security risk, please insert it before using this in production.")
     }
 }

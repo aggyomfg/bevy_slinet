@@ -1,20 +1,23 @@
 //! Client part of the plugin. You can enable it by adding `client` feature.
 
+use std::future::Future;
 use std::io;
-use std::io::ErrorKind;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use bevy::prelude::*;
-use crossbeam_channel::{Receiver, Sender};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::connection::{
-    max_packet_size_system, EcsConnection, RawConnection, ReceiveError, MAX_PACKET_SIZE,
+    max_packet_size_system, max_packet_size_warning_system, EcsConnection, IsDisconnected,
+    RawConnection,
 };
-use crate::protocol::Protocol;
-use crate::{ClientConfig, SystemLabels};
+use crate::protocol::ReadStream;
+use crate::protocol::WriteStream;
+use crate::protocol::{NetworkStream, ReceiveError};
+use crate::{ClientConfig, Protocol, SystemLabels};
 
 /// Client-side connection to a server.
 pub type ClientConnection<Config> = EcsConnection<<Config as ClientConfig>::ClientPacket>;
@@ -31,16 +34,17 @@ struct AddInitialConnectionRequestEventLabel;
 
 impl<Config: ClientConfig> Plugin for ClientPlugin<Config> {
     fn build(&self, app: &mut App) {
-        if MAX_PACKET_SIZE.load(Ordering::Relaxed) == usize::MAX {
-            log::warn!("You haven't set \"MaxPacketSize\" resource! This is a security risk, please insert it before using this client in production.")
-        }
-
         let address = self.address;
 
         app.add_event::<ConnectionRequestEvent<Config>>()
             .add_event::<ConnectionEstablishEvent<Config>>()
             .add_event::<DisconnectionEvent<Config>>()
             .add_event::<PacketReceiveEvent<Config>>()
+            .insert_resource(Vec::<ClientConnection<Config>>::new())
+            .add_system_to_stage(
+                CoreStage::PostUpdate,
+                max_packet_size_warning_system.label(SystemLabels::MaxPacketSizeWarning),
+            )
             .add_system(max_packet_size_system.label(SystemLabels::SetMaxPacketSize))
             .add_system(
                 connection_request_system::<Config>.label(SystemLabels::ClientConnectionRequest),
@@ -128,41 +132,60 @@ impl<Config: ClientConfig> Clone for ConnectionRequestEvent<Config> {
     }
 }
 
-struct ConnectionRequestSender<Config: ClientConfig>(Sender<SocketAddr>, PhantomData<Config>);
-struct ConnectionReceiver<Config: ClientConfig>(Receiver<(SocketAddr, ClientConnection<Config>)>);
-struct DisconnectionReceiver<Config: ClientConfig>(
-    Receiver<(io::Error, SocketAddr)>,
+struct ConnectionRequestSender<Config: ClientConfig>(
+    UnboundedSender<SocketAddr>,
     PhantomData<Config>,
 );
+
+struct ConnectionReceiver<Config: ClientConfig>(
+    UnboundedReceiver<(SocketAddr, ClientConnection<Config>)>,
+);
+
+struct DisconnectionReceiver<Config: ClientConfig>(
+    UnboundedReceiver<(
+        ReceiveError<
+            Config::ServerPacket,
+            Config::ClientPacket,
+            Config::Serializer,
+            Config::LengthSerializer,
+        >,
+        SocketAddr,
+    )>,
+    PhantomData<Config>,
+);
+
 struct PacketReceiver<Config: ClientConfig>(
-    Receiver<(ClientConnection<Config>, Config::ServerPacket)>,
+    UnboundedReceiver<(ClientConnection<Config>, Config::ServerPacket)>,
 );
 
 fn setup_system<Config: ClientConfig>(mut commands: Commands) {
-    let (req_tx, req_rx) = crossbeam_channel::unbounded();
+    let (req_tx, mut req_rx) = tokio::sync::mpsc::unbounded_channel();
     commands.insert_resource(ConnectionRequestSender::<Config>(req_tx, PhantomData));
 
-    let (conn_tx, conn_rx) = crossbeam_channel::unbounded();
-    let (conn_tx2, conn_rx2) = crossbeam_channel::unbounded();
-    let (disc_tx, disc_rx) = crossbeam_channel::unbounded();
-    let (pack_tx, pack_rx) = crossbeam_channel::unbounded();
+    let (conn_tx, conn_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (conn_tx2, mut conn_rx2) = tokio::sync::mpsc::unbounded_channel();
+    let (disc_tx, disc_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (pack_tx, pack_rx) = tokio::sync::mpsc::unbounded_channel();
     commands.insert_resource(ConnectionReceiver::<Config>(conn_rx));
     commands.insert_resource(DisconnectionReceiver::<Config>(disc_rx, PhantomData));
     commands.insert_resource(PacketReceiver::<Config>(pack_rx));
 
     // Connection
-    let disc_tx_2 = disc_tx.clone();
-    std::thread::spawn(move || {
-        for address in req_rx.iter() {
-            let (tx, rx) = crossbeam_channel::unbounded();
+    let disc_tx2 = disc_tx.clone();
+    run_async(async move {
+        while let Some(address) = req_rx.recv().await {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             match create_connection::<Config>(
                 address,
                 Config::Serializer::default(),
                 Config::LengthSerializer::default(),
                 rx,
-            ) {
+            )
+            .await
+            {
                 Ok(connection) => {
                     let ecs_conn = EcsConnection {
+                        disconnect_task: connection.disconnect_task.clone(),
                         id: connection.id(),
                         packet_tx: tx,
                         local_addr: connection.local_addr(),
@@ -173,53 +196,70 @@ fn setup_system<Config: ClientConfig>(mut commands: Commands) {
                 }
                 Err(err) => {
                     log::warn!("Couldn't connect to server: {err:?}");
-                    disc_tx_2.send((err, address)).unwrap();
+                    disc_tx2
+                        .send((ReceiveError::NoConnection(err), address))
+                        .unwrap();
                 }
             }
         }
-
-        io::Result::Ok(())
     });
 
-    std::thread::spawn(move || {
-        let mut connections = Vec::new();
-
-        loop {
-            for new_connection in conn_rx2.try_iter() {
-                connections.push(new_connection);
-            }
-
-            let mut to_remove = Vec::new();
-            for (connection, ecs_conn) in connections.iter_mut() {
-                match connection.receive() {
-                    Ok(packet) => {
-                        log::trace!("Received packet {:?}", packet);
-                        pack_tx.send((ecs_conn.clone(), packet)).unwrap();
+    run_async(async move {
+        while let Some((connection, ecs_conn)) = conn_rx2.recv().await {
+            let RawConnection {
+                disconnect_task,
+                stream,
+                serializer,
+                packet_length_serializer,
+                mut packets_rx,
+                id: _,
+                _receive_packet,
+                _send_packet,
+            } = connection;
+            let pack_tx2 = pack_tx.clone();
+            let disc_tx2 = disc_tx.clone();
+            let serializer2 = Arc::clone(&serializer);
+            let packet_length_serializer2 = Arc::clone(&packet_length_serializer);
+            let peer_addr = stream.peer_addr();
+            let (mut read, mut write) = stream.into_split().await.expect("Couldn't split stream");
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        IsDisconnected::No(result) = async { IsDisconnected::No(read.receive(&*serializer2, &*packet_length_serializer2).await) } => {
+                            match result {
+                                Ok(packet) => {
+                                    log::trace!("Received packet {packet:?}");
+                                    pack_tx2.send((ecs_conn.clone(), packet)).unwrap();
+                                }
+                                Err(err) => {
+                                    log::debug!("Error receiving next packet: {err:?}");
+                                    disc_tx2.send((err, peer_addr)).unwrap();
+                                    break;
+                                }
+                            }
+                        }
+                        _ = disconnect_task.clone() => {
+                            log::debug!("Client disconnected intentionally");
+                            break
+                        }
                     }
-                    Err(ReceiveError::Io(err))
-                        if matches!(
-                            err.kind(),
-                            ErrorKind::TimedOut
-                                | ErrorKind::ConnectionAborted
-                                | ErrorKind::ConnectionReset
-                                | ErrorKind::BrokenPipe
-                                | ErrorKind::ConnectionRefused
-                        ) =>
-                    {
-                        disc_tx.send((err, connection.peer_addr())).unwrap();
-                        to_remove.push(connection.id());
-                        continue;
-                    }
-                    _ => (),
                 }
-                let packets = connection.packets_rx.try_iter().collect::<Vec<_>>();
-                for packet in packets {
+            });
+            tokio::spawn(async move {
+                while let Some(packet) = packets_rx.recv().await {
                     log::trace!("Sending packet {:?}", packet);
-                    // If disconnected, the .receive() call above would fail on next loop tick.
-                    let _ = connection.send(packet);
+                    match write
+                        .send(packet, &*serializer, &*packet_length_serializer)
+                        .await
+                    {
+                        Ok(()) => (),
+                        Err(err) => {
+                            log::error!("Error sending packet: {err}");
+                            break;
+                        }
+                    }
                 }
-            }
-            connections.retain(|(connection, _)| !to_remove.contains(&connection.id()));
+            });
         }
     });
 }
@@ -234,11 +274,11 @@ fn connection_request_system<Config: ClientConfig>(
 }
 
 #[allow(clippy::type_complexity)]
-pub(crate) fn create_connection<Config: ClientConfig>(
+pub(crate) async fn create_connection<Config: ClientConfig>(
     addr: SocketAddr,
     serializer: Config::Serializer,
     packet_length_serializer: Config::LengthSerializer,
-    packet_rx: Receiver<Config::ClientPacket>,
+    packet_rx: UnboundedReceiver<Config::ClientPacket>,
 ) -> io::Result<
     RawConnection<
         Config::ServerPacket,
@@ -249,7 +289,7 @@ pub(crate) fn create_connection<Config: ClientConfig>(
     >,
 > {
     Ok(RawConnection::new(
-        Config::Protocol::connect_to_server(addr)?,
+        Config::Protocol::connect_to_server(addr).await?,
         serializer,
         packet_length_serializer,
         packet_rx,
@@ -257,31 +297,24 @@ pub(crate) fn create_connection<Config: ClientConfig>(
 }
 
 fn packet_receive_system<Config: ClientConfig>(
-    packets: Res<PacketReceiver<Config>>,
-    mut writer: EventWriter<PacketReceiveEvent<Config>>,
+    mut packets: ResMut<PacketReceiver<Config>>,
+    mut event_writer: EventWriter<PacketReceiveEvent<Config>>,
 ) {
-    writer.send_batch(
-        packets
-            .0
-            .try_iter()
-            .map(|(connection, packet)| PacketReceiveEvent { connection, packet }),
-    )
+    while let Ok((connection, packet)) = packets.0.try_recv() {
+        event_writer.send(PacketReceiveEvent { connection, packet })
+    }
 }
 
 fn connection_establish_system<Config: ClientConfig>(
     mut commands: Commands,
-    new_connections: Res<ConnectionReceiver<Config>>,
-    mut connections: Option<ResMut<Vec<ClientConnection<Config>>>>,
-    mut writer: EventWriter<ConnectionEstablishEvent<Config>>,
+    mut new_connections: ResMut<ConnectionReceiver<Config>>,
+    mut connections: ResMut<Vec<ClientConnection<Config>>>,
+    mut event_writer: EventWriter<ConnectionEstablishEvent<Config>>,
 ) {
-    for (address, connection) in new_connections.0.try_iter() {
+    while let Ok((address, connection)) = new_connections.0.try_recv() {
         commands.insert_resource(connection.clone());
-        if let Some(connections) = connections.as_mut() {
-            connections.push(connection.clone());
-        } else {
-            commands.insert_resource(vec![connection.clone()]);
-        };
-        writer.send(ConnectionEstablishEvent {
+        connections.push(connection.clone());
+        event_writer.send(ConnectionEstablishEvent {
             address,
             connection,
         })
@@ -290,16 +323,17 @@ fn connection_establish_system<Config: ClientConfig>(
 
 fn connection_remove_system<Config: ClientConfig>(
     mut commands: Commands,
-    old_connections: Res<DisconnectionReceiver<Config>>,
-    mut connections: Option<ResMut<Vec<ClientConnection<Config>>>>,
-    mut writer: EventWriter<DisconnectionEvent<Config>>,
+    mut old_connections: ResMut<DisconnectionReceiver<Config>>,
+    mut connections: ResMut<Vec<ClientConnection<Config>>>,
+    mut event_writer: EventWriter<DisconnectionEvent<Config>>,
 ) {
-    for (error, address) in old_connections.0.try_iter() {
+    while let Ok((error, address)) = old_connections.0.try_recv() {
         commands.remove_resource::<ClientConnection<Config>>();
-        if let Some(connections) = connections.as_mut() {
-            connections.retain(|conn| conn.peer_addr() != address);
+        connections.retain(|conn| conn.peer_addr() != address);
+        if let Some(connection) = connections.last() {
+            commands.insert_resource(connection.clone());
         }
-        writer.send(DisconnectionEvent {
+        event_writer.send(DisconnectionEvent {
             error,
             address,
             _marker: PhantomData,
@@ -318,7 +352,12 @@ pub struct ConnectionEstablishEvent<Config: ClientConfig> {
 /// Indicates that something went wrong during a connection attempt. See [`DisconnectionEvent.error`] for details
 pub struct DisconnectionEvent<Config: ClientConfig> {
     /// The error.
-    pub error: io::Error,
+    pub error: ReceiveError<
+        Config::ServerPacket,
+        Config::ClientPacket,
+        Config::Serializer,
+        Config::LengthSerializer,
+    >,
     /// A server's IP address.
     pub address: SocketAddr,
     _marker: PhantomData<Config>,
@@ -330,4 +369,41 @@ pub struct PacketReceiveEvent<Config: ClientConfig> {
     pub connection: ClientConnection<Config>,
     /// The packet.
     pub packet: Config::ServerPacket,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn run_async<F>(future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Cannot start tokio runtime");
+
+        rt.block_on(async move {
+            let local = tokio::task::LocalSet::new();
+            local
+                .run_until(async move {
+                    tokio::task::spawn_local(future).await.unwrap();
+                })
+                .await;
+        });
+    });
+}
+
+#[cfg(target_arch = "wasm32")]
+fn run_async<F>(future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    wasm_bindgen_futures::spawn_local(async move {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                tokio::task::spawn_local(future).await.unwrap();
+            })
+            .await;
+    });
 }

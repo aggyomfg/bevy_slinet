@@ -1,5 +1,5 @@
 #![deny(rustdoc::broken_intra_doc_links)]
-#![deny(missing_docs)]
+#![cfg_attr(not(debug_assertions), deny(missing_docs))]
 #![cfg_attr(not(doctest), doc = include_str!("../README.md"))]
 
 use std::fmt::Debug;
@@ -36,6 +36,7 @@ pub enum SystemLabels {
     ServerAcceptNewPackets,
     ServerRemoveConnections,
     SetMaxPacketSize,
+    MaxPacketSizeWarning,
 }
 
 /// A server plugin config.

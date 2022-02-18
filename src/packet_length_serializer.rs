@@ -7,7 +7,7 @@ use std::marker::PhantomData;
 /// This serializer controls how to serialize and deserialize the packet length
 pub trait PacketLengthSerializer: Send + Sync + 'static {
     /// The serializer's error type.
-    type Error: Error;
+    type Error: Error + Send + Sync;
 
     /// The length's length in bytes. For u16 it would be 2.
     const SIZE: usize;
@@ -27,7 +27,7 @@ pub trait PacketLengthSerializer: Send + Sync + 'static {
 pub enum PacketLengthDeserializationError<E: Error> {
     /// The deserializer needs more bytes. This is useful for serializers
     /// with dynamic packet length length, e.g., 1 byte to store packet
-    /// length for small packets, 2 bytes for bigger packets)
+    /// length for small packets, 2 bytes for larger packets)
     NeedMoreBytes(usize),
     /// Error
     Err(E),

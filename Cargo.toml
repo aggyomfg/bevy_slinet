@@ -12,15 +12,6 @@ description = "A simple networking plugin for bevy."
 categories = [ "game-development", "network-programming" ]
 keywords = ["gamedev", "networking", "bevy"]
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[features]
-serializer_bincode = [ "bincode" ]
-tcp = []
-udp = [ "dashmap" ]
-client = []
-server = []
-
 [dependencies]
 bevy = { version = "0.6", default-features = false }
 serde = "1"
@@ -28,7 +19,19 @@ byteorder = "1"
 bincode = { version = "1", optional = true }
 dashmap = { version = "5", optional = true }
 log = "0.4"
-crossbeam-channel = "0.5"
+tokio = { version = "1", features = [ "io-util", "rt-multi-thread", "sync", "macros" ] }
+async-trait = "0.1.52"
+futures = { version = "0.3.21", optional = true }
+
+[features]
+serializer_bincode = [ "bincode" ]
+tcp = [ "tokio/net" ]
+udp = [ "tokio/net", "dashmap", "futures" ]
+client = []
+server = []
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+wasm-bindgen-futures = "0.4.29"
 
 [dev-dependencies]
 serde = { version = "1", features = [ "derive" ] }
