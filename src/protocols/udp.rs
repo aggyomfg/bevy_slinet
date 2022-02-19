@@ -22,6 +22,7 @@ use crate::Protocol;
 
 const BUFFER_SIZE: usize = u16::MAX as usize;
 
+/// UDP protocol.
 pub struct UdpProtocol;
 
 #[async_trait]
@@ -49,6 +50,7 @@ struct Inner {
 #[derive(Clone)]
 struct UdpRead(Arc<Inner>);
 
+/// A UDP listener.
 pub struct UdpNetworkListener {
     socket: Arc<UdpSocket>,
     tasks: DashMap<SocketAddr, UdpRead>,
@@ -85,8 +87,13 @@ impl Listener<UdpServerStream> for UdpNetworkListener {
     fn address(&self) -> SocketAddr {
         self.socket.local_addr().unwrap()
     }
+
+    fn handle_disconnection(&self, peer_addr: SocketAddr) {
+        self.tasks.remove(&peer_addr);
+    }
 }
 
+/// A UDP server stream that contains cached bytes and a task waker.
 pub struct UdpServerStream {
     task: UdpRead,
     peer_addr: SocketAddr,
@@ -95,12 +102,12 @@ pub struct UdpServerStream {
 
 #[async_trait]
 impl NetworkStream for UdpServerStream {
-    type ReadHalf = UdpStreamReadHalf;
+    type ReadHalf = UdpServerReadHalf;
     type WriteHalf = UdpServerWriteHalf;
 
     async fn into_split(self) -> io::Result<(Self::ReadHalf, Self::WriteHalf)> {
         Ok((
-            UdpStreamReadHalf(self.task.clone()),
+            UdpServerReadHalf(self.task.clone()),
             UdpServerWriteHalf {
                 peer_addr: self.peer_addr(),
                 socket: self.socket,
@@ -117,10 +124,11 @@ impl NetworkStream for UdpServerStream {
     }
 }
 
-pub struct UdpStreamReadHalf(UdpRead);
+/// The read half of [`UdpServerStream`].
+pub struct UdpServerReadHalf(UdpRead);
 
 #[async_trait]
-impl ReadStream for UdpStreamReadHalf {
+impl ReadStream for UdpServerReadHalf {
     fn read_exact<'life0, 'life1, 'async_trait>(
         &'life0 mut self,
         buffer: &'life1 mut [u8],
@@ -137,6 +145,8 @@ impl ReadStream for UdpStreamReadHalf {
     }
 }
 
+/// A future that tries to read bytes from cache, and receives additional bytes if needed.
+/// [`UdpStream::recv`] discards bytes that are not needed and there's no way to save them without buffering.
 pub struct UdpReadTask<'a> {
     read: UdpRead,
     buffer: &'a mut [u8],
@@ -168,6 +178,7 @@ impl Future for UdpReadTask<'_> {
     }
 }
 
+/// A write half of [`UdpServerStream`];
 pub struct UdpServerWriteHalf {
     peer_addr: SocketAddr,
     socket: Arc<UdpSocket>,
@@ -185,6 +196,7 @@ impl WriteStream for UdpServerWriteHalf {
 
 impl ServerStream for UdpServerStream {}
 
+/// A UDP client stream.
 pub struct UdpClientStream {
     socket: UdpSocket,
     peer_addr: SocketAddr,
@@ -239,6 +251,7 @@ impl ClientStream for UdpClientStream {
     }
 }
 
+/// A read half of [`UdpClientStream`].
 pub struct UdpClientReadHalf {
     socket: UdpSocket,
     buffer: Vec<u8>,
@@ -260,6 +273,7 @@ impl ReadStream for UdpClientReadHalf {
     }
 }
 
+/// A write half of [`UdpClientStream`].
 pub struct UdpClientWriteHalf {
     socket: UdpSocket,
 }

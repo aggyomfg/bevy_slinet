@@ -21,12 +21,12 @@ dashmap = { version = "5", optional = true }
 log = "0.4"
 tokio = { version = "1", features = [ "io-util", "rt-multi-thread", "sync", "macros" ] }
 async-trait = "0.1.52"
-futures = { version = "0.3.21", optional = true }
+futures = { version = "0.3.21" }
 
 [features]
 serializer_bincode = [ "bincode" ]
 tcp = [ "tokio/net" ]
-udp = [ "tokio/net", "dashmap", "futures" ]
+udp = [ "tokio/net", "dashmap" ]
 client = []
 server = []
 

@@ -11,8 +11,7 @@ use bevy::prelude::*;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::connection::{
-    max_packet_size_system, max_packet_size_warning_system, EcsConnection, IsDisconnected,
-    RawConnection,
+    max_packet_size_warning_system, set_max_packet_size_system, EcsConnection, RawConnection,
 };
 use crate::protocol::ReadStream;
 use crate::protocol::WriteStream;
@@ -41,11 +40,10 @@ impl<Config: ClientConfig> Plugin for ClientPlugin<Config> {
             .add_event::<DisconnectionEvent<Config>>()
             .add_event::<PacketReceiveEvent<Config>>()
             .insert_resource(Vec::<ClientConnection<Config>>::new())
-            .add_system_to_stage(
-                CoreStage::PostUpdate,
+            .add_startup_system(
                 max_packet_size_warning_system.label(SystemLabels::MaxPacketSizeWarning),
             )
-            .add_system(max_packet_size_system.label(SystemLabels::SetMaxPacketSize))
+            .add_system(set_max_packet_size_system.label(SystemLabels::SetMaxPacketSize))
             .add_system(
                 connection_request_system::<Config>.label(SystemLabels::ClientConnectionRequest),
             )
@@ -141,6 +139,7 @@ struct ConnectionReceiver<Config: ClientConfig>(
     UnboundedReceiver<(SocketAddr, ClientConnection<Config>)>,
 );
 
+#[allow(clippy::type_complexity)]
 struct DisconnectionReceiver<Config: ClientConfig>(
     UnboundedReceiver<(
         ReceiveError<
@@ -212,7 +211,7 @@ fn setup_system<Config: ClientConfig>(mut commands: Commands) {
                 serializer,
                 packet_length_serializer,
                 mut packets_rx,
-                id: _,
+                id,
                 _receive_packet,
                 _send_packet,
             } = connection;
@@ -225,36 +224,44 @@ fn setup_system<Config: ClientConfig>(mut commands: Commands) {
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
-                        IsDisconnected::No(result) = async { IsDisconnected::No(read.receive(&*serializer2, &*packet_length_serializer2).await) } => {
+                        result = read.receive(&*serializer2, &*packet_length_serializer2) => {
                             match result {
                                 Ok(packet) => {
-                                    log::trace!("Received packet {packet:?}");
-                                    pack_tx2.send((ecs_conn.clone(), packet)).unwrap();
+                                    log::trace!("({id:?}) Received packet {packet:?}");
+                                    if pack_tx2.send((ecs_conn.clone(), packet)).is_err() {
+                                        break
+                                    }
                                 }
                                 Err(err) => {
-                                    log::debug!("Error receiving next packet: {err:?}");
-                                    disc_tx2.send((err, peer_addr)).unwrap();
+                                    log::debug!("({id:?}) Error receiving next packet: {err:?}");
+                                    if disc_tx2.send((err, peer_addr)).is_err() {
+                                        break
+                                    }
                                     break;
                                 }
                             }
                         }
                         _ = disconnect_task.clone() => {
-                            log::debug!("Client disconnected intentionally");
+                            log::debug!("({id:?}) Client disconnected intentionally");
+                            disc_tx2.send((ReceiveError::IntentionalDisconnection, peer_addr)).unwrap();
                             break
                         }
                     }
                 }
             });
+            // `select!` is not needed because `packets_rx` returns `None` when
+            // all senders are be dropped, and `disc_tx2.send(...)` above should
+            // remove all senders from ECS.
             tokio::spawn(async move {
                 while let Some(packet) = packets_rx.recv().await {
-                    log::trace!("Sending packet {:?}", packet);
+                    log::trace!("({id:?}) Sending packet {:?}", packet);
                     match write
                         .send(packet, &*serializer, &*packet_length_serializer)
                         .await
                     {
                         Ok(()) => (),
                         Err(err) => {
-                            log::error!("Error sending packet: {err}");
+                            log::error!("({id:?}) Error sending packet: {err}");
                             break;
                         }
                     }

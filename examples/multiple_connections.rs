@@ -72,7 +72,7 @@ fn main() {
 fn server_new_connection_system(mut events: EventReader<NewConnectionEvent<Config>>) {
     for event in events.iter() {
         println!("Connection");
-        event.connection.send(ServerPacket::Hello);
+        event.connection.send(ServerPacket::Hello).unwrap();
     }
 }
 
@@ -84,11 +84,11 @@ fn client_packet_receive_system(
         match &event.packet {
             ServerPacket::Hello => {
                 println!("Server -> Client: Hello (client #{})", client_number.0);
-                event.connection.send(ClientPacket::Hello);
+                event.connection.send(ClientPacket::Hello).unwrap();
             }
             ServerPacket::Message(i) => {
                 println!("Server -> Client: {} (client #{})", i, client_number.0);
-                event.connection.send(ClientPacket::Reply(*i));
+                event.connection.send(ClientPacket::Reply(*i)).unwrap();
             }
         }
     }
@@ -99,11 +99,11 @@ fn server_packet_receive_system(mut events: EventReader<server::PacketReceiveEve
         match &event.packet {
             ClientPacket::Hello => {
                 println!("Server <- Client {:04?}: Hello", event.connection.id());
-                event.connection.send(ServerPacket::Message(0));
+                event.connection.send(ServerPacket::Message(0)).unwrap();
             }
             ClientPacket::Reply(i) => {
                 println!("Server <- Client {:04?}: {}", event.connection.id(), i);
-                event.connection.send(ServerPacket::Message(i + 1));
+                event.connection.send(ServerPacket::Message(i + 1)).unwrap();
             }
         }
     }

@@ -134,6 +134,8 @@ fn packet_receive_system(mut events: EventReader<PacketReceiveEvent<Config>>) {
 }
 ```
 
+Note: you should implement keep-alive and disconnection systems yourself, or look at [lobby_and_battle_servers example](examples/lobby_and_battle_servers.rs)
+
 ## More examples
 [Here](https://github.com/Sliman4/bevy_slinet/tree/main/examples).
 

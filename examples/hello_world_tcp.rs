@@ -66,7 +66,8 @@ fn server_new_connection_system(mut events: EventReader<NewConnectionEvent<Confi
     for event in events.iter() {
         event
             .connection
-            .send(ServerPacket::String("Hello, World!".to_string()));
+            .send(ServerPacket::String("Hello, World!".to_string()))
+            .unwrap();
     }
 }
 
@@ -77,7 +78,8 @@ fn client_packet_receive_system(mut events: EventReader<client::PacketReceiveEve
         }
         event
             .connection
-            .send(ClientPacket::String("Hello, Server!".to_string()));
+            .send(ClientPacket::String("Hello, Server!".to_string()))
+            .unwrap();
     }
 }
 
@@ -88,6 +90,7 @@ fn server_packet_receive_system(mut events: EventReader<server::PacketReceiveEve
         }
         event
             .connection
-            .send(ServerPacket::String("Hello, Client!".to_string()));
+            .send(ServerPacket::String("Hello, Client!".to_string()))
+            .unwrap();
     }
 }

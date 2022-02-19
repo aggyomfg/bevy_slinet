@@ -11,6 +11,7 @@ use std::task::{Context, Poll};
 
 use bevy::prelude::Res;
 use futures::task::AtomicWaker;
+use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::packet_length_serializer::PacketLengthSerializer;
@@ -75,11 +76,12 @@ where
         self.local_addr
     }
 
-    /// Sends a packet to the server.
-    pub fn send(&self, packet: SendingPacket) {
-        self.packet_tx.send(packet).unwrap();
+    /// Sends a packet to the server. Returns error if disconnected.
+    pub fn send(&self, packet: SendingPacket) -> Result<(), SendError<SendingPacket>> {
+        self.packet_tx.send(packet)
     }
 
+    /// Closes the connection.
     pub fn disconnect(&self) {
         self.disconnect_task.disconnect();
     }
@@ -125,10 +127,14 @@ where
 /// every server restart. If there are multiple clients/servers running
 /// (like in multiple_connections example), they'll have a single connection
 /// counter that increments for every clientside/serverside connection.
-#[derive(
-    Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Hash, bevy::ecs::component::Component,
-)]
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, bevy::ecs::component::Component)]
 pub struct ConnectionId(usize);
+
+impl Debug for ConnectionId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "#{}", self.0)
+    }
+}
 
 impl ConnectionId {
     /// Creates and returns a new, unique [`ConnectionId`].
@@ -224,12 +230,7 @@ impl Future for DisconnectTask {
     }
 }
 
-pub enum IsDisconnected<T> {
-    No(T),
-    Yes,
-}
-
-pub(crate) fn max_packet_size_system(max_packet_size: Option<Res<MaxPacketSize>>) {
+pub(crate) fn set_max_packet_size_system(max_packet_size: Option<Res<MaxPacketSize>>) {
     match max_packet_size {
         Some(res) if res.is_changed() => {
             MAX_PACKET_SIZE.store(res.0, Ordering::Relaxed);

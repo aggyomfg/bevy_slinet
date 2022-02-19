@@ -57,6 +57,9 @@ where
 
     /// Get the local address that this listeners listens at.
     fn address(&self) -> SocketAddr;
+
+    /// Do something when [`ServerConnection::disconnect`](crate::connection::EcsConnection::disconnect) gets called
+    fn handle_disconnection(&self, #[allow(unused_variables)] peer_addr: SocketAddr) {}
 }
 
 /// A [NetworkStream](NetworkStream) that can be used client-side.
@@ -90,6 +93,7 @@ pub trait NetworkStream: Send + Sync + 'static {
     fn local_addr(&self) -> SocketAddr;
 }
 
+/// A readable stream.
 #[async_trait]
 pub trait ReadStream: Send + Sync + 'static {
     /// Fills the whole buffer with bytes in this stream.
@@ -138,6 +142,7 @@ pub trait ReadStream: Send + Sync + 'static {
     }
 }
 
+/// An error that may happen when receiving packets.
 pub enum ReceiveError<ReceivingPacket, SendingPacket, S, LS>
 where
     ReceivingPacket: Send + Sync + Debug + 'static,
@@ -145,11 +150,18 @@ where
     S: Serializer<ReceivingPacket, SendingPacket>,
     LS: PacketLengthSerializer,
 {
+    /// IO error.
     Io(io::Error),
+    /// Deserialization error.
     Deserialization(S::Error),
+    /// Length deserialization error.
     LengthDeserialization(LS::Error),
+    /// The packet size is too large (set by [`MaxPacketSize`](crate::connection::MaxPacketSize) resource).
     PacketTooBig,
+    /// The client failed to connect.
     NoConnection(io::Error),
+    /// [`ServerConnection::disconnect`](crate::connection::EcsConnection::disconnect) was called
+    IntentionalDisconnection,
 }
 
 impl<ReceivingPacket, SendingPacket, S, LS> Debug
@@ -171,10 +183,12 @@ where
             }
             ReceiveError::PacketTooBig => write!(f, "ReceiveError::PacketTooBig"),
             ReceiveError::NoConnection(error) => write!(f, "ReceiveError::NoConnection({error:?})"),
+            ReceiveError::IntentionalDisconnection => write!(f, "IntentionalDisconnection"),
         }
     }
 }
 
+/// A writeable stream.
 #[async_trait]
 pub trait WriteStream: Send + Sync + 'static {
     /// Writes the whole buffer to the stream.
