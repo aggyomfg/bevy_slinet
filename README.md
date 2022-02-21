@@ -8,20 +8,19 @@ A simple networking plugin for bevy.
 ## Features
 - You can choose TCP or UDP protocol, with websocket (or other wasm-friendly solution?) planned. Adding your own protocols is as easy as implementing a few traits.
 - Multiple clients/servers with different configs (config is a collection of a protocol, packet types, a serializer, etc.)
-- You don't have to handle deserialization manually: you choose a protocol, serializer, packet type, and we do everything for you!
+- You don't have to handle deserialization manually: you choose a protocol, serializer, packet type (you probably want it to be `enum`), and we do everything for you!
 
 
 ## Client example
 ```rust
 use bevy::app::{App, EventReader};
 use bevy::MinimalPlugins;
-use bincode::DefaultOptions;
 use serde::{Deserialize, Serialize};
 
-use bevy_slinet::client::{ClientPlugin, PacketReceiveEvent};
+use bevy_slinet::client::{ClientPlugin, ConnectionEstablishEvent, PacketReceiveEvent};
 use bevy_slinet::packet_length_serializer::LittleEndian;
 use bevy_slinet::protocols::tcp::TcpProtocol;
-use bevy_slinet::serializers::bincode::BincodeSerializer;
+use bevy_slinet::serializers::bincode::{BincodeSerializer, DefaultOptions};
 use bevy_slinet::ClientConfig;
 
 struct Config;
@@ -54,7 +53,7 @@ fn main() {
 }
 
 fn connection_establish_system(mut events: EventReader<ConnectionEstablishEvent<Config>>) {
-    for event in events.iter() {
+    for _event in events.iter() {
         println!("Connected!");
     }
 }
@@ -66,7 +65,7 @@ fn packet_receive_system(mut events: EventReader<PacketReceiveEvent<Config>>) {
         }
         event
             .connection
-            .send(ClientPacket::String("Hello, Server!".to_string()));
+            .send(ClientPacket::String("Hello, Server!".to_string())).unwrap();
     }
 }
 ```
@@ -76,12 +75,11 @@ fn packet_receive_system(mut events: EventReader<PacketReceiveEvent<Config>>) {
 ```rust
 use bevy::app::{App, EventReader};
 use bevy::MinimalPlugins;
-use bincode::DefaultOptions;
 use serde::{Deserialize, Serialize};
 
 use bevy_slinet::packet_length_serializer::LittleEndian;
 use bevy_slinet::protocols::tcp::TcpProtocol;
-use bevy_slinet::serializers::bincode::BincodeSerializer;
+use bevy_slinet::serializers::bincode::{BincodeSerializer, DefaultOptions};
 use bevy_slinet::server::{NewConnectionEvent, ServerPlugin, PacketReceiveEvent};
 use bevy_slinet::ServerConfig;
 
@@ -118,7 +116,7 @@ fn new_connection_system(mut events: EventReader<NewConnectionEvent<Config>>) {
     for event in events.iter() {
         event
             .connection
-            .send(ServerPacket::String("Hello, Client!".to_string()));
+            .send(ServerPacket::String("Hello, Client!".to_string())).unwrap();
     }
 }
 
@@ -129,7 +127,7 @@ fn packet_receive_system(mut events: EventReader<PacketReceiveEvent<Config>>) {
         }
         event
             .connection
-            .send(ServerPacket::String("Hello, Client!".to_string()));
+            .send(ServerPacket::String("Hello, Client!".to_string())).unwrap();
     }
 }
 ```
@@ -143,4 +141,5 @@ Note: you should implement keep-alive and disconnection systems yourself, or loo
 | Plugin Version | Bevy Version |
 |----------------|--------------|
 | `0.1`          | `0.6`        |
+| `0.2`          | `0.6`        |
 | `main`         | `main`       |
