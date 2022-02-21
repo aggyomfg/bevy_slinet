@@ -1,6 +1,6 @@
 [package]
 name = "bevy_slinet"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Sliman4 <4sliman4@gmail.com>"]
 edition = "2021"
 license = "Apache-2.0 OR MIT"
