@@ -21,7 +21,7 @@ use crate::serializer::Serializer;
 /// The ecs-side connection struct. There is 2 structs,
 /// one raw (with the stream, runs on another thread),
 /// and ecs that can be cheaply cloned and interacts with
-/// the raw connection via [`crossbeam_channel`].
+/// the raw connection via [`tokio::sync::mpsc`].
 pub struct EcsConnection<SendingPacket>
 where
     SendingPacket: Send + Sync + Debug + 'static,

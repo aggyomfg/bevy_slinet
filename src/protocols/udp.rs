@@ -144,7 +144,7 @@ impl ReadStream for UdpServerReadHalf {
 }
 
 /// A future that tries to read bytes from cache, and receives additional bytes if needed.
-/// [`UdpStream::recv`] discards bytes that are not needed and there's no way to save them without buffering.
+/// [`UdpSocket::recv`] discards bytes that are not needed and there's no way to save them without buffering.
 pub struct UdpReadTask<'a> {
     read: UdpRead,
     buffer: &'a mut [u8],

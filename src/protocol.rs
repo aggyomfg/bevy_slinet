@@ -26,9 +26,7 @@ pub trait Protocol: Send + Sync + 'static {
     /// A client-side network stream. It can be different from [`Self::ServerStream`]
     type ClientStream: ClientStream;
 
-    /// Creates and runs a [Listener](Self::Listener). Most of the time
-    /// you want to use [create_listener](Self::create_listener) instead
-    /// of this.
+    /// Creates a [Listener](Self::Listener).
     async fn bind(addr: SocketAddr) -> io::Result<Self::Listener>;
 
     /// Connect to the server at specified address.
