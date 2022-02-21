@@ -7,7 +7,6 @@ use tokio::net::{TcpListener, TcpStream};
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::ToSocketAddrs;
 
 use crate::protocol::{
     ClientStream, Listener, NetworkStream, Protocol, ReadStream, ServerStream, WriteStream,
@@ -22,10 +21,7 @@ impl Protocol for TcpProtocol {
     type ServerStream = TcpNetworkStream;
     type ClientStream = TcpNetworkStream;
 
-    async fn bind<A>(addr: A) -> io::Result<Self::Listener>
-    where
-        A: ToSocketAddrs + Send,
-    {
+    async fn bind(addr: SocketAddr) -> io::Result<Self::Listener> {
         Ok(TcpNetworkListener(TcpListener::bind(addr).await?))
     }
 }
@@ -34,7 +30,9 @@ impl Protocol for TcpProtocol {
 pub struct TcpNetworkListener(TcpListener);
 
 #[async_trait]
-impl Listener<TcpNetworkStream> for TcpNetworkListener {
+impl Listener for TcpNetworkListener {
+    type Stream = TcpNetworkStream;
+
     async fn accept(&self) -> io::Result<TcpNetworkStream> {
         let (stream, _) = self.0.accept().await?;
         Ok(TcpNetworkStream(stream))
@@ -82,10 +80,9 @@ impl WriteStream for OwnedWriteHalf {
 
 #[async_trait]
 impl ClientStream for TcpNetworkStream {
-    async fn connect<A>(addr: A) -> io::Result<Self>
+    async fn connect(addr: SocketAddr) -> io::Result<Self>
     where
         Self: Sized,
-        A: ToSocketAddrs + Send,
     {
         Ok(TcpNetworkStream(TcpStream::connect(addr).await?))
     }

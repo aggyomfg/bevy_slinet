@@ -9,8 +9,11 @@ repository = "https://github.com/Sliman4/bevy_slinet"
 homepage = "https://github.com/Sliman4/bevy_slinet#readme"
 documentation = "https://docs.rs/bevy_slinet"
 description = "A simple networking plugin for bevy."
-categories = [ "game-development", "network-programming" ]
+categories = ["game-development", "network-programming"]
 keywords = ["gamedev", "networking", "bevy"]
+
+[package.metadata.docs.rs]
+features = ["serializer_bincode", "protocol_tcp", "protocol_udp", "client", "server"]
 
 [dependencies]
 bevy = { version = "0.6", default-features = false }
@@ -19,14 +22,14 @@ byteorder = "1"
 bincode = { version = "1", optional = true }
 dashmap = { version = "5", optional = true }
 log = "0.4"
-tokio = { version = "1", features = [ "io-util", "rt-multi-thread", "sync", "macros" ] }
-async-trait = "0.1.52"
-futures = { version = "0.3.21" }
+tokio = { version = "1", features = ["io-util", "rt-multi-thread", "sync", "macros"] }
+async-trait = "0.1"
+futures = { version = "0.3" }
 
 [features]
-serializer_bincode = [ "bincode" ]
-tcp = [ "tokio/net" ]
-udp = [ "tokio/net", "dashmap" ]
+serializer_bincode = ["bincode"]
+protocol_tcp = ["tokio/net"]
+protocol_udp = ["tokio/net", "dashmap"]
 client = []
 server = []
 
@@ -34,24 +37,24 @@ server = []
 wasm-bindgen-futures = "0.4.29"
 
 [dev-dependencies]
-serde = { version = "1", features = [ "derive" ] }
+serde = { version = "1", features = ["derive"] }
 
 [[example]]
 name = "hello_world_tcp"
 path = "examples/hello_world_tcp.rs"
-required-features = [ "client", "server", "tcp", "serializer_bincode" ]
+required-features = ["client", "server", "protocol_tcp", "serializer_bincode"]
 
 [[example]]
 name = "hello_world_udp"
 path = "examples/hello_world_udp.rs"
-required-features = [ "client", "server", "udp", "serializer_bincode" ]
+required-features = ["client", "server", "protocol_udp", "serializer_bincode"]
 
 [[example]]
 name = "multiple_connections"
 path = "examples/multiple_connections.rs"
-required-features = [ "client", "server", "udp", "serializer_bincode" ]
+required-features = ["client", "server", "protocol_udp", "serializer_bincode"]
 
 [[example]]
 name = "lobby_and_battle_servers"
 path = "examples/lobby_and_battle_servers.rs"
-required-features = [ "client", "server", "udp", "tcp", "serializer_bincode" ]
+required-features = ["client", "server", "protocol_udp", "protocol_tcp", "serializer_bincode"]

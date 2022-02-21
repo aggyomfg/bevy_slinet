@@ -10,7 +10,6 @@ use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
-use tokio::net::ToSocketAddrs;
 
 use crate::connection::MAX_PACKET_SIZE;
 use crate::packet_length_serializer::PacketLengthDeserializationError;
@@ -21,7 +20,7 @@ use crate::{PacketLengthSerializer, Serializer};
 #[async_trait]
 pub trait Protocol: Send + Sync + 'static {
     /// A server-side listener type.
-    type Listener: Listener<Self::ServerStream>;
+    type Listener: Listener<Stream = Self::ServerStream>;
     /// A server-side network stream. It can be different from [`Self::ClientStream`]
     type ServerStream: ServerStream;
     /// A client-side network stream. It can be different from [`Self::ServerStream`]
@@ -30,15 +29,10 @@ pub trait Protocol: Send + Sync + 'static {
     /// Creates and runs a [Listener](Self::Listener). Most of the time
     /// you want to use [create_listener](Self::create_listener) instead
     /// of this.
-    async fn bind<A>(addr: A) -> io::Result<Self::Listener>
-    where
-        A: ToSocketAddrs + Send;
+    async fn bind(addr: SocketAddr) -> io::Result<Self::Listener>;
 
     /// Connect to the server at specified address.
-    async fn connect_to_server<A>(addr: A) -> io::Result<Self::ClientStream>
-    where
-        A: ToSocketAddrs + Send,
-    {
+    async fn connect_to_server(addr: SocketAddr) -> io::Result<Self::ClientStream> {
         let stream = Self::ClientStream::connect(addr).await?;
         log::debug!("Connected to a server at {:?}", stream.peer_addr());
         Ok(stream)
@@ -47,13 +41,13 @@ pub trait Protocol: Send + Sync + 'static {
 
 /// A listener that accepts connections from clients.
 #[async_trait]
-pub trait Listener<S>: Send + Sync + 'static
-where
-    S: ServerStream,
-{
+pub trait Listener {
+    /// A [`ServerStream`] that is returned by [`Self::accept()`]
+    type Stream: ServerStream;
+
     /// Returns a [ServerStream](ServerStream) when a client wants to connect.
     /// Runs in an endless loop.
-    async fn accept(&self) -> io::Result<S>;
+    async fn accept(&self) -> io::Result<Self::Stream>;
 
     /// Get the local address that this listeners listens at.
     fn address(&self) -> SocketAddr;
@@ -66,10 +60,9 @@ where
 #[async_trait]
 pub trait ClientStream: NetworkStream {
     /// Connects to a server.
-    async fn connect<A>(addr: A) -> io::Result<Self>
+    async fn connect(addr: SocketAddr) -> io::Result<Self>
     where
-        Self: Sized,
-        A: ToSocketAddrs + Send;
+        Self: Sized;
 }
 
 /// A [NetworkStream](NetworkStream) that can be used server-side.

@@ -1,5 +1,4 @@
 //! UDP protocol implementation based on [`std::net`]. You can enable it by adding `udp` feature.
-// The implementation is very poor and should be rewritten ASAP.
 
 use std::future::Future;
 use std::io;
@@ -12,7 +11,7 @@ use std::task::{Context, Poll};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use futures::task::AtomicWaker;
-use tokio::net::{ToSocketAddrs, UdpSocket};
+use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 
 use crate::protocol::{
@@ -31,10 +30,7 @@ impl Protocol for UdpProtocol {
     type ServerStream = UdpServerStream;
     type ClientStream = UdpClientStream;
 
-    async fn bind<A>(addr: A) -> std::io::Result<Self::Listener>
-    where
-        A: ToSocketAddrs + Send,
-    {
+    async fn bind(addr: SocketAddr) -> std::io::Result<Self::Listener> {
         Ok(UdpNetworkListener {
             socket: Arc::new(UdpSocket::bind(addr).await?),
             tasks: DashMap::new(),
@@ -57,7 +53,9 @@ pub struct UdpNetworkListener {
 }
 
 #[async_trait]
-impl Listener<UdpServerStream> for UdpNetworkListener {
+impl Listener for UdpNetworkListener {
+    type Stream = UdpServerStream;
+
     async fn accept(&self) -> std::io::Result<UdpServerStream> {
         let mut buf = [0; BUFFER_SIZE];
         loop {
@@ -233,10 +231,9 @@ impl NetworkStream for UdpClientStream {
 
 #[async_trait]
 impl ClientStream for UdpClientStream {
-    async fn connect<A>(addr: A) -> std::io::Result<Self>
+    async fn connect(addr: SocketAddr) -> std::io::Result<Self>
     where
         Self: Sized,
-        A: ToSocketAddrs + Send,
     {
         let socket = UdpSocket::bind("127.0.0.1:0").await?;
         socket.connect(addr).await?;
