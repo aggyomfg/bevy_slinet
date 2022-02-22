@@ -1,4 +1,4 @@
-//! UDP protocol implementation based on [`std::net`]. You can enable it by adding `protocol_udp` feature.
+//! UDP protocol implementation based on [`tokio::net`]. You can enable it by adding `protocol_udp` feature.
 
 use std::future::Future;
 use std::io;

@@ -1,4 +1,4 @@
-//! TCP [`Protocol`] implementation based on [`std::net`]. You can enable it by adding `protocol_tcp` feature.
+//! TCP [`Protocol`] implementation based on [`tokio::net`]. You can enable it by adding `protocol_tcp` feature.
 
 use std::io;
 use std::net::SocketAddr;
