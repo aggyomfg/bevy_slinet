@@ -305,21 +305,21 @@ fn battle_client_packet_handler(
                 log::info!("[Client] I won!");
                 event.connection.disconnect();
 
-                /* Delay between connections is required for this particular example
-                because the operating system may assign the same port (we use
-                127.0.0.1:0 to let OS pick a free port for us) twice before the
-                server disconnects the first client, and will treat a new connection
-                as an existing one. In this example our server is sending a `BattleStart`
-                packet and the client doesn't implement a proper error handling mechanism
-                to prevent situations like "no BattleStart but lot of KeepAlive". Your
-                real case would start with authentication and more complex initial connection
-                logic, as well as reasonable number of connections, not just spamming the
-                server with millions of connections from a single IP. The reason is that the
-                server disconnects the client after 1 second of no keep-alive packets, but
-                sometimes 1 second is enough for second connection to have the same port.
-                You can remove this line and try it yourself (in release mode). After a few
-                millions of connections you'll notice that the entire connection is just
-                KeepAlive packets and nothing else. */
+                // Delay between connections is required for this particular example
+                // because the operating system may assign the same port (we use
+                // 127.0.0.1:0 to let OS pick a free port for us) twice before the
+                // server disconnects the first client, and will treat a new connection
+                // as an existing one. In this example our server is sending a `BattleStart`
+                // packet and the client doesn't implement a proper error handling mechanism
+                // to prevent situations like "no BattleStart but lot of KeepAlive". Your
+                // real case would start with authentication and more complex initial connection
+                // logic, as well as reasonable number of connections, not just spamming the
+                // server with millions of connections from a single IP. The reason is that the
+                // server disconnects the client after 1 second of no keep-alive packets, but
+                // sometimes 1 second is enough for second connection to have the same port.
+                // You can remove this line and try it yourself (in release mode). After a few
+                // millions of connections you'll notice that the entire connection is just
+                // KeepAlive packets and nothing else.
                 std::thread::sleep(Duration::from_secs_f64(0.10));
 
                 event_writer.send(ConnectionRequestEvent::new(LOBBY_SERVER));
