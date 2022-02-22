@@ -51,9 +51,7 @@ impl<Config: ServerConfig> Plugin for ServerPlugin<Config> {
             )
             .add_system_to_stage(
                 CoreStage::PostUpdate,
-                connection_add_system::<Config>
-                    .label(SystemLabels::ServerConnectionAdd)
-                    .after(SystemLabels::ServerAcceptNewConnections),
+                connection_add_system::<Config>.label(SystemLabels::ServerConnectionAdd),
             );
     }
 }
