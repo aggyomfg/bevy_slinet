@@ -142,4 +142,4 @@ Note: you should implement keep-alive and disconnection systems yourself, or loo
 |----------------|--------------|
 | `0.1`          | `0.6`        |
 | `0.2`          | `0.6`        |
-| `main`         | `main`       |
+| `main`         | `0.6`        |
