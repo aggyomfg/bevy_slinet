@@ -243,6 +243,8 @@ impl ClientStream for UdpClientStream {
         let peer_addr = std_socket.peer_addr().unwrap();
         let socket = UdpSocket::from_std(std_socket).unwrap();
 
+        // socket.connect and socket.send is not enough to handle ConnectionRefused, but 2 sends is
+        socket.send(&[]).await?;
         socket.send(&[]).await?;
         Ok(UdpClientStream { socket, peer_addr })
     }
