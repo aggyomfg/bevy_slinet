@@ -1,6 +1,6 @@
 [package]
 name = "bevy_slinet"
-version = "0.2.1"
+version = "0.3.0"
 authors = ["Sliman4 <4sliman4@gmail.com>"]
 edition = "2021"
 license = "Apache-2.0 OR MIT"
@@ -16,7 +16,7 @@ keywords = ["gamedev", "networking", "bevy"]
 features = ["serializer_bincode", "protocol_tcp", "protocol_udp", "client", "server"]
 
 [dependencies]
-bevy = { version = "0.6", default-features = false }
+bevy = { version = "0.7", default-features = false }
 serde = "1"
 byteorder = "1"
 bincode = { version = "1", optional = true }
