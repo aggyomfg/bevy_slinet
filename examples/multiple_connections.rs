@@ -1,8 +1,6 @@
 use std::time::Duration;
 
-use bevy::app::{App, EventReader};
-use bevy::ecs::system::Res;
-use bevy::MinimalPlugins;
+use bevy::prelude::*;
 use bincode::DefaultOptions;
 use serde::{Deserialize, Serialize};
 
