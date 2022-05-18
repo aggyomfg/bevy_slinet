@@ -13,8 +13,7 @@ A simple networking plugin for bevy.
 
 ## Client example
 ```rust
-use bevy::app::{App, EventReader};
-use bevy::MinimalPlugins;
+use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use bevy_slinet::client::{ClientPlugin, ConnectionEstablishEvent, PacketReceiveEvent};
@@ -73,8 +72,7 @@ fn packet_receive_system(mut events: EventReader<PacketReceiveEvent<Config>>) {
 ## Server Example
 
 ```rust
-use bevy::app::{App, EventReader};
-use bevy::MinimalPlugins;
+use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use bevy_slinet::packet_length_serializer::LittleEndian;
