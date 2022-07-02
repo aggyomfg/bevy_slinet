@@ -19,6 +19,9 @@ pub mod serializers;
 #[cfg(feature = "server")]
 pub mod server;
 
+#[cfg(test)]
+mod tests;
+
 /// [`Labels`](bevy::ecs::schedule::SystemLabel) in [`bevy`] are used for system ordering.
 /// See [System Order of Execution][cheatbook_order] on unofficial bevy cheatbook for details.
 /// For more details on what each label means, refer to [`client`](crate::client) or [`server`](crate::server) source code
