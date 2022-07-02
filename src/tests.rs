@@ -9,6 +9,7 @@ use bevy::ecs::event::Events;
 use bevy::prelude::EventReader;
 use bincode::DefaultOptions;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
 struct Packet(u64);
@@ -41,6 +42,7 @@ fn tcp_connection() {
 
     app_server.update(); // bind
     app_client.update(); // connect
+    std::thread::sleep(Duration::from_secs(1));
     app_client.update(); // add connection resource
     app_server.update(); // handle connection
 
@@ -94,8 +96,10 @@ fn tcp_packets() {
 
     app_server.update(); // bind
     app_client.update(); // connect
+    std::thread::sleep(Duration::from_secs(1));
     app_client.update(); // add connection resource
     app_server.update(); // handle connection
+    std::thread::sleep(Duration::from_secs(1));
     app_client.update(); // handle packet
     app_server.update(); // handle packet
 
