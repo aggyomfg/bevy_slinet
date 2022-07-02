@@ -47,7 +47,7 @@ fn main() {
     let server = std::thread::spawn(move || {
         App::new()
             .add_plugins(MinimalPlugins)
-            .add_plugin(ServerPlugin::<Config>::bind("127.0.0.1:3000").unwrap())
+            .add_plugin(ServerPlugin::<Config>::bind("127.0.0.1:3000"))
             .add_system(server_new_connection_system)
             .add_system(server_packet_receive_system)
             .run();

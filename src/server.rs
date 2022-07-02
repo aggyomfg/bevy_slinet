@@ -58,18 +58,18 @@ impl<Config: ServerConfig> Plugin for ServerPlugin<Config> {
 
 impl<Config: ServerConfig> ServerPlugin<Config> {
     /// Bind to the specified address and return a [`ServerPlugin`].
-    pub fn bind<A>(address: A) -> io::Result<ServerPlugin<Config>>
+    pub fn bind<A>(address: A) -> ServerPlugin<Config>
     where
         A: ToSocketAddrs,
     {
-        Ok(ServerPlugin {
+        ServerPlugin {
             address: address
                 .to_socket_addrs()
                 .expect("Invalid address")
                 .next()
                 .expect("Invalid address"),
             _marker: PhantomData,
-        })
+        }
     }
 }
 

@@ -149,11 +149,11 @@ fn main() {
         .add_plugin(LogPlugin)
         .add_plugins(MinimalPlugins)
         // Lobby server
-        .add_plugin(ServerPlugin::<LobbyConfig>::bind(LOBBY_SERVER).unwrap())
+        .add_plugin(ServerPlugin::<LobbyConfig>::bind(LOBBY_SERVER))
         .add_system(lobby_server_accept_new_connections.before("remove_timed_out"))
         .add_system(lobby_server_packet_handler)
         // Battle server
-        .add_plugin(ServerPlugin::<BattleConfig>::bind(BATTLE_SERVER).unwrap())
+        .add_plugin(ServerPlugin::<BattleConfig>::bind(BATTLE_SERVER))
         .add_system(battle_server_accept_new_connections.before("remove_timed_out"))
         .add_system(battle_server_packet_handler)
         // Keep-alive packets
