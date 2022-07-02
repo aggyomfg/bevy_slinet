@@ -103,7 +103,7 @@ fn tcp_packets() {
         .world
         .resource::<Events<server::PacketReceiveEvent<TcpConfig>>>();
     let mut server_reader = server_events.get_reader();
-    let mut server_events_iter = server_reader.iter(&server_events);
+    let mut server_events_iter = server_reader.iter(server_events);
     assert_eq!(
         server_events_iter.next().map(|event| event.packet),
         Some(client_to_server_packet),
@@ -114,7 +114,7 @@ fn tcp_packets() {
         .world
         .resource::<Events<client::PacketReceiveEvent<TcpConfig>>>();
     let mut client_reader = client_events.get_reader();
-    let mut client_events_iter = client_reader.iter(&client_events);
+    let mut client_events_iter = client_reader.iter(client_events);
     assert_eq!(
         client_events_iter.next().map(|event| event.packet),
         Some(server_to_client_packet),
