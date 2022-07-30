@@ -37,9 +37,9 @@ use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use bevy::core::FixedTimestep;
 use bevy::log::LogPlugin;
 use bevy::prelude::*;
+use bevy::time::FixedTimestep;
 use bincode::DefaultOptions;
 use serde::{Deserialize, Serialize};
 
