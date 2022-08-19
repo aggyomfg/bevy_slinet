@@ -6,10 +6,11 @@ A simple networking plugin for bevy.
 [![Crates.io](https://img.shields.io/crates/l/bevy_slinet)](https://github.com/Sliman4/bevy_slinet/tree/main/LICENSE)
 
 ## Features
-- You can choose TCP or UDP protocol, with websocket (or other wasm-friendly solution?) planned. Adding your own protocols is as easy as implementing a few traits.
-- Multiple clients/servers with different configs (config is a collection of a protocol, packet types, a serializer, etc.)
-- You don't have to handle deserialization manually: you choose a protocol, serializer, packet type (you probably want it to be `enum`), and we do everything for you!
+- You can choose TCP or UDP protocol. Adding your own protocols is as easy as implementing a few traits.
+- Multiple clients/servers with different configs (specifies a protocol, packet types, serializer, etc.)
+- De/serialization. You choose a serialization format, packet type (you probably want it to be `enum`), and receive events with deserialized packets.
 
+> Note: Everything in bevy_slinet is feature-gated. Make sure to enable features you need (`client`, `server`, `protocol_tcp`, `protocol_udp`, `serializer_bincode`).
 
 ## Client example
 ```rust
