@@ -20,6 +20,29 @@ use crate::{ClientConfig, Protocol, SystemLabels};
 
 /// Client-side connection to a server.
 pub type ClientConnection<Config> = EcsConnection<<Config as ClientConfig>::ClientPacket>;
+/// List of client-side connections to a server.
+
+#[derive(Resource)]
+pub struct ClientConnections<Config: ClientConfig>(Vec<ClientConnection<Config>>);
+impl<Config: ClientConfig> ClientConnections<Config> {
+    fn new() -> Self {
+        Self(Vec::new())
+    }
+}
+
+impl<Config: ClientConfig> std::ops::Deref for ClientConnections<Config> {
+    type Target = Vec<ClientConnection<Config>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<Config: ClientConfig> std::ops::DerefMut for ClientConnections<Config> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 /// Client-side plugin. Use [`ClientPlugin::connect`] to connect immediately or
 /// [`ClientPlugin::new`] to add the required systems and send [`ConnectionRequestEvent`] later.
@@ -39,7 +62,7 @@ impl<Config: ClientConfig> Plugin for ClientPlugin<Config> {
             .add_event::<ConnectionEstablishEvent<Config>>()
             .add_event::<DisconnectionEvent<Config>>()
             .add_event::<PacketReceiveEvent<Config>>()
-            .insert_resource(Vec::<ClientConnection<Config>>::new())
+            .insert_resource(ClientConnections::<Config>::new())
             .add_startup_system(
                 max_packet_size_warning_system.label(SystemLabels::MaxPacketSizeWarning),
             )
@@ -126,20 +149,24 @@ impl<Config: ClientConfig> ConnectionRequestEvent<Config> {
 
 impl<Config: ClientConfig> Clone for ConnectionRequestEvent<Config> {
     fn clone(&self) -> Self {
-        ConnectionRequestEvent::new(&self.address)
+        ConnectionRequestEvent::new(self.address)
     }
 }
 
+#[derive(Resource)]
 struct ConnectionRequestSender<Config: ClientConfig>(
     UnboundedSender<SocketAddr>,
     PhantomData<Config>,
 );
 
+#[derive(Resource)]
 struct ConnectionReceiver<Config: ClientConfig>(
     UnboundedReceiver<(SocketAddr, ClientConnection<Config>)>,
 );
 
+#[derive(Resource)]
 #[allow(clippy::type_complexity)]
+
 struct DisconnectionReceiver<Config: ClientConfig>(
     UnboundedReceiver<(
         ReceiveError<
@@ -153,6 +180,7 @@ struct DisconnectionReceiver<Config: ClientConfig>(
     PhantomData<Config>,
 );
 
+#[derive(Resource)]
 struct PacketReceiver<Config: ClientConfig>(
     UnboundedReceiver<(ClientConnection<Config>, Config::ServerPacket)>,
 );
@@ -315,7 +343,7 @@ fn packet_receive_system<Config: ClientConfig>(
 fn connection_establish_system<Config: ClientConfig>(
     mut commands: Commands,
     mut new_connections: ResMut<ConnectionReceiver<Config>>,
-    mut connections: ResMut<Vec<ClientConnection<Config>>>,
+    mut connections: ResMut<ClientConnections<Config>>,
     mut event_writer: EventWriter<ConnectionEstablishEvent<Config>>,
 ) {
     while let Ok((address, connection)) = new_connections.0.try_recv() {
@@ -331,7 +359,7 @@ fn connection_establish_system<Config: ClientConfig>(
 fn connection_remove_system<Config: ClientConfig>(
     mut commands: Commands,
     mut old_connections: ResMut<DisconnectionReceiver<Config>>,
-    mut connections: ResMut<Vec<ClientConnection<Config>>>,
+    mut connections: ResMut<ClientConnections<Config>>,
     mut event_writer: EventWriter<DisconnectionEvent<Config>>,
 ) {
     while let Ok((error, address)) = old_connections.0.try_recv() {

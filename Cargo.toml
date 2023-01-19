@@ -13,16 +13,27 @@ categories = ["game-development", "network-programming"]
 keywords = ["gamedev", "networking", "bevy"]
 
 [package.metadata.docs.rs]
-features = ["serializer_bincode", "protocol_tcp", "protocol_udp", "client", "server"]
+features = [
+    "serializer_bincode",
+    "protocol_tcp",
+    "protocol_udp",
+    "client",
+    "server",
+]
 
 [dependencies]
-bevy = { version = "0.8", default-features = false }
+bevy = { version = "0.9", default-features = false }
 serde = "1"
 byteorder = "1"
 bincode = { version = "1", optional = true }
 dashmap = { version = "5", optional = true }
 log = "0.4"
-tokio = { version = "1", features = ["io-util", "rt-multi-thread", "sync", "macros"] }
+tokio = { version = "1", features = [
+    "io-util",
+    "rt-multi-thread",
+    "sync",
+    "macros",
+] }
 async-trait = "0.1"
 futures = { version = "0.3" }
 
@@ -57,4 +68,10 @@ required-features = ["client", "server", "protocol_udp", "serializer_bincode"]
 [[example]]
 name = "lobby_and_battle_servers"
 path = "examples/lobby_and_battle_servers.rs"
-required-features = ["client", "server", "protocol_udp", "protocol_tcp", "serializer_bincode"]
+required-features = [
+    "client",
+    "server",
+    "protocol_udp",
+    "protocol_tcp",
+    "serializer_bincode",
+]

@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use bevy::prelude::Res;
+use bevy::prelude::{Res, Resource};
 use futures::task::AtomicWaker;
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -22,6 +22,7 @@ use crate::serializer::Serializer;
 /// one raw (with the stream, runs on another thread),
 /// and ecs that can be cheaply cloned and interacts with
 /// the raw connection via [`tokio::sync::mpsc`].
+#[derive(Resource)]
 pub struct EcsConnection<SendingPacket>
 where
     SendingPacket: Send + Sync + Debug + 'static,
@@ -152,7 +153,7 @@ pub(crate) static MAX_PACKET_SIZE: AtomicUsize = AtomicUsize::new(usize::MAX);
 /// because using trait consts as const generics require `generic_const_exprs` feature. You should set
 /// this resource to avoid out-of-memory attacks (where a client sends a packet with length-prefix of
 /// 100000000000 bytes and bevy_slinet tries to allocate a buffer of that size).
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Resource)]
 pub struct MaxPacketSize(pub usize);
 
 impl<ReceivingPacket, SendingPacket, NS, S, LS>

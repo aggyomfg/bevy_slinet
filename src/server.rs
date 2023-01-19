@@ -19,6 +19,30 @@ use crate::{ServerConfig, SystemLabels};
 /// Server-side connection to a server.
 pub type ServerConnection<Config> = EcsConnection<<Config as ServerConfig>::ServerPacket>;
 
+/// List of server-side connections to a server.
+
+#[derive(Resource)]
+pub struct ServerConnections<Config: ServerConfig>(Vec<ServerConnection<Config>>);
+impl<Config: ServerConfig> ServerConnections<Config> {
+    fn new() -> Self {
+        Self(Vec::new())
+    }
+}
+
+impl<Config: ServerConfig> std::ops::Deref for ServerConnections<Config> {
+    type Target = Vec<ServerConnection<Config>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<Config: ServerConfig> std::ops::DerefMut for ServerConnections<Config> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 /// Server-side plugin. Use [`ServerPlugin::bind`] to create.
 pub struct ServerPlugin<Config: ServerConfig> {
     address: SocketAddr,
@@ -30,7 +54,7 @@ impl<Config: ServerConfig> Plugin for ServerPlugin<Config> {
         app.add_event::<NewConnectionEvent<Config>>()
             .add_event::<DisconnectionEvent<Config>>()
             .add_event::<PacketReceiveEvent<Config>>()
-            .insert_resource(Vec::<ServerConnection<Config>>::new())
+            .insert_resource(ServerConnections::<Config>::new())
             .add_startup_system(create_setup_system::<Config>(self.address))
             .add_startup_system(
                 max_packet_size_warning_system.label(SystemLabels::MaxPacketSizeWarning),
@@ -72,11 +96,13 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
     }
 }
 
+#[derive(Resource)]
 struct ConnectionReceiver<Config: ServerConfig>(
     UnboundedReceiver<(SocketAddr, ServerConnection<Config>)>,
 );
 
 #[allow(clippy::type_complexity)]
+#[derive(Resource)]
 struct DisconnectionReceiver<Config: ServerConfig>(
     UnboundedReceiver<(
         ReceiveError<
@@ -88,6 +114,8 @@ struct DisconnectionReceiver<Config: ServerConfig>(
         ServerConnection<Config>,
     )>,
 );
+
+#[derive(Resource)]
 struct PacketReceiver<Config: ServerConfig>(
     UnboundedReceiver<(ServerConnection<Config>, Config::ClientPacket)>,
 );
@@ -300,7 +328,7 @@ fn accept_new_packets<Config: ServerConfig>(
 }
 
 fn remove_connections<Config: ServerConfig>(
-    mut connections: ResMut<Vec<ServerConnection<Config>>>,
+    mut connections: ResMut<ServerConnections<Config>>,
     mut disconnections: ResMut<DisconnectionReceiver<Config>>,
     mut event_writer: EventWriter<DisconnectionEvent<Config>>,
 ) {
@@ -311,7 +339,7 @@ fn remove_connections<Config: ServerConfig>(
 }
 
 fn connection_add_system<Config: ServerConfig>(
-    mut connections: ResMut<Vec<ServerConnection<Config>>>,
+    mut connections: ResMut<ServerConnections<Config>>,
     mut events: EventReader<NewConnectionEvent<Config>>,
 ) {
     for event in events.iter() {
