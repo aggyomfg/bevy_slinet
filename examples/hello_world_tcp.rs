@@ -73,7 +73,7 @@ fn server_new_connection_system(mut events: EventReader<NewConnectionEvent<Confi
 fn client_packet_receive_system(mut events: EventReader<client::PacketReceiveEvent<Config>>) {
     for event in events.iter() {
         match &event.packet {
-            ServerPacket::String(s) => println!("Server -> Client: {}", s),
+            ServerPacket::String(s) => println!("Server -> Client: {s}"),
         }
         event
             .connection
@@ -85,7 +85,7 @@ fn client_packet_receive_system(mut events: EventReader<client::PacketReceiveEve
 fn server_packet_receive_system(mut events: EventReader<server::PacketReceiveEvent<Config>>) {
     for event in events.iter() {
         match &event.packet {
-            ClientPacket::String(s) => println!("Server <- Client: {}", s),
+            ClientPacket::String(s) => println!("Server <- Client: {s}"),
         }
         event
             .connection

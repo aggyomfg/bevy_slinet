@@ -41,6 +41,7 @@ enum ClientPacket {
     Reply(usize),
 }
 
+#[derive(Resource)]
 struct ClientId(usize);
 
 fn main() {

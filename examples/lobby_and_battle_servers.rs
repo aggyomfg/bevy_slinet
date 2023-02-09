@@ -52,7 +52,7 @@ use bevy_slinet::protocol::ReceiveError;
 use bevy_slinet::protocols::tcp::TcpProtocol;
 use bevy_slinet::protocols::udp::UdpProtocol;
 use bevy_slinet::serializers::bincode::BincodeSerializer;
-use bevy_slinet::server::{NewConnectionEvent, ServerConnection, ServerPlugin};
+use bevy_slinet::server::{NewConnectionEvent, ServerConnections, ServerPlugin};
 use bevy_slinet::{client, server, ClientConfig, ServerConfig};
 
 pub const LOBBY_SERVER: &str = "127.0.0.1:3000";
@@ -122,16 +122,18 @@ enum BattleServerPacket {
     KeepAlive,
 }
 
+#[derive(Resource)]
 struct ServerKeepAliveMap<Config: ServerConfig> {
     map: HashMap<ConnectionId, Timer>,
     _marker: PhantomData<Config>,
 }
 
+#[derive(Resource)]
 struct ClientKeepAliveTimeout(Timer);
 
 impl Default for ClientKeepAliveTimeout {
     fn default() -> Self {
-        ClientKeepAliveTimeout(Timer::from_seconds(5.0, false))
+        ClientKeepAliveTimeout(Timer::from_seconds(5.0, TimerMode::Once))
     }
 }
 
@@ -146,7 +148,7 @@ impl<Config: ServerConfig> Default for ServerKeepAliveMap<Config> {
 
 fn main() {
     App::new()
-        .add_plugin(LogPlugin)
+        .add_plugin(LogPlugin::default())
         .add_plugins(MinimalPlugins)
         // Lobby server
         .add_plugin(ServerPlugin::<LobbyConfig>::bind(LOBBY_SERVER))
@@ -207,22 +209,24 @@ fn lobby_server_accept_new_connections(
     mut keep_alive_map: ResMut<ServerKeepAliveMap<LobbyConfig>>,
 ) {
     for event in event_reader.iter() {
-        keep_alive_map
-            .map
-            .insert(event.connection.id(), Timer::from_seconds(1.0, false));
+        keep_alive_map.map.insert(
+            event.connection.id(),
+            Timer::from_seconds(1.0, TimerMode::Once),
+        );
     }
 }
 
 fn battle_server_accept_new_connections(
     mut event_reader: EventReader<NewConnectionEvent<BattleConfig>>,
     mut keep_alive_map: ResMut<ServerKeepAliveMap<BattleConfig>>,
-    connections: Res<Vec<ServerConnection<BattleConfig>>>,
+    connections: Res<ServerConnections<BattleConfig>>,
 ) {
     for event in event_reader.iter() {
         log::info!("[Battle] We have a new player!");
-        keep_alive_map
-            .map
-            .insert(event.connection.id(), Timer::from_seconds(1.0, false));
+        keep_alive_map.map.insert(
+            event.connection.id(),
+            Timer::from_seconds(1.0, TimerMode::Once),
+        );
 
         // We only have 1 player, but this example shows how to get all connected clients.
         // Note that `connection` doesn't contain the new connection yet.
@@ -361,8 +365,8 @@ fn client_send_keepalive(
 }
 
 fn server_send_keepalive(
-    lobby: Res<Vec<ServerConnection<LobbyConfig>>>,
-    battle: Res<Vec<ServerConnection<BattleConfig>>>,
+    lobby: Res<ServerConnections<LobbyConfig>>,
+    battle: Res<ServerConnections<BattleConfig>>,
 ) {
     for client in lobby.iter() {
         let _ = client.send(LobbyServerPacket::KeepAlive);
@@ -436,11 +440,11 @@ fn client_reconnect_if_error(
 fn server_remove_timed_out_clients(
     time: Res<Time>,
 
-    lobby_connections: Res<Vec<ServerConnection<LobbyConfig>>>,
+    lobby_connections: Res<ServerConnections<LobbyConfig>>,
     mut lobby_map: ResMut<ServerKeepAliveMap<LobbyConfig>>,
     mut lobby_events: EventReader<server::PacketReceiveEvent<LobbyConfig>>,
 
-    battle_connections: Res<Vec<ServerConnection<BattleConfig>>>,
+    battle_connections: Res<ServerConnections<BattleConfig>>,
     mut battle_map: ResMut<ServerKeepAliveMap<BattleConfig>>,
     mut battle_events: EventReader<server::PacketReceiveEvent<BattleConfig>>,
 ) {
@@ -453,7 +457,7 @@ fn server_remove_timed_out_clients(
                 .reset()
         }
     }
-    for connection in &*lobby_connections {
+    for connection in &**lobby_connections {
         if lobby_map
             .map
             .get_mut(&connection.id())
