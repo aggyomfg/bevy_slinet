@@ -3,7 +3,7 @@ use crate::client::{ClientConnection, ClientPlugin, ConnectionEstablishEvent};
 use crate::packet_length_serializer::LittleEndian;
 use crate::protocols::tcp::TcpProtocol;
 use crate::serializers::bincode::BincodeSerializer;
-use crate::server::{NewConnectionEvent, ServerConnection, ServerPlugin};
+use crate::server::{NewConnectionEvent, ServerConnections, ServerPlugin};
 use crate::{server, ClientConfig, ServerConfig};
 use bevy::app::App;
 use bevy::ecs::event::Events;
@@ -57,7 +57,7 @@ fn tcp_connection() {
     assert_eq!(
         app_server
             .world
-            .get_resource::<Events<NewConnectionEvent<TcpConfig>>>()
+            .get_resource::<ServerConnections<TcpConfig>>()
             .unwrap()
             .len(),
         1,
