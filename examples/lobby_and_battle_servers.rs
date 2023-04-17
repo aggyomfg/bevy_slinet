@@ -39,7 +39,7 @@ use std::time::Duration;
 
 use bevy::log::LogPlugin;
 use bevy::prelude::*;
-use bevy::time::FixedTimestep;
+use bevy::time::common_conditions::on_timer;
 use bincode::DefaultOptions;
 use serde::{Deserialize, Serialize};
 
@@ -146,31 +146,36 @@ impl<Config: ServerConfig> Default for ServerKeepAliveMap<Config> {
     }
 }
 
+#[derive(SystemSet, Clone, Hash, Debug, PartialEq, Eq)]
+enum SystemSets {
+    ServerRemoveTimedOutClients,
+}
+
 fn main() {
     App::new()
         .add_plugin(LogPlugin::default())
         .add_plugins(MinimalPlugins)
         // Lobby server
         .add_plugin(ServerPlugin::<LobbyConfig>::bind(LOBBY_SERVER))
-        .add_system(lobby_server_accept_new_connections.before("remove_timed_out"))
+        .add_system(
+            lobby_server_accept_new_connections.before(SystemSets::ServerRemoveTimedOutClients),
+        )
         .add_system(lobby_server_packet_handler)
         // Battle server
         .add_plugin(ServerPlugin::<BattleConfig>::bind(BATTLE_SERVER))
-        .add_system(battle_server_accept_new_connections.before("remove_timed_out"))
+        .add_system(
+            battle_server_accept_new_connections.before(SystemSets::ServerRemoveTimedOutClients),
+        )
         .add_system(battle_server_packet_handler)
         // Keep-alive packets
         .init_resource::<ClientKeepAliveTimeout>()
         .init_resource::<ServerKeepAliveMap<LobbyConfig>>()
         .init_resource::<ServerKeepAliveMap<BattleConfig>>()
-        .add_system_set(
-            SystemSet::new()
-                .with_run_criteria(FixedTimestep::step(0.5))
-                .with_system(client_send_keepalive)
-                .with_system(server_send_keepalive),
-        )
+        .add_system(client_send_keepalive.run_if(on_timer(Duration::from_secs_f32(0.5))))
+        .add_system(server_send_keepalive.run_if(on_timer(Duration::from_secs_f32(0.5))))
         .add_system(client_reconnect_if_timeout)
         .add_system(client_reconnect_if_error)
-        .add_system(server_remove_timed_out_clients.label("remove_timed_out"))
+        .add_system(server_remove_timed_out_clients.in_set(SystemSets::ServerRemoveTimedOutClients))
         // Lobby client
         .add_plugin(ClientPlugin::<LobbyConfig>::connect(LOBBY_SERVER))
         .add_system(lobby_client_connect_handler)

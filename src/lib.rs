@@ -7,6 +7,7 @@ use std::fmt::Debug;
 use crate::packet_length_serializer::PacketLengthSerializer;
 use crate::protocol::Protocol;
 use crate::serializer::Serializer;
+use bevy::prelude::SystemSet;
 
 #[cfg(feature = "client")]
 pub mod client;
@@ -23,14 +24,14 @@ pub mod server;
 // #[cfg(test)]
 // mod tests;
 
-/// [`Labels`](bevy::ecs::schedule::SystemLabel) in [`bevy`] are used for system ordering.
+/// [`SystemSets`](bevy::ecs::schedule::SystemSet) in [`bevy`] are used for system ordering.
 /// See [System Order of Execution][cheatbook_order] on unofficial bevy cheatbook for details.
-/// For more details on what each label means, refer to [`client`](crate::client) or [`server`](crate::server) source code
+/// For more details on what each SystemSet means, refer to [`client`](crate::client) or [`server`](crate::server) source code
 ///
-/// [cheatbook_order]: https://bevy-cheatbook.github.io/programming/system-order.html
-#[derive(bevy::ecs::schedule::SystemLabel, Clone, Hash, Debug, PartialEq, Eq)]
+/// [cheatbook_systemsets]: https://bevy-cheatbook.github.io/programming/system-sets.html
+#[derive(SystemSet, Clone, Hash, Debug, PartialEq, Eq)]
 #[allow(missing_docs)]
-pub enum SystemLabels {
+pub enum SystemSets {
     ClientPacketReceive,
     ClientConnectionEstablish,
     ClientConnectionRemove,

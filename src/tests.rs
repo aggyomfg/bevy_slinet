@@ -1,9 +1,10 @@
+use crate::client;
 use crate::client::{ClientConnection, ClientPlugin, ConnectionEstablishEvent};
 use crate::packet_length_serializer::LittleEndian;
 use crate::protocols::tcp::TcpProtocol;
 use crate::serializers::bincode::BincodeSerializer;
-use crate::server::{NewConnectionEvent, ServerConnection, ServerPlugin};
-use crate::{client, server, ClientConfig, ServerConfig};
+use crate::server::{NewConnectionEvent, ServerConnections, ServerPlugin};
+use crate::{server, ClientConfig, ServerConfig};
 use bevy::app::App;
 use bevy::ecs::event::Events;
 use bevy::prelude::EventReader;
@@ -56,11 +57,11 @@ fn tcp_connection() {
     assert_eq!(
         app_server
             .world
-            .resource::<Vec<ServerConnection<TcpConfig>>>()
+            .get_resource::<ServerConnections<TcpConfig>>()
+            .unwrap()
             .len(),
         1,
-        "Vec<ServerConnection>'s length is not 1"
-    );
+    )
 }
 
 #[test]

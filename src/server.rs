@@ -14,7 +14,7 @@ use crate::connection::{
     EcsConnection, RawConnection,
 };
 use crate::protocol::{Listener, NetworkStream, Protocol, ReadStream, ReceiveError, WriteStream};
-use crate::{ServerConfig, SystemLabels};
+use crate::{ServerConfig, SystemSets};
 
 /// Server-side connection to a server.
 pub type ServerConnection<Config> = EcsConnection<<Config as ServerConfig>::ServerPacket>;
@@ -57,24 +57,28 @@ impl<Config: ServerConfig> Plugin for ServerPlugin<Config> {
             .insert_resource(ServerConnections::<Config>::new())
             .add_startup_system(create_setup_system::<Config>(self.address))
             .add_startup_system(
-                max_packet_size_warning_system.label(SystemLabels::MaxPacketSizeWarning),
+                max_packet_size_warning_system.in_set(SystemSets::MaxPacketSizeWarning),
             )
-            .add_system(set_max_packet_size_system.label(SystemLabels::SetMaxPacketSize))
-            .add_system_to_stage(
-                CoreStage::PreUpdate,
-                accept_new_connections::<Config>.label(SystemLabels::ServerAcceptNewConnections),
+            .add_system(set_max_packet_size_system.in_set(SystemSets::SetMaxPacketSize))
+            .add_system(
+                accept_new_connections::<Config>
+                    .in_base_set(CoreSet::PreUpdate)
+                    .in_set(SystemSets::ServerAcceptNewConnections),
             )
-            .add_system_to_stage(
-                CoreStage::PreUpdate,
-                accept_new_packets::<Config>.label(SystemLabels::ServerAcceptNewPackets),
+            .add_system(
+                accept_new_packets::<Config>
+                    .in_base_set(CoreSet::PreUpdate)
+                    .in_set(SystemSets::ServerAcceptNewPackets),
             )
-            .add_system_to_stage(
-                CoreStage::PostUpdate,
-                remove_connections::<Config>.label(SystemLabels::ServerRemoveConnections),
+            .add_system(
+                remove_connections::<Config>
+                    .in_base_set(CoreSet::PostUpdate)
+                    .in_set(SystemSets::ServerRemoveConnections),
             )
-            .add_system_to_stage(
-                CoreStage::PostUpdate,
-                connection_add_system::<Config>.label(SystemLabels::ServerConnectionAdd),
+            .add_system(
+                connection_add_system::<Config>
+                    .in_base_set(CoreSet::PostUpdate)
+                    .in_set(SystemSets::ServerConnectionAdd),
             );
     }
 }

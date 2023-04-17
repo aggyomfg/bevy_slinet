@@ -16,7 +16,7 @@ use crate::connection::{
 use crate::protocol::ReadStream;
 use crate::protocol::WriteStream;
 use crate::protocol::{NetworkStream, ReceiveError};
-use crate::{ClientConfig, Protocol, SystemLabels};
+use crate::{ClientConfig, Protocol, SystemSets};
 
 /// Client-side connection to a server.
 pub type ClientConnection<Config> = EcsConnection<<Config as ClientConfig>::ClientPacket>;
@@ -51,7 +51,7 @@ pub struct ClientPlugin<Config: ClientConfig> {
     _marker: PhantomData<Config>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, SystemLabel)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, SystemSet)]
 struct AddInitialConnectionRequestEventLabel;
 
 impl<Config: ClientConfig> Plugin for ClientPlugin<Config> {
@@ -64,27 +64,36 @@ impl<Config: ClientConfig> Plugin for ClientPlugin<Config> {
             .add_event::<PacketReceiveEvent<Config>>()
             .insert_resource(ClientConnections::<Config>::new())
             .add_startup_system(
-                max_packet_size_warning_system.label(SystemLabels::MaxPacketSizeWarning),
+                max_packet_size_warning_system.in_set(SystemSets::MaxPacketSizeWarning),
             )
-            .add_system(set_max_packet_size_system.label(SystemLabels::SetMaxPacketSize))
+            .add_system(set_max_packet_size_system.in_set(SystemSets::SetMaxPacketSize))
             .add_system(
-                connection_request_system::<Config>.label(SystemLabels::ClientConnectionRequest),
+                connection_request_system::<Config>
+                    .in_base_set(CoreSet::PreUpdate)
+                    .in_set(SystemSets::ClientConnectionRequest),
             )
             .add_system(
                 connection_establish_system::<Config>
-                    .label(SystemLabels::ClientConnectionEstablish),
+                    .in_base_set(CoreSet::PreUpdate)
+                    .in_set(SystemSets::ClientConnectionEstablish),
             )
             .add_system(
-                connection_remove_system::<Config>.label(SystemLabels::ClientConnectionRemove),
+                connection_remove_system::<Config>
+                    .in_base_set(CoreSet::PostUpdate)
+                    .in_set(SystemSets::ClientConnectionRemove),
             )
-            .add_system(packet_receive_system::<Config>.label(SystemLabels::ClientPacketReceive))
+            .add_system(
+                packet_receive_system::<Config>
+                    .in_base_set(CoreSet::PostUpdate)
+                    .in_set(SystemSets::ClientPacketReceive),
+            )
             .add_startup_system(
                 (move |mut events: EventWriter<ConnectionRequestEvent<Config>>| {
                     if let Some(address) = address {
                         events.send(ConnectionRequestEvent::new(address));
                     }
                 })
-                .label(AddInitialConnectionRequestEventLabel),
+                .in_set(AddInitialConnectionRequestEventLabel),
             )
             .add_startup_system(
                 setup_system::<Config>.after(AddInitialConnectionRequestEventLabel),
