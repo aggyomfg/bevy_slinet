@@ -148,7 +148,7 @@ impl<Config: ServerConfig> Default for ServerKeepAliveMap<Config> {
 
 #[derive(SystemSet, Clone, Hash, Debug, PartialEq, Eq)]
 enum SystemSets {
-    ServerRemoveTimedOutClients
+    ServerRemoveTimedOutClients,
 }
 
 fn main() {
@@ -157,11 +157,15 @@ fn main() {
         .add_plugins(MinimalPlugins)
         // Lobby server
         .add_plugin(ServerPlugin::<LobbyConfig>::bind(LOBBY_SERVER))
-        .add_system(lobby_server_accept_new_connections.before(SystemSets::ServerRemoveTimedOutClients))
+        .add_system(
+            lobby_server_accept_new_connections.before(SystemSets::ServerRemoveTimedOutClients),
+        )
         .add_system(lobby_server_packet_handler)
         // Battle server
         .add_plugin(ServerPlugin::<BattleConfig>::bind(BATTLE_SERVER))
-        .add_system(battle_server_accept_new_connections.before(SystemSets::ServerRemoveTimedOutClients))
+        .add_system(
+            battle_server_accept_new_connections.before(SystemSets::ServerRemoveTimedOutClients),
+        )
         .add_system(battle_server_packet_handler)
         // Keep-alive packets
         .init_resource::<ClientKeepAliveTimeout>()
