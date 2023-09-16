@@ -42,10 +42,14 @@ enum ServerPacket {
 fn main() {
     let server = std::thread::spawn(move || {
         App::new()
-            .add_plugins(MinimalPlugins)
-            .add_plugin(ServerPlugin::<Config>::bind("127.0.0.1:3000"))
-            .add_system(server_new_connection_system)
-            .add_system(server_packet_receive_system)
+            .add_plugins((
+                MinimalPlugins,
+                ServerPlugin::<Config>::bind("127.0.0.1:3000"),
+            ))
+            .add_systems(
+                Update,
+                (server_new_connection_system, server_packet_receive_system),
+            )
             .run();
     });
     println!("Waiting 5000ms to make sure the server side has started");
@@ -53,8 +57,8 @@ fn main() {
     let client = std::thread::spawn(move || {
         App::new()
             .add_plugins(MinimalPlugins)
-            .add_plugin(ClientPlugin::<Config>::connect("127.0.0.1:3000"))
-            .add_system(client_packet_receive_system)
+            .add_plugins(ClientPlugin::<Config>::connect("127.0.0.1:3000"))
+            .add_systems(Update, client_packet_receive_system)
             .run();
     });
     server.join().unwrap();

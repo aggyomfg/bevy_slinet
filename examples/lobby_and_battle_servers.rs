@@ -153,37 +153,52 @@ enum SystemSets {
 
 fn main() {
     App::new()
-        .add_plugin(LogPlugin::default())
-        .add_plugins(MinimalPlugins)
+        .add_plugins((LogPlugin::default(), MinimalPlugins))
         // Lobby server
-        .add_plugin(ServerPlugin::<LobbyConfig>::bind(LOBBY_SERVER))
-        .add_system(
-            lobby_server_accept_new_connections.before(SystemSets::ServerRemoveTimedOutClients),
+        .add_plugins(ServerPlugin::<LobbyConfig>::bind(LOBBY_SERVER))
+        .add_systems(
+            Update,
+            (
+                lobby_server_accept_new_connections.before(SystemSets::ServerRemoveTimedOutClients),
+                lobby_server_packet_handler,
+            ),
         )
-        .add_system(lobby_server_packet_handler)
         // Battle server
-        .add_plugin(ServerPlugin::<BattleConfig>::bind(BATTLE_SERVER))
-        .add_system(
-            battle_server_accept_new_connections.before(SystemSets::ServerRemoveTimedOutClients),
+        .add_plugins(ServerPlugin::<BattleConfig>::bind(BATTLE_SERVER))
+        .add_systems(
+            Update,
+            (
+                battle_server_accept_new_connections
+                    .before(SystemSets::ServerRemoveTimedOutClients),
+                battle_server_packet_handler,
+            ),
         )
-        .add_system(battle_server_packet_handler)
         // Keep-alive packets
         .init_resource::<ClientKeepAliveTimeout>()
         .init_resource::<ServerKeepAliveMap<LobbyConfig>>()
         .init_resource::<ServerKeepAliveMap<BattleConfig>>()
-        .add_system(client_send_keepalive.run_if(on_timer(Duration::from_secs_f32(0.5))))
-        .add_system(server_send_keepalive.run_if(on_timer(Duration::from_secs_f32(0.5))))
-        .add_system(client_reconnect_if_timeout)
-        .add_system(client_reconnect_if_error)
-        .add_system(server_remove_timed_out_clients.in_set(SystemSets::ServerRemoveTimedOutClients))
+        .add_systems(
+            Update,
+            (
+                client_send_keepalive.run_if(on_timer(Duration::from_secs_f32(0.5))),
+                server_send_keepalive.run_if(on_timer(Duration::from_secs_f32(0.5))),
+                client_reconnect_if_timeout,
+                client_reconnect_if_error,
+                server_remove_timed_out_clients.in_set(SystemSets::ServerRemoveTimedOutClients),
+            ),
+        )
         // Lobby client
-        .add_plugin(ClientPlugin::<LobbyConfig>::connect(LOBBY_SERVER))
-        .add_system(lobby_client_connect_handler)
-        .add_system(lobby_client_packet_handler)
+        .add_plugins(ClientPlugin::<LobbyConfig>::connect(LOBBY_SERVER))
+        .add_systems(
+            Update,
+            (lobby_client_connect_handler, lobby_client_packet_handler),
+        )
         // Battle client (doesn't connect immediately)
-        .add_plugin(ClientPlugin::<BattleConfig>::new())
-        .add_system(battle_client_connect_handler)
-        .add_system(battle_client_packet_handler)
+        .add_plugins(ClientPlugin::<BattleConfig>::new())
+        .add_systems(
+            Update,
+            (battle_client_connect_handler, battle_client_packet_handler),
+        )
         .run();
 }
 
