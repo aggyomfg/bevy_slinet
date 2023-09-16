@@ -55,30 +55,30 @@ impl<Config: ServerConfig> Plugin for ServerPlugin<Config> {
             .add_event::<DisconnectionEvent<Config>>()
             .add_event::<PacketReceiveEvent<Config>>()
             .insert_resource(ServerConnections::<Config>::new())
-            .add_startup_system(create_setup_system::<Config>(self.address))
-            .add_startup_system(
-                max_packet_size_warning_system.in_set(SystemSets::MaxPacketSizeWarning),
+            .add_systems(
+                Startup,
+                (
+                    create_setup_system::<Config>(self.address),
+                    max_packet_size_warning_system.in_set(SystemSets::MaxPacketSizeWarning),
+                ),
             )
-            .add_system(set_max_packet_size_system.in_set(SystemSets::SetMaxPacketSize))
-            .add_system(
-                accept_new_connections::<Config>
-                    .in_base_set(CoreSet::PreUpdate)
-                    .in_set(SystemSets::ServerAcceptNewConnections),
+            .add_systems(
+                Update,
+                set_max_packet_size_system.in_set(SystemSets::SetMaxPacketSize),
             )
-            .add_system(
-                accept_new_packets::<Config>
-                    .in_base_set(CoreSet::PreUpdate)
-                    .in_set(SystemSets::ServerAcceptNewPackets),
+            .add_systems(
+                PreUpdate,
+                (
+                    accept_new_connections::<Config>.in_set(SystemSets::ServerAcceptNewConnections),
+                    accept_new_packets::<Config>.in_set(SystemSets::ServerAcceptNewPackets),
+                ),
             )
-            .add_system(
-                remove_connections::<Config>
-                    .in_base_set(CoreSet::PostUpdate)
-                    .in_set(SystemSets::ServerRemoveConnections),
-            )
-            .add_system(
-                connection_add_system::<Config>
-                    .in_base_set(CoreSet::PostUpdate)
-                    .in_set(SystemSets::ServerConnectionAdd),
+            .add_systems(
+                PostUpdate,
+                (
+                    remove_connections::<Config>.in_set(SystemSets::ServerRemoveConnections),
+                    connection_add_system::<Config>.in_set(SystemSets::ServerConnectionAdd),
+                ),
             );
     }
 }
@@ -282,6 +282,7 @@ fn create_setup_system<Config: ServerConfig>(address: SocketAddr) -> impl Fn(Com
 }
 
 /// A new client has connected.
+#[derive(Event)]
 pub struct NewConnectionEvent<Config: ServerConfig> {
     /// The connection.
     pub connection: ServerConnection<Config>,
@@ -290,6 +291,7 @@ pub struct NewConnectionEvent<Config: ServerConfig> {
 }
 
 /// A client disconnected.
+#[derive(Event)]
 pub struct DisconnectionEvent<Config: ServerConfig> {
     /// The error.
     pub error: ReceiveError<
@@ -303,6 +305,7 @@ pub struct DisconnectionEvent<Config: ServerConfig> {
 }
 
 /// Sent for every packet received.
+#[derive(Event)]
 pub struct PacketReceiveEvent<Config: ServerConfig> {
     /// The connection.
     pub connection: ServerConnection<Config>,

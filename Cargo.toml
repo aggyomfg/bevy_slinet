@@ -1,6 +1,6 @@
 [package]
 name = "bevy_slinet"
-version = "0.6.0"
+version = "0.7.0"
 authors = ["Sliman4 <4sliman4@gmail.com>"]
 edition = "2021"
 license = "Apache-2.0 OR MIT"
@@ -22,7 +22,7 @@ features = [
 ]
 
 [dependencies]
-bevy = { version = "0.10.1", default-features = false }
+bevy = { version = "0.11.*", default-features = false }
 serde = "1"
 byteorder = "1"
 bincode = { version = "1", optional = true }

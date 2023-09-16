@@ -7,7 +7,7 @@ use crate::server::{NewConnectionEvent, ServerConnections, ServerPlugin};
 use crate::{server, ClientConfig, ServerConfig};
 use bevy::app::App;
 use bevy::ecs::event::Events;
-use bevy::prelude::EventReader;
+use bevy::prelude::{EventReader, Update};
 use bincode::DefaultOptions;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -36,10 +36,10 @@ impl ClientConfig for TcpConfig {
 #[test]
 fn tcp_connection() {
     let mut app_server = App::new();
-    app_server.add_plugin(ServerPlugin::<TcpConfig>::bind("127.0.0.1:3000"));
+    app_server.add_plugins(ServerPlugin::<TcpConfig>::bind("127.0.0.1:3000"));
 
     let mut app_client = App::new();
-    app_client.add_plugin(ClientPlugin::<TcpConfig>::connect("127.0.0.1:3000"));
+    app_client.add_plugins(ClientPlugin::<TcpConfig>::connect("127.0.0.1:3000"));
 
     app_server.update(); // bind
     app_client.update(); // connect
@@ -70,8 +70,9 @@ fn tcp_packets() {
     let server_to_client_packet = Packet(24);
 
     let mut app_server = App::new();
-    app_server.add_plugin(ServerPlugin::<TcpConfig>::bind("127.0.0.1:3001"));
-    app_server.add_system(
+    app_server.add_plugins(ServerPlugin::<TcpConfig>::bind("127.0.0.1:3001"));
+    app_server.add_systems(
+        Update,
         move |mut events: EventReader<NewConnectionEvent<TcpConfig>>| {
             for event in events.iter() {
                 event
@@ -83,8 +84,9 @@ fn tcp_packets() {
     );
 
     let mut app_client = App::new();
-    app_client.add_plugin(ClientPlugin::<TcpConfig>::connect("127.0.0.1:3001"));
-    app_client.add_system(
+    app_client.add_plugins(ClientPlugin::<TcpConfig>::connect("127.0.0.1:3001"));
+    app_client.add_systems(
+        Update,
         move |mut events: EventReader<ConnectionEstablishEvent<TcpConfig>>| {
             for event in events.iter() {
                 event

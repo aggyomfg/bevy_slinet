@@ -63,40 +63,40 @@ impl<Config: ClientConfig> Plugin for ClientPlugin<Config> {
             .add_event::<DisconnectionEvent<Config>>()
             .add_event::<PacketReceiveEvent<Config>>()
             .insert_resource(ClientConnections::<Config>::new())
-            .add_startup_system(
+            .add_systems(
+                Startup,
                 max_packet_size_warning_system.in_set(SystemSets::MaxPacketSizeWarning),
             )
-            .add_system(set_max_packet_size_system.in_set(SystemSets::SetMaxPacketSize))
-            .add_system(
-                connection_request_system::<Config>
-                    .in_base_set(CoreSet::PreUpdate)
-                    .in_set(SystemSets::ClientConnectionRequest),
+            .add_systems(
+                Update,
+                set_max_packet_size_system.in_set(SystemSets::SetMaxPacketSize),
             )
-            .add_system(
-                connection_establish_system::<Config>
-                    .in_base_set(CoreSet::PreUpdate)
-                    .in_set(SystemSets::ClientConnectionEstablish),
+            .add_systems(
+                PreUpdate,
+                (
+                    connection_request_system::<Config>.in_set(SystemSets::ClientConnectionRequest),
+                    connection_establish_system::<Config>
+                        .in_set(SystemSets::ClientConnectionEstablish),
+                ),
             )
-            .add_system(
-                connection_remove_system::<Config>
-                    .in_base_set(CoreSet::PostUpdate)
-                    .in_set(SystemSets::ClientConnectionRemove),
+            .add_systems(
+                PostUpdate,
+                (
+                    connection_remove_system::<Config>.in_set(SystemSets::ClientConnectionRemove),
+                    packet_receive_system::<Config>.in_set(SystemSets::ClientPacketReceive),
+                ),
             )
-            .add_system(
-                packet_receive_system::<Config>
-                    .in_base_set(CoreSet::PostUpdate)
-                    .in_set(SystemSets::ClientPacketReceive),
-            )
-            .add_startup_system(
-                (move |mut events: EventWriter<ConnectionRequestEvent<Config>>| {
-                    if let Some(address) = address {
-                        events.send(ConnectionRequestEvent::new(address));
-                    }
-                })
-                .in_set(AddInitialConnectionRequestEventLabel),
-            )
-            .add_startup_system(
-                setup_system::<Config>.after(AddInitialConnectionRequestEventLabel),
+            .add_systems(
+                Startup,
+                (
+                    (move |mut events: EventWriter<ConnectionRequestEvent<Config>>| {
+                        if let Some(address) = address {
+                            events.send(ConnectionRequestEvent::new(address));
+                        }
+                    })
+                    .in_set(AddInitialConnectionRequestEventLabel),
+                    setup_system::<Config>.after(AddInitialConnectionRequestEventLabel),
+                ),
             );
     }
 }
@@ -137,6 +137,7 @@ impl<Config: ClientConfig> ClientPlugin<Config> {
 
 /// Send this event to indicate that you want to connect to a server.
 /// Wait for [`ConnectionEstablishEvent`] or [`DisconnectionEvent`] to know the connection's state
+#[derive(Event)]
 pub struct ConnectionRequestEvent<Config: ClientConfig> {
     address: SocketAddr,
     _marker: PhantomData<Config>,
@@ -386,6 +387,7 @@ fn connection_remove_system<Config: ClientConfig>(
 }
 
 /// Indicates that a connection was successfully established.
+#[derive(Event)]
 pub struct ConnectionEstablishEvent<Config: ClientConfig> {
     /// A server address.
     pub address: SocketAddr,
@@ -394,6 +396,7 @@ pub struct ConnectionEstablishEvent<Config: ClientConfig> {
 }
 
 /// Indicates that something went wrong during a connection attempt. See [`DisconnectionEvent.error`] for details
+#[derive(Event)]
 pub struct DisconnectionEvent<Config: ClientConfig> {
     /// The error.
     pub error: ReceiveError<
@@ -408,6 +411,7 @@ pub struct DisconnectionEvent<Config: ClientConfig> {
 }
 
 /// Sent for every packet received.
+#[derive(Event)]
 pub struct PacketReceiveEvent<Config: ClientConfig> {
     /// The connection.
     pub connection: ClientConnection<Config>,

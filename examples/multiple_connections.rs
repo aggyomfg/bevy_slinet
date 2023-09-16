@@ -47,10 +47,14 @@ struct ClientId(usize);
 fn main() {
     let server = std::thread::spawn(move || {
         App::new()
-            .add_plugins(MinimalPlugins)
-            .add_plugin(ServerPlugin::<Config>::bind("127.0.0.1:3000"))
-            .add_system(server_new_connection_system)
-            .add_system(server_packet_receive_system)
+            .add_plugins((
+                MinimalPlugins,
+                ServerPlugin::<Config>::bind("127.0.0.1:3000"),
+            ))
+            .add_systems(
+                Update,
+                (server_new_connection_system, server_packet_receive_system),
+            )
             .run();
     });
     println!("Waiting 5000ms to make sure the server has started");
@@ -58,10 +62,12 @@ fn main() {
     for id in 0..10 {
         std::thread::spawn(move || {
             App::new()
-                .add_plugins(MinimalPlugins)
-                .add_plugin(ClientPlugin::<Config>::connect("127.0.0.1:3000"))
+                .add_plugins((
+                    MinimalPlugins,
+                    ClientPlugin::<Config>::connect("127.0.0.1:3000"),
+                ))
                 .insert_resource(ClientId(id))
-                .add_system(client_packet_receive_system)
+                .add_systems(Update, client_packet_receive_system)
                 .run();
         });
     }
