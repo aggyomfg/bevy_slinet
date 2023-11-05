@@ -46,9 +46,8 @@ enum ServerPacket {
 fn main() {
     App::new()
         .add_plugins(MinimalPlugins)
-        .add_plugin(ClientPlugin::<Config>::connect("127.0.0.1:3000"))
-        .add_system(connection_establish_system)
-        .add_system(packet_receive_system)
+        .add_plugins(ClientPlugin::<Config>::connect("127.0.0.1:3000"))
+        .add_systems(Update, (connection_establish_system, packet_receive_system))
         .run()
 }
 
@@ -105,9 +104,8 @@ enum ServerPacket {
 fn main() {
     App::new()
         .add_plugins(MinimalPlugins)
-        .add_plugin(ServerPlugin::<Config>::bind("127.0.0.1:3000").unwrap())
-        .add_system(new_connection_system)
-        .add_system(packet_receive_system)
+        .add_plugins(ServerPlugin::<Config>::bind("127.0.0.1:3000").unwrap())
+        .add_systems(Update, (new_connection_system, packet_receive_system))
         .run()
 }
 
