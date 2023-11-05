@@ -349,7 +349,7 @@ fn connection_add_system<Config: ServerConfig>(
     mut connections: ResMut<ServerConnections<Config>>,
     mut events: EventReader<NewConnectionEvent<Config>>,
 ) {
-    for event in events.iter() {
+    for event in events.read() {
         connections.push(event.connection.clone());
     }
 }

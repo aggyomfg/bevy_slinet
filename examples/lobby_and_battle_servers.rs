@@ -205,7 +205,7 @@ fn main() {
 fn lobby_server_packet_handler(
     mut event_reader: EventReader<server::PacketReceiveEvent<LobbyConfig>>,
 ) {
-    for event in event_reader.iter() {
+    for event in event_reader.read() {
         log::info!("Client -> Lobby: {:?}", event.packet);
         match event.packet {
             LobbyClientPacket::Hello => {
@@ -228,7 +228,7 @@ fn lobby_server_accept_new_connections(
     mut event_reader: EventReader<NewConnectionEvent<LobbyConfig>>,
     mut keep_alive_map: ResMut<ServerKeepAliveMap<LobbyConfig>>,
 ) {
-    for event in event_reader.iter() {
+    for event in event_reader.read() {
         keep_alive_map.map.insert(
             event.connection.id(),
             Timer::from_seconds(1.0, TimerMode::Once),
@@ -241,7 +241,7 @@ fn battle_server_accept_new_connections(
     mut keep_alive_map: ResMut<ServerKeepAliveMap<BattleConfig>>,
     connections: Res<ServerConnections<BattleConfig>>,
 ) {
-    for event in event_reader.iter() {
+    for event in event_reader.read() {
         log::info!("[Battle] We have a new player!");
         keep_alive_map.map.insert(
             event.connection.id(),
@@ -265,7 +265,7 @@ fn battle_server_accept_new_connections(
 fn battle_server_packet_handler(
     mut event_reader: EventReader<server::PacketReceiveEvent<BattleConfig>>,
 ) {
-    for event in event_reader.iter() {
+    for event in event_reader.read() {
         log::info!("Client -> Battle: {:?}", event.packet);
         #[allow(clippy::single_match)]
         match event.packet {
@@ -282,7 +282,7 @@ fn lobby_client_packet_handler(
     mut event_reader: EventReader<client::PacketReceiveEvent<LobbyConfig>>,
     mut event_writer: EventWriter<ConnectionRequestEvent<BattleConfig>>,
 ) {
-    for event in event_reader.iter() {
+    for event in event_reader.read() {
         log::info!(
             "Lobby -> Client{:?}: {:?}",
             event.connection.id(),
@@ -309,7 +309,7 @@ fn battle_client_packet_handler(
     mut event_reader: EventReader<client::PacketReceiveEvent<BattleConfig>>,
     mut event_writer: EventWriter<ConnectionRequestEvent<LobbyConfig>>,
 ) {
-    for event in event_reader.iter() {
+    for event in event_reader.read() {
         if event.packet != BattleServerPacket::KeepAlive {
             log::info!(
                 "Battle -> Client{:?}: {:?}",
@@ -357,7 +357,7 @@ fn lobby_client_connect_handler(
     mut events: EventReader<ConnectionEstablishEvent<LobbyConfig>>,
     mut timeout: ResMut<ClientKeepAliveTimeout>,
 ) {
-    for event in events.iter() {
+    for event in events.read() {
         event.connection.send(LobbyClientPacket::Hello).unwrap();
         timeout.0.reset();
     }
@@ -367,7 +367,7 @@ fn battle_client_connect_handler(
     mut events: EventReader<ConnectionEstablishEvent<BattleConfig>>,
     mut timeout: ResMut<ClientKeepAliveTimeout>,
 ) {
-    for _ in events.iter() {
+    for _ in events.read() {
         timeout.0.reset();
     }
 }
@@ -410,12 +410,12 @@ fn client_reconnect_if_timeout(
 
     mut timeout: ResMut<ClientKeepAliveTimeout>,
 ) {
-    for packet in lobby_packets.iter() {
+    for packet in lobby_packets.read() {
         if packet.packet == LobbyServerPacket::KeepAlive {
             timeout.0.reset();
         }
     }
-    for packet in battle_packets.iter() {
+    for packet in battle_packets.read() {
         if packet.packet == BattleServerPacket::KeepAlive {
             timeout.0.reset();
         }
@@ -443,13 +443,13 @@ fn client_reconnect_if_error(
     mut battle_disconnect: EventReader<client::DisconnectionEvent<BattleConfig>>,
     mut battle_reconnect: EventWriter<ConnectionRequestEvent<BattleConfig>>,
 ) {
-    for event in lobby_disconnect.iter() {
+    for event in lobby_disconnect.read() {
         if !matches!(event.error, ReceiveError::IntentionalDisconnection) {
             log::error!("Lobby disconnect. Reconnecting. Error: {:?}", event.error);
             lobby_reconnect.send(ConnectionRequestEvent::new(event.address));
         }
     }
-    for event in battle_disconnect.iter() {
+    for event in battle_disconnect.read() {
         if !matches!(event.error, ReceiveError::IntentionalDisconnection) {
             log::error!("Battle disconnect. Reconnecting. Error: {:?}", event.error);
             battle_reconnect.send(ConnectionRequestEvent::new(event.address));
@@ -468,7 +468,7 @@ fn server_remove_timed_out_clients(
     mut battle_map: ResMut<ServerKeepAliveMap<BattleConfig>>,
     mut battle_events: EventReader<server::PacketReceiveEvent<BattleConfig>>,
 ) {
-    for event in lobby_events.iter() {
+    for event in lobby_events.read() {
         if event.packet == LobbyClientPacket::KeepAlive {
             lobby_map
                 .map
@@ -489,7 +489,7 @@ fn server_remove_timed_out_clients(
         }
     }
 
-    for event in battle_events.iter() {
+    for event in battle_events.read() {
         if event.packet == BattleClientPacket::KeepAlive {
             battle_map
                 .map

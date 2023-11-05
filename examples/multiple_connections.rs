@@ -75,7 +75,7 @@ fn main() {
 }
 
 fn server_new_connection_system(mut events: EventReader<NewConnectionEvent<Config>>) {
-    for event in events.iter() {
+    for event in events.read() {
         println!("Connection");
         event.connection.send(ServerPacket::Hello).unwrap();
     }
@@ -85,7 +85,7 @@ fn client_packet_receive_system(
     mut events: EventReader<client::PacketReceiveEvent<Config>>,
     client_number: Res<ClientId>,
 ) {
-    for event in events.iter() {
+    for event in events.read() {
         match &event.packet {
             ServerPacket::Hello => {
                 println!("Server -> Client: Hello (client #{})", client_number.0);
@@ -100,7 +100,7 @@ fn client_packet_receive_system(
 }
 
 fn server_packet_receive_system(mut events: EventReader<server::PacketReceiveEvent<Config>>) {
-    for event in events.iter() {
+    for event in events.read() {
         match &event.packet {
             ClientPacket::Hello => {
                 println!("Server <- Client {:04?}: Hello", event.connection.id());

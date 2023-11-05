@@ -313,7 +313,7 @@ fn connection_request_system<Config: ClientConfig>(
     requests: Res<ConnectionRequestSender<Config>>,
     mut events: EventReader<ConnectionRequestEvent<Config>>,
 ) {
-    for event in events.iter() {
+    for event in events.read() {
         requests.0.send(event.address).unwrap();
     }
 }

@@ -53,13 +53,13 @@ fn main() {
 }
 
 fn connection_establish_system(mut events: EventReader<ConnectionEstablishEvent<Config>>) {
-    for _event in events.iter() {
+    for _event in events.read() {
         println!("Connected!");
     }
 }
 
 fn packet_receive_system(mut events: EventReader<PacketReceiveEvent<Config>>) {
-    for event in events.iter() {
+    for event in events.read() {
         match &event.packet {
             ServerPacket::String(s) => println!("Got a message: {}", s),
         }
@@ -112,7 +112,7 @@ fn main() {
 }
 
 fn new_connection_system(mut events: EventReader<NewConnectionEvent<Config>>) {
-    for event in events.iter() {
+    for event in events.read() {
         event
             .connection
             .send(ServerPacket::String("Hello, Client!".to_string())).unwrap();
@@ -120,7 +120,7 @@ fn new_connection_system(mut events: EventReader<NewConnectionEvent<Config>>) {
 }
 
 fn packet_receive_system(mut events: EventReader<PacketReceiveEvent<Config>>) {
-    for event in events.iter() {
+    for event in events.read() {
         match &event.packet {
             ClientPacket::String(s) => println!("Got a message from a client: {}", s),
         }
@@ -146,4 +146,5 @@ Note: you should implement keep-alive and disconnection systems yourself, or loo
 | `0.5`          | `0.9`        |
 | `0.6`          | `0.10.1`     |
 | `0.7`          | `0.11`       |
-| `main`         | `0.11`       |
+| `0.8`          | `0.12`       |
+| `main`         | `0.12`       |
