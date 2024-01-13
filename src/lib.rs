@@ -21,8 +21,8 @@ pub mod serializers;
 pub mod server;
 
 // Tests work fine on my pc but fail on CI, idk how to make them pass, networking speed depends on machine
-// #[cfg(test)]
-// mod tests;
+#[cfg(test)]
+mod tests;
 
 /// [`SystemSets`](bevy::ecs::schedule::SystemSet) in [`bevy`] are used for system ordering.
 /// See [System Order of Execution][cheatbook_order] on unofficial bevy cheatbook for details.
