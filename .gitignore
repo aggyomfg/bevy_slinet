@@ -1,7 +1,6 @@
 /target
 /Cargo.lock
 /.idea
-/.vscode
 /.cargo/config
 /.cargo/config.toml
 /*.iml

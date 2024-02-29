@@ -1,0 +1,3 @@
+{
+    "rust-analyzer.cargo.features": ["serializer_bincode", "protocol_tcp", "protocol_udp", "client", "server"]
+}

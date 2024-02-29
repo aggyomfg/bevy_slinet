@@ -346,7 +346,7 @@ fn packet_receive_system<Config: ClientConfig>(
     mut event_writer: EventWriter<PacketReceiveEvent<Config>>,
 ) {
     while let Ok((connection, packet)) = packets.0.try_recv() {
-        event_writer.send(PacketReceiveEvent { connection, packet })
+        let _id = event_writer.send(PacketReceiveEvent { connection, packet });
     }
 }
 
@@ -359,10 +359,10 @@ fn connection_establish_system<Config: ClientConfig>(
     while let Ok((address, connection)) = new_connections.0.try_recv() {
         commands.insert_resource(connection.clone());
         connections.push(connection.clone());
-        event_writer.send(ConnectionEstablishEvent {
+        let _id = event_writer.send(ConnectionEstablishEvent {
             address,
             connection,
-        })
+        });
     }
 }
 
@@ -378,11 +378,11 @@ fn connection_remove_system<Config: ClientConfig>(
         if let Some(connection) = connections.last() {
             commands.insert_resource(connection.clone());
         }
-        event_writer.send(DisconnectionEvent {
+        let _id = event_writer.send(DisconnectionEvent {
             error,
             address,
             _marker: PhantomData,
-        })
+        });
     }
 }
 
