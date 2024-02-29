@@ -318,10 +318,10 @@ fn accept_new_connections<Config: ServerConfig>(
     mut event_writer: EventWriter<NewConnectionEvent<Config>>,
 ) {
     while let Ok((address, connection)) = receiver.0.try_recv() {
-        event_writer.send(NewConnectionEvent {
+        let _id = event_writer.send(NewConnectionEvent {
             connection,
             address,
-        })
+        });
     }
 }
 
@@ -330,7 +330,7 @@ fn accept_new_packets<Config: ServerConfig>(
     mut event_writer: EventWriter<PacketReceiveEvent<Config>>,
 ) {
     while let Ok((connection, packet)) = receiver.0.try_recv() {
-        event_writer.send(PacketReceiveEvent { connection, packet })
+        let _id = event_writer.send(PacketReceiveEvent { connection, packet });
     }
 }
 

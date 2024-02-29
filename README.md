@@ -1,4 +1,5 @@
 # bevy_slinet
+
 A simple networking plugin for bevy.
 
 [![docs.rs](https://img.shields.io/docsrs/bevy_slinet)](https://docs.rs/bevy_slinet)
@@ -6,6 +7,7 @@ A simple networking plugin for bevy.
 [![Crates.io](https://img.shields.io/crates/l/bevy_slinet)](https://github.com/Sliman4/bevy_slinet/tree/main/LICENSE)
 
 ## Features
+
 - You can choose TCP or UDP protocol. Adding your own protocols is as easy as implementing a few traits.
 - Multiple clients/servers with different configs (specifies a protocol, packet types, serializer, etc.)
 - De/serialization. You choose a serialization format, packet type (you probably want it to be `enum`), and receive events with deserialized packets.
@@ -13,6 +15,7 @@ A simple networking plugin for bevy.
 > Note: Everything in bevy_slinet is feature-gated. Make sure to enable features you need (`client`, `server`, `protocol_tcp`, `protocol_udp`, `serializer_bincode`).
 
 ## Client example
+
 ```rust
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -132,9 +135,11 @@ fn packet_receive_system(mut events: EventReader<PacketReceiveEvent<Config>>) {
 Note: you should implement keep-alive and disconnection systems yourself, or look at [lobby_and_battle_servers example](examples/lobby_and_battle_servers.rs)
 
 ## More examples
+
 [Here](https://github.com/Sliman4/bevy_slinet/tree/main/examples).
 
 ### Compatibility table
+
 | Plugin Version | Bevy Version |
 |----------------|--------------|
 | `0.1`          | `0.6`        |
@@ -145,4 +150,5 @@ Note: you should implement keep-alive and disconnection systems yourself, or loo
 | `0.6`          | `0.10.1`     |
 | `0.7`          | `0.11`       |
 | `0.8`          | `0.12`       |
-| `main`         | `0.12`       |
+| `0.9`          | `0.13`       |
+| `main`         | `0.13`       |
