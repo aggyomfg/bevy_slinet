@@ -134,8 +134,6 @@ impl Debug for ConnectionId {
     }
 }
 
-impl ConnectionId {}
-
 impl ConnectionId {
     /// Creates and returns a new, unique [`ConnectionId`].
     /// See the source code for implementation details.
