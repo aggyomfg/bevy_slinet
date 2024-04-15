@@ -1,6 +1,8 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use bevy::prelude::*;
+use bevy_slinet::serializer::SerializerAdapter;
 use bincode::DefaultOptions;
 use serde::{Deserialize, Serialize};
 
@@ -17,7 +19,11 @@ impl ServerConfig for Config {
     type ClientPacket = ClientPacket;
     type ServerPacket = ServerPacket;
     type Protocol = TcpProtocol;
-    type Serializer = BincodeSerializer<DefaultOptions>;
+    type SerializerError = bincode::Error;
+    fn build_serializer(
+    ) -> SerializerAdapter<Self::ClientPacket, Self::ServerPacket, Self::SerializerError> {
+        SerializerAdapter::ReadOnly(Arc::new(BincodeSerializer::<DefaultOptions>::default()))
+    }
     type LengthSerializer = LittleEndian<u32>;
 }
 
@@ -25,7 +31,11 @@ impl ClientConfig for Config {
     type ClientPacket = ClientPacket;
     type ServerPacket = ServerPacket;
     type Protocol = TcpProtocol;
-    type Serializer = BincodeSerializer<DefaultOptions>;
+    type SerializerError = bincode::Error;
+    fn build_serializer(
+    ) -> SerializerAdapter<Self::ServerPacket, Self::ClientPacket, Self::SerializerError> {
+        SerializerAdapter::ReadOnly(Arc::new(BincodeSerializer::<DefaultOptions>::default()))
+    }
     type LengthSerializer = LittleEndian<u32>;
 }
 

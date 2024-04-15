@@ -104,10 +104,14 @@ impl NetworkStream for UdpServerStream {
     type WriteHalf = UdpServerWriteHalf;
 
     async fn into_split(self) -> io::Result<(Self::ReadHalf, Self::WriteHalf)> {
+        let peer_addr = self.peer_addr();
         Ok((
-            UdpServerReadHalf(self.task.clone()),
+            UdpServerReadHalf {
+                peer_addr: peer_addr,
+                task: self.task,
+            },
             UdpServerWriteHalf {
-                peer_addr: self.peer_addr(),
+                peer_addr: peer_addr,
                 socket: self.socket,
             },
         ))
@@ -123,10 +127,16 @@ impl NetworkStream for UdpServerStream {
 }
 
 /// The read half of [`UdpServerStream`].
-pub struct UdpServerReadHalf(UdpRead);
+pub struct UdpServerReadHalf {
+    peer_addr: SocketAddr,
+    task: UdpRead,
+}
 
 #[async_trait]
 impl ReadStream for UdpServerReadHalf {
+    fn peer_addr(&self) -> std::io::Result<SocketAddr> {
+        Ok(self.peer_addr)
+    }
     fn read_exact<'life0, 'life1, 'async_trait>(
         &'life0 mut self,
         buffer: &'life1 mut [u8],
@@ -137,7 +147,7 @@ impl ReadStream for UdpServerReadHalf {
         Self: 'async_trait,
     {
         Box::pin(UdpReadTask {
-            read: self.0.clone(),
+            read: self.task.clone(),
             buffer,
         })
     }
@@ -184,6 +194,9 @@ pub struct UdpServerWriteHalf {
 
 #[async_trait]
 impl WriteStream for UdpServerWriteHalf {
+    fn peer_addr(&self) -> io::Result<SocketAddr> {
+        Ok(self.peer_addr)
+    }
     async fn write_all(&mut self, buffer: &[u8]) -> std::io::Result<()> {
         self.socket
             .send_to(buffer, self.peer_addr)
@@ -258,6 +271,9 @@ pub struct UdpClientReadHalf {
 
 #[async_trait]
 impl ReadStream for UdpClientReadHalf {
+    fn peer_addr(&self) -> std::io::Result<SocketAddr> {
+        self.socket.peer_addr()
+    }
     async fn read_exact(&mut self, buffer: &mut [u8]) -> std::io::Result<()> {
         loop {
             if self.buffer.len() >= buffer.len() {
@@ -277,8 +293,17 @@ pub struct UdpClientWriteHalf {
     socket: UdpSocket,
 }
 
+impl AsRef<UdpSocket> for UdpClientWriteHalf {
+    fn as_ref(&self) -> &UdpSocket {
+        &self.socket
+    }
+}
+
 #[async_trait]
 impl WriteStream for UdpClientWriteHalf {
+    fn peer_addr(&self) -> io::Result<SocketAddr> {
+        self.as_ref().peer_addr()
+    }
     async fn write_all(&mut self, buffer: &[u8]) -> std::io::Result<()> {
         self.socket
             .send(buffer)

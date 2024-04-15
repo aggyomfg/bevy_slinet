@@ -2,6 +2,7 @@ use crate::client;
 use crate::client::{ClientConnection, ClientPlugin, ConnectionEstablishEvent};
 use crate::packet_length_serializer::LittleEndian;
 use crate::protocols::tcp::TcpProtocol;
+use crate::serializer::SerializerAdapter;
 use crate::serializers::bincode::BincodeSerializer;
 use crate::server::{NewConnectionEvent, ServerConnections, ServerPlugin};
 use crate::{server, ClientConfig, ServerConfig};
@@ -10,6 +11,7 @@ use bevy::ecs::event::Events;
 use bevy::prelude::{EventReader, Update};
 use bincode::DefaultOptions;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
@@ -21,16 +23,28 @@ impl ServerConfig for TcpConfig {
     type ClientPacket = Packet;
     type ServerPacket = Packet;
     type Protocol = TcpProtocol;
-    type Serializer = BincodeSerializer<DefaultOptions>;
+
+    type SerializerError = bincode::Error;
+
     type LengthSerializer = LittleEndian<u32>;
+
+    fn build_serializer(
+    ) -> SerializerAdapter<Self::ClientPacket, Self::ServerPacket, Self::SerializerError> {
+        SerializerAdapter::ReadOnly(Arc::new(BincodeSerializer::<DefaultOptions>::default()))
+    }
 }
 
 impl ClientConfig for TcpConfig {
     type ClientPacket = Packet;
     type ServerPacket = Packet;
     type Protocol = TcpProtocol;
-    type Serializer = BincodeSerializer<DefaultOptions>;
+    type SerializerError = bincode::Error;
+
     type LengthSerializer = LittleEndian<u32>;
+    fn build_serializer(
+    ) -> SerializerAdapter<Self::ClientPacket, Self::ServerPacket, Self::SerializerError> {
+        SerializerAdapter::ReadOnly(Arc::new(BincodeSerializer::<DefaultOptions>::default()))
+    }
 }
 
 #[test]

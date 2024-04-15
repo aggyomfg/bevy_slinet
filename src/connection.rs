@@ -1,8 +1,8 @@
 //! This module contains structs that are used connection handling.
 
+use std::error::Error;
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
-use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -16,7 +16,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::packet_length_serializer::PacketLengthSerializer;
 use crate::protocol::NetworkStream;
-use crate::serializer::Serializer;
+use crate::serializer::SerializerAdapter;
 
 /// The ecs-side connection struct. There is 2 structs,
 /// one raw (with the stream, runs on another thread),
@@ -88,31 +88,29 @@ where
     }
 }
 
-pub(crate) struct RawConnection<ReceivingPacket, SendingPacket, NS, S, LS>
+pub(crate) struct RawConnection<ReceivingPacket, SendingPacket, NS, SE, LS>
 where
     ReceivingPacket: Send + Sync + Debug + 'static,
     SendingPacket: Send + Sync + Debug + 'static,
     NS: NetworkStream,
-    S: Serializer<ReceivingPacket, SendingPacket>,
+    SE: Error + Send + Sync,
     LS: PacketLengthSerializer,
 {
     pub disconnect_task: DisconnectTask,
     pub stream: NS,
-    pub serializer: Arc<S>,
+    pub serializer: Arc<SerializerAdapter<ReceivingPacket, SendingPacket, SE>>,
     pub packet_length_serializer: Arc<LS>,
     pub packets_rx: UnboundedReceiver<SendingPacket>,
     pub id: ConnectionId,
-    pub _receive_packet: PhantomData<ReceivingPacket>,
-    pub _send_packet: PhantomData<SendingPacket>,
 }
 
-impl<ReceivingPacket, SendingPacket, NS, S, LS> Debug
-    for RawConnection<ReceivingPacket, SendingPacket, NS, S, LS>
+impl<ReceivingPacket, SendingPacket, NS, SE, LS> Debug
+    for RawConnection<ReceivingPacket, SendingPacket, NS, SE, LS>
 where
     ReceivingPacket: Send + Sync + Debug + 'static,
     SendingPacket: Send + Sync + Debug + 'static,
     NS: NetworkStream,
-    S: Serializer<ReceivingPacket, SendingPacket>,
+    SE: Error + Send + Sync,
     LS: PacketLengthSerializer,
 {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -130,12 +128,13 @@ where
 /// counter that increments for every clientside/serverside connection.
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, bevy::ecs::component::Component)]
 pub struct ConnectionId(usize);
-
 impl Debug for ConnectionId {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "#{}", self.0)
     }
 }
+
+impl ConnectionId {}
 
 impl ConnectionId {
     /// Creates and returns a new, unique [`ConnectionId`].
@@ -144,6 +143,10 @@ impl ConnectionId {
         static CONNECTION_ID: AtomicUsize = AtomicUsize::new(0);
 
         ConnectionId(CONNECTION_ID.fetch_add(1, Ordering::Relaxed))
+    }
+    // Allows to convert ConnectionId for more flexible usage
+    pub fn read(&self) -> usize {
+        self.0
     }
 }
 
@@ -156,31 +159,29 @@ pub(crate) static MAX_PACKET_SIZE: AtomicUsize = AtomicUsize::new(usize::MAX);
 #[derive(Copy, Clone, Resource)]
 pub struct MaxPacketSize(pub usize);
 
-impl<ReceivingPacket, SendingPacket, NS, S, LS>
-    RawConnection<ReceivingPacket, SendingPacket, NS, S, LS>
+impl<ReceivingPacket, SendingPacket, NS, SE, LS>
+    RawConnection<ReceivingPacket, SendingPacket, NS, SE, LS>
 where
     ReceivingPacket: Send + Sync + Debug + 'static,
     SendingPacket: Send + Sync + Debug + 'static,
     NS: NetworkStream,
-    S: Serializer<ReceivingPacket, SendingPacket>,
+    SE: Error + Send + Sync,
     LS: PacketLengthSerializer,
 {
     #[cfg(feature = "client")]
     pub fn new(
         stream: NS,
-        serializer: S,
+        serializer: Arc<SerializerAdapter<ReceivingPacket, SendingPacket, SE>>,
         packet_length_serializer: LS,
         packets_rx: UnboundedReceiver<SendingPacket>,
     ) -> Self {
         Self {
             disconnect_task: DisconnectTask::default(),
             stream,
-            serializer: Arc::new(serializer),
+            serializer,
             packet_length_serializer: Arc::new(packet_length_serializer),
             packets_rx,
             id: ConnectionId::next(),
-            _receive_packet: PhantomData,
-            _send_packet: PhantomData,
         }
     }
 

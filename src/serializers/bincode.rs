@@ -1,6 +1,6 @@
 //! A [`bincode`]-based packet serializer. You can enable it by adding `serializer_bincode` feature.
 
-use crate::serializer::Serializer;
+use crate::serializer::ReadOnlySerializer;
 pub use bincode::{DefaultOptions, Options};
 use serde::{Deserialize, Serialize};
 
@@ -10,7 +10,7 @@ pub struct BincodeSerializer<O>(pub O)
 where
     O: Options + Send + Sync + 'static;
 
-impl<ReceivingPacket, SendingPacket, O> Serializer<ReceivingPacket, SendingPacket>
+impl<ReceivingPacket, SendingPacket, O> ReadOnlySerializer<ReceivingPacket, SendingPacket>
     for BincodeSerializer<O>
 where
     ReceivingPacket: for<'de> Deserialize<'de>,

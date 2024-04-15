@@ -66,6 +66,9 @@ impl NetworkStream for TcpNetworkStream {
 
 #[async_trait]
 impl ReadStream for OwnedReadHalf {
+    fn peer_addr(&self) -> io::Result<SocketAddr> {
+        self.as_ref().peer_addr()
+    }
     async fn read_exact(&mut self, buffer: &mut [u8]) -> io::Result<()> {
         AsyncReadExt::read_exact(self, buffer).await.map(|_| ())
     }
@@ -73,6 +76,9 @@ impl ReadStream for OwnedReadHalf {
 
 #[async_trait]
 impl WriteStream for OwnedWriteHalf {
+    fn peer_addr(&self) -> io::Result<SocketAddr> {
+        self.as_ref().peer_addr()
+    }
     async fn write_all(&mut self, buffer: &[u8]) -> io::Result<()> {
         AsyncWriteExt::write_all(self, buffer).await
     }

@@ -17,26 +17,35 @@ use crate::protocol::{Listener, NetworkStream, Protocol, ReadStream, ReceiveErro
 use crate::{ServerConfig, SystemSets};
 
 /// Server-side connection to a server.
-pub type ServerConnection<Config> = EcsConnection<<Config as ServerConfig>::ServerPacket>;
+pub type EcsServerConnection<Config> = EcsConnection<<Config as ServerConfig>::ServerPacket>;
 
+// Raw connection to a server.
+type RawServerConnection<Config> = (
+    RawConnection<
+        <Config as ServerConfig>::ClientPacket,
+        <Config as ServerConfig>::ServerPacket,
+        <<Config as ServerConfig>::Protocol as Protocol>::ServerStream,
+        <Config as ServerConfig>::SerializerError,
+        <Config as ServerConfig>::LengthSerializer,
+    >,
+    EcsServerConnection<Config>,
+);
 /// List of server-side connections to a server.
 
 #[derive(Resource)]
-pub struct ServerConnections<Config: ServerConfig>(Vec<ServerConnection<Config>>);
+pub struct ServerConnections<Config: ServerConfig>(Vec<EcsServerConnection<Config>>);
 impl<Config: ServerConfig> ServerConnections<Config> {
     fn new() -> Self {
         Self(Vec::new())
     }
 }
-
 impl<Config: ServerConfig> std::ops::Deref for ServerConnections<Config> {
-    type Target = Vec<ServerConnection<Config>>;
+    type Target = Vec<EcsServerConnection<Config>>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
-
 impl<Config: ServerConfig> std::ops::DerefMut for ServerConnections<Config> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
@@ -102,26 +111,21 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
 
 #[derive(Resource)]
 struct ConnectionReceiver<Config: ServerConfig>(
-    UnboundedReceiver<(SocketAddr, ServerConnection<Config>)>,
+    UnboundedReceiver<(SocketAddr, EcsServerConnection<Config>)>,
 );
 
 #[allow(clippy::type_complexity)]
 #[derive(Resource)]
 struct DisconnectionReceiver<Config: ServerConfig>(
     UnboundedReceiver<(
-        ReceiveError<
-            Config::ClientPacket,
-            Config::ServerPacket,
-            Config::Serializer,
-            Config::LengthSerializer,
-        >,
-        ServerConnection<Config>,
+        ReceiveError<Config::SerializerError, Config::LengthSerializer>,
+        EcsServerConnection<Config>,
     )>,
 );
 
 #[derive(Resource)]
 struct PacketReceiver<Config: ServerConfig>(
-    UnboundedReceiver<(ServerConnection<Config>, Config::ClientPacket)>,
+    UnboundedReceiver<(EcsServerConnection<Config>, Config::ClientPacket)>,
 );
 
 fn create_setup_system<Config: ServerConfig>(address: SocketAddr) -> impl Fn(Commands) {
@@ -132,26 +136,8 @@ fn create_setup_system<Config: ServerConfig>(address: SocketAddr) -> impl Fn(Com
         let (conn_tx, conn_rx) = tokio::sync::mpsc::unbounded_channel();
         #[allow(clippy::type_complexity)]
         let (conn_tx2, mut conn_rx2): (
-            UnboundedSender<(
-                RawConnection<
-                    Config::ClientPacket,
-                    Config::ServerPacket,
-                    <Config::Protocol as Protocol>::ServerStream,
-                    Config::Serializer,
-                    Config::LengthSerializer,
-                >,
-                ServerConnection<Config>,
-            )>,
-            UnboundedReceiver<(
-                RawConnection<
-                    Config::ClientPacket,
-                    Config::ServerPacket,
-                    <Config::Protocol as Protocol>::ServerStream,
-                    Config::Serializer,
-                    Config::LengthSerializer,
-                >,
-                ServerConnection<Config>,
-            )>,
+            UnboundedSender<RawServerConnection<Config>>,
+            UnboundedReceiver<RawServerConnection<Config>>,
         ) = tokio::sync::mpsc::unbounded_channel();
         let (disc_tx, disc_rx) = tokio::sync::mpsc::unbounded_channel();
         let (pack_tx, pack_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -176,8 +162,6 @@ fn create_setup_system<Config: ServerConfig>(address: SocketAddr) -> impl Fn(Com
                                 packet_length_serializer,
                                 mut packets_rx,
                                 id,
-                                _receive_packet,
-                                _send_packet,
                             } = connection;
                             let (mut read, mut write) =
                                 stream.into_split().await.expect("Couldn't split stream");
@@ -191,7 +175,7 @@ fn create_setup_system<Config: ServerConfig>(address: SocketAddr) -> impl Fn(Com
                                     // `select!` handles intentional disconnections (ecs_connection.disconnect()).
                                     // AsyncReadExt::read_exact is not cancel-safe and loses data, but we don't need that data anymore
                                     tokio::select! {
-                                        result = read.receive(&*serializer2, &*packet_length_serializer2) => {
+                                        result = read.receive(Arc::clone(&serializer2), &*packet_length_serializer2) => {
                                             match result {
                                                 Ok(packet) => {
                                                     log::trace!("({id:?}) Received packet {:?}", packet);
@@ -220,7 +204,7 @@ fn create_setup_system<Config: ServerConfig>(address: SocketAddr) -> impl Fn(Com
                                 while let Some(packet) = packets_rx.recv().await {
                                     log::trace!("({id:?}) Sending packet {:?}", packet);
                                     match write
-                                        .send(packet, &*serializer, &*packet_length_serializer)
+                                        .send(packet, Arc::clone(&serializer), &*packet_length_serializer)
                                         .await
                                     {
                                         Ok(()) => (),
@@ -250,12 +234,10 @@ fn create_setup_system<Config: ServerConfig>(address: SocketAddr) -> impl Fn(Com
                                     let connection = RawConnection {
                                         disconnect_task: disconnect_task.clone(),
                                         stream: connection,
-                                        serializer: Arc::new(Default::default()),
+                                        serializer: Arc::new(Config::build_serializer()),
                                         packet_length_serializer: Arc::new(Default::default()),
                                         id: ConnectionId::next(),
                                         packets_rx: rx,
-                                        _receive_packet: PhantomData,
-                                        _send_packet: PhantomData,
                                     };
                                     let ecs_conn = EcsConnection {
                                         disconnect_task,
@@ -285,7 +267,7 @@ fn create_setup_system<Config: ServerConfig>(address: SocketAddr) -> impl Fn(Com
 #[derive(Event)]
 pub struct NewConnectionEvent<Config: ServerConfig> {
     /// The connection.
-    pub connection: ServerConnection<Config>,
+    pub connection: EcsServerConnection<Config>,
     /// A client's IP address.
     pub address: SocketAddr,
 }
@@ -294,21 +276,16 @@ pub struct NewConnectionEvent<Config: ServerConfig> {
 #[derive(Event)]
 pub struct DisconnectionEvent<Config: ServerConfig> {
     /// The error.
-    pub error: ReceiveError<
-        Config::ClientPacket,
-        Config::ServerPacket,
-        Config::Serializer,
-        Config::LengthSerializer,
-    >,
+    pub error: ReceiveError<Config::SerializerError, Config::LengthSerializer>,
     /// The connection.
-    pub connection: ServerConnection<Config>,
+    pub connection: EcsServerConnection<Config>,
 }
 
 /// Sent for every packet received.
 #[derive(Event)]
 pub struct PacketReceiveEvent<Config: ServerConfig> {
     /// The connection.
-    pub connection: ServerConnection<Config>,
+    pub connection: EcsServerConnection<Config>,
     /// The packet.
     pub packet: Config::ClientPacket,
 }

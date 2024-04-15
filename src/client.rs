@@ -16,6 +16,7 @@ use crate::connection::{
 use crate::protocol::ReadStream;
 use crate::protocol::WriteStream;
 use crate::protocol::{NetworkStream, ReceiveError};
+use crate::serializer::SerializerAdapter;
 use crate::{ClientConfig, Protocol, SystemSets};
 
 /// Client-side connection to a server.
@@ -179,12 +180,7 @@ struct ConnectionReceiver<Config: ClientConfig>(
 
 struct DisconnectionReceiver<Config: ClientConfig>(
     UnboundedReceiver<(
-        ReceiveError<
-            Config::ServerPacket,
-            Config::ClientPacket,
-            Config::Serializer,
-            Config::LengthSerializer,
-        >,
+        ReceiveError<Config::SerializerError, Config::LengthSerializer>,
         SocketAddr,
     )>,
     PhantomData<Config>,
@@ -214,7 +210,7 @@ fn setup_system<Config: ClientConfig>(mut commands: Commands) {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             match create_connection::<Config>(
                 address,
-                Config::Serializer::default(),
+                Arc::new(Config::build_serializer()),
                 Config::LengthSerializer::default(),
                 rx,
             )
@@ -250,8 +246,6 @@ fn setup_system<Config: ClientConfig>(mut commands: Commands) {
                 packet_length_serializer,
                 mut packets_rx,
                 id,
-                _receive_packet,
-                _send_packet,
             } = connection;
             let pack_tx2 = pack_tx.clone();
             let disc_tx2 = disc_tx.clone();
@@ -262,7 +256,7 @@ fn setup_system<Config: ClientConfig>(mut commands: Commands) {
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
-                        result = read.receive(&*serializer2, &*packet_length_serializer2) => {
+                        result = read.receive(Arc::clone(&serializer2), &*packet_length_serializer2) => {
                             match result {
                                 Ok(packet) => {
                                     log::trace!("({id:?}) Received packet {packet:?}");
@@ -294,7 +288,7 @@ fn setup_system<Config: ClientConfig>(mut commands: Commands) {
                 while let Some(packet) = packets_rx.recv().await {
                     log::trace!("({id:?}) Sending packet {:?}", packet);
                     match write
-                        .send(packet, &*serializer, &*packet_length_serializer)
+                        .send(packet, Arc::clone(&serializer), &*packet_length_serializer)
                         .await
                     {
                         Ok(()) => (),
@@ -321,7 +315,9 @@ fn connection_request_system<Config: ClientConfig>(
 #[allow(clippy::type_complexity)]
 pub(crate) async fn create_connection<Config: ClientConfig>(
     addr: SocketAddr,
-    serializer: Config::Serializer,
+    serializer: Arc<
+        SerializerAdapter<Config::ServerPacket, Config::ClientPacket, Config::SerializerError>,
+    >,
     packet_length_serializer: Config::LengthSerializer,
     packet_rx: UnboundedReceiver<Config::ClientPacket>,
 ) -> io::Result<
@@ -329,7 +325,7 @@ pub(crate) async fn create_connection<Config: ClientConfig>(
         Config::ServerPacket,
         Config::ClientPacket,
         <Config::Protocol as Protocol>::ClientStream,
-        Config::Serializer,
+        Config::SerializerError,
         Config::LengthSerializer,
     >,
 > {
@@ -399,12 +395,7 @@ pub struct ConnectionEstablishEvent<Config: ClientConfig> {
 #[derive(Event)]
 pub struct DisconnectionEvent<Config: ClientConfig> {
     /// The error.
-    pub error: ReceiveError<
-        Config::ServerPacket,
-        Config::ClientPacket,
-        Config::Serializer,
-        Config::LengthSerializer,
-    >,
+    pub error: ReceiveError<Config::SerializerError, Config::LengthSerializer>,
     /// A server's IP address.
     pub address: SocketAddr,
     _marker: PhantomData<Config>,
