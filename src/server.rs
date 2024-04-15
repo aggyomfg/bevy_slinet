@@ -18,8 +18,6 @@ use crate::{ServerConfig, SystemSets};
 
 /// Server-side connection to a server.
 pub type EcsServerConnection<Config> = EcsConnection<<Config as ServerConfig>::ServerPacket>;
-
-// Raw connection to a server.
 type RawServerConnection<Config> = (
     RawConnection<
         <Config as ServerConfig>::ClientPacket,
@@ -31,7 +29,6 @@ type RawServerConnection<Config> = (
     EcsServerConnection<Config>,
 );
 /// List of server-side connections to a server.
-
 #[derive(Resource)]
 pub struct ServerConnections<Config: ServerConfig>(Vec<EcsServerConnection<Config>>);
 impl<Config: ServerConfig> ServerConnections<Config> {
@@ -134,7 +131,6 @@ fn create_setup_system<Config: ServerConfig>(address: SocketAddr) -> impl Fn(Com
 
     move |mut commands: Commands| {
         let (conn_tx, conn_rx) = tokio::sync::mpsc::unbounded_channel();
-        #[allow(clippy::type_complexity)]
         let (conn_tx2, mut conn_rx2): (
             UnboundedSender<RawServerConnection<Config>>,
             UnboundedReceiver<RawServerConnection<Config>>,

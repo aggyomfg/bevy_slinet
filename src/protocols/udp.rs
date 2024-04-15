@@ -107,11 +107,11 @@ impl NetworkStream for UdpServerStream {
         let peer_addr = self.peer_addr();
         Ok((
             UdpServerReadHalf {
-                peer_addr: peer_addr,
+                peer_addr,
                 task: self.task,
             },
             UdpServerWriteHalf {
-                peer_addr: peer_addr,
+                peer_addr,
                 socket: self.socket,
             },
         ))

@@ -21,8 +21,15 @@ use crate::{ClientConfig, Protocol, SystemSets};
 
 /// Client-side connection to a server.
 pub type ClientConnection<Config> = EcsConnection<<Config as ClientConfig>::ClientPacket>;
-/// List of client-side connections to a server.
+type RawClientConnection<Config> = RawConnection<
+    <Config as ClientConfig>::ServerPacket,
+    <Config as ClientConfig>::ClientPacket,
+    <<Config as ClientConfig>::Protocol as Protocol>::ClientStream,
+    <Config as ClientConfig>::SerializerError,
+    <Config as ClientConfig>::LengthSerializer,
+>;
 
+/// List of client-side connections to a server.
 #[derive(Resource)]
 pub struct ClientConnections<Config: ClientConfig>(Vec<ClientConnection<Config>>);
 impl<Config: ClientConfig> ClientConnections<Config> {
@@ -175,8 +182,8 @@ struct ConnectionReceiver<Config: ClientConfig>(
     UnboundedReceiver<(SocketAddr, ClientConnection<Config>)>,
 );
 
-#[derive(Resource)]
 #[allow(clippy::type_complexity)]
+#[derive(Resource)]
 
 struct DisconnectionReceiver<Config: ClientConfig>(
     UnboundedReceiver<(
@@ -312,7 +319,6 @@ fn connection_request_system<Config: ClientConfig>(
     }
 }
 
-#[allow(clippy::type_complexity)]
 pub(crate) async fn create_connection<Config: ClientConfig>(
     addr: SocketAddr,
     serializer: Arc<
@@ -320,15 +326,7 @@ pub(crate) async fn create_connection<Config: ClientConfig>(
     >,
     packet_length_serializer: Config::LengthSerializer,
     packet_rx: UnboundedReceiver<Config::ClientPacket>,
-) -> io::Result<
-    RawConnection<
-        Config::ServerPacket,
-        Config::ClientPacket,
-        <Config::Protocol as Protocol>::ClientStream,
-        Config::SerializerError,
-        Config::LengthSerializer,
-    >,
-> {
+) -> io::Result<RawClientConnection<Config>> {
     Ok(RawConnection::new(
         Config::Protocol::connect_to_server(addr).await?,
         serializer,
