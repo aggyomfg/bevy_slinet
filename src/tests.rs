@@ -82,9 +82,10 @@ fn tcp_connection() {
 fn tcp_packets() {
     let client_to_server_packet = Packet(42);
     let server_to_client_packet = Packet(24);
+    let server_addr = "127.0.0.1:3007";
 
     let mut app_server = App::new();
-    app_server.add_plugins(ServerPlugin::<TcpConfig>::bind("127.0.0.1:3001"));
+    app_server.add_plugins(ServerPlugin::<TcpConfig>::bind(server_addr));
     app_server.add_systems(
         Update,
         move |mut events: EventReader<NewConnectionEvent<TcpConfig>>| {
@@ -98,7 +99,7 @@ fn tcp_packets() {
     );
 
     let mut app_client = App::new();
-    app_client.add_plugins(ClientPlugin::<TcpConfig>::connect("127.0.0.1:3001"));
+    app_client.add_plugins(ClientPlugin::<TcpConfig>::connect(server_addr));
     app_client.add_systems(
         Update,
         move |mut events: EventReader<ConnectionEstablishEvent<TcpConfig>>| {
