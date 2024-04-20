@@ -18,8 +18,7 @@ jobs:
           path: |
             ~/.cargo
             ~/.rustup
-            target
-          key: rust-${{ hashFiles('**/Cargo.lock') }}
+          key: toolchain-x86_64-unknown-linux-gnu-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install stable toolchain
         uses: actions-rs/toolchain@v1
@@ -72,8 +71,7 @@ jobs:
           path: |
             ~/.cargo
             ~/.rustup
-            target
-          key: rust-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.target }}
+          key: toolchain-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install stable toolchain
         uses: actions-rs/toolchain@v1
