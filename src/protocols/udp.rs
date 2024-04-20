@@ -278,12 +278,6 @@ pub struct UdpClientWriteHalf {
     socket: UdpSocket,
 }
 
-impl AsRef<UdpSocket> for UdpClientWriteHalf {
-    fn as_ref(&self) -> &UdpSocket {
-        &self.socket
-    }
-}
-
 #[async_trait]
 impl WriteStream for UdpClientWriteHalf {
     async fn write_all(&mut self, buffer: &[u8]) -> std::io::Result<()> {
