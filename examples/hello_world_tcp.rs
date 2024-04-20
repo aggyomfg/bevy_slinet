@@ -50,12 +50,10 @@ enum ServerPacket {
 }
 
 fn main() {
+    let server_addr = "127.0.0.1:3000";
     let server = std::thread::spawn(move || {
         App::new()
-            .add_plugins((
-                MinimalPlugins,
-                ServerPlugin::<Config>::bind("127.0.0.1:3000"),
-            ))
+            .add_plugins((MinimalPlugins, ServerPlugin::<Config>::bind(server_addr)))
             .add_systems(
                 Update,
                 (server_new_connection_system, server_packet_receive_system),
@@ -67,7 +65,7 @@ fn main() {
     let client = std::thread::spawn(move || {
         App::new()
             .add_plugins(MinimalPlugins)
-            .add_plugins(ClientPlugin::<Config>::connect("127.0.0.1:3000"))
+            .add_plugins(ClientPlugin::<Config>::connect(server_addr))
             .add_systems(Update, client_packet_receive_system)
             .run();
     });
