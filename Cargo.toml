@@ -56,6 +56,12 @@ path = "examples/hello_world_tcp.rs"
 required-features = ["client", "server", "protocol_tcp", "serializer_bincode"]
 
 [[example]]
+name = "hello_world_tcp_encrypted"
+path = "examples/hello_world_tcp_encrypted.rs"
+required-features = ["client", "server", "protocol_tcp", "serializer_bincode"]
+
+
+[[example]]
 name = "hello_world_udp"
 path = "examples/hello_world_udp.rs"
 required-features = ["client", "server", "protocol_udp", "serializer_bincode"]

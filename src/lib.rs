@@ -22,6 +22,8 @@ pub mod server;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_mut_serializer;
 
 /// [`SystemSets`](bevy::ecs::schedule::SystemSet) in [`bevy`] are used for system ordering.
 /// See [System Order of Execution][cheatbook_order] on unofficial bevy cheatbook for details.

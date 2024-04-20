@@ -16,7 +16,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::packet_length_serializer::PacketLengthSerializer;
 use crate::protocol::NetworkStream;
-use crate::serializer::SerializerAdapter;
+use crate::serializer::Serializer;
 
 /// The ecs-side connection struct. There is 2 structs,
 /// one raw (with the stream, runs on another thread),
@@ -98,7 +98,7 @@ where
 {
     pub disconnect_task: DisconnectTask,
     pub stream: NS,
-    pub serializer: Arc<SerializerAdapter<ReceivingPacket, SendingPacket, SE>>,
+    pub serializer: Arc<dyn Serializer<ReceivingPacket, SendingPacket, Error = SE>>,
     pub packet_length_serializer: Arc<LS>,
     pub packets_rx: UnboundedReceiver<SendingPacket>,
     pub id: ConnectionId,
@@ -169,7 +169,7 @@ where
     #[cfg(feature = "client")]
     pub fn new(
         stream: NS,
-        serializer: Arc<SerializerAdapter<ReceivingPacket, SendingPacket, SE>>,
+        serializer: Arc<dyn Serializer<ReceivingPacket, SendingPacket, Error = SE>>,
         packet_length_serializer: LS,
         packets_rx: UnboundedReceiver<SendingPacket>,
     ) -> Self {

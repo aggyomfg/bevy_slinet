@@ -5,7 +5,6 @@ use core::fmt::Debug;
 use std::{
     error::Error,
     fmt::{self, Display},
-    net::SocketAddr,
     sync::{Arc, Mutex},
 };
 
@@ -20,9 +19,9 @@ where
 
     // Serializes a packet into bytes to be sent over a network. The method takes ownership of the packet
     // and a peer address, returning either a byte vector or an error if serialization fails.
-    fn serialize(&self, packet: SendingPacket, peer: SocketAddr) -> Result<Vec<u8>, Self::Error>;
+    fn serialize(&self, packet: SendingPacket) -> Result<Vec<u8>, Self::Error>;
     // Deserializes bytes received from a network back into a packet structure.
-    fn deserialize(&self, data: &[u8], peer: SocketAddr) -> Result<ReceivingPacket, Self::Error>;
+    fn deserialize(&self, data: &[u8]) -> Result<ReceivingPacket, Self::Error>;
 }
 
 // DefaultSerializationError is a minimal implementation of an error that might occur during the
@@ -60,22 +59,18 @@ where
 
     // Depending on the adapter's type, serialization can either directly pass the data or
     // require locking a mutex to ensure thread-safety in mutable contexts.
-    fn serialize(&self, packet: SendingPacket, peer: SocketAddr) -> Result<Vec<u8>, Self::Error> {
+    fn serialize(&self, packet: SendingPacket) -> Result<Vec<u8>, Self::Error> {
         match self {
             SerializerAdapter::ReadOnly(serializer) => serializer.serialize(packet),
-            SerializerAdapter::Mutable(serializer) => {
-                serializer.lock().unwrap().serialize(packet, peer)
-            }
+            SerializerAdapter::Mutable(serializer) => serializer.lock().unwrap().serialize(packet),
         }
     }
 
     // Deserialization behaves similarly to serialization, respecting the adapter's type.
-    fn deserialize(&self, data: &[u8], peer: SocketAddr) -> Result<ReceivingPacket, Self::Error> {
+    fn deserialize(&self, data: &[u8]) -> Result<ReceivingPacket, Self::Error> {
         match self {
             SerializerAdapter::ReadOnly(serializer) => serializer.deserialize(data),
-            SerializerAdapter::Mutable(serializer) => {
-                serializer.lock().unwrap().deserialize(data, peer)
-            }
+            SerializerAdapter::Mutable(serializer) => serializer.lock().unwrap().deserialize(data),
         }
     }
 }
@@ -91,7 +86,6 @@ pub trait ReadOnlySerializer<ReceivingPacket, SendingPacket>: Send + Sync + 'sta
 /// useful in cases like cryptographic transformations where state is critical.
 pub trait MutableSerializer<ReceivingPacket, SendingPacket>: Send + Sync + 'static {
     type Error: Error + Send + Sync;
-    fn serialize(&mut self, p: SendingPacket, peer: SocketAddr) -> Result<Vec<u8>, Self::Error>;
-    fn deserialize(&mut self, buf: &[u8], peer: SocketAddr)
-        -> Result<ReceivingPacket, Self::Error>;
+    fn serialize(&mut self, p: SendingPacket) -> Result<Vec<u8>, Self::Error>;
+    fn deserialize(&mut self, buf: &[u8]) -> Result<ReceivingPacket, Self::Error>;
 }

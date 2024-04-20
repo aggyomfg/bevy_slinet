@@ -90,7 +90,6 @@ pub trait NetworkStream: Send + Sync + 'static {
 /// A readable stream.
 #[async_trait]
 pub trait ReadStream: Send + Sync + 'static {
-    fn peer_addr(&self) -> io::Result<SocketAddr>;
     /// Fills the whole buffer with bytes in this stream.
     async fn read_exact(&mut self, buffer: &mut [u8]) -> io::Result<()>;
 
@@ -125,7 +124,7 @@ pub trait ReadStream: Send + Sync + 'static {
                     let mut buf = vec![0; length];
                     self.read_exact(&mut buf).await.map_err(ReceiveError::Io)?;
                     Ok(serializer
-                        .deserialize(&buf, self.peer_addr().unwrap())
+                        .deserialize(&buf)
                         .map_err(ReceiveError::Deserialization)?)
                 }
             }
@@ -181,7 +180,6 @@ where
 /// A writeable stream.
 #[async_trait]
 pub trait WriteStream: Send + Sync + 'static {
-    fn peer_addr(&self) -> io::Result<SocketAddr>;
     /// Writes the whole buffer to the stream.
     async fn write_all(&mut self, buffer: &[u8]) -> io::Result<()>;
 
@@ -201,7 +199,7 @@ pub trait WriteStream: Send + Sync + 'static {
         LS: PacketLengthSerializer,
     {
         let serialized = serializer
-            .serialize(packet, self.peer_addr().unwrap())
+            .serialize(packet)
             .expect("Error serializing packet");
         let mut buf = length_serializer
             .serialize_packet_length(serialized.len())

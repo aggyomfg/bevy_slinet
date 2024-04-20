@@ -106,10 +106,7 @@ impl NetworkStream for UdpServerStream {
     async fn into_split(self) -> io::Result<(Self::ReadHalf, Self::WriteHalf)> {
         let peer_addr = self.peer_addr();
         Ok((
-            UdpServerReadHalf {
-                peer_addr,
-                task: self.task,
-            },
+            UdpServerReadHalf(self.task.clone()),
             UdpServerWriteHalf {
                 peer_addr,
                 socket: self.socket,
@@ -127,16 +124,10 @@ impl NetworkStream for UdpServerStream {
 }
 
 /// The read half of [`UdpServerStream`].
-pub struct UdpServerReadHalf {
-    peer_addr: SocketAddr,
-    task: UdpRead,
-}
+pub struct UdpServerReadHalf(UdpRead);
 
 #[async_trait]
 impl ReadStream for UdpServerReadHalf {
-    fn peer_addr(&self) -> std::io::Result<SocketAddr> {
-        Ok(self.peer_addr)
-    }
     fn read_exact<'life0, 'life1, 'async_trait>(
         &'life0 mut self,
         buffer: &'life1 mut [u8],
@@ -147,7 +138,7 @@ impl ReadStream for UdpServerReadHalf {
         Self: 'async_trait,
     {
         Box::pin(UdpReadTask {
-            read: self.task.clone(),
+            read: self.0.clone(),
             buffer,
         })
     }
@@ -194,9 +185,6 @@ pub struct UdpServerWriteHalf {
 
 #[async_trait]
 impl WriteStream for UdpServerWriteHalf {
-    fn peer_addr(&self) -> io::Result<SocketAddr> {
-        Ok(self.peer_addr)
-    }
     async fn write_all(&mut self, buffer: &[u8]) -> std::io::Result<()> {
         self.socket
             .send_to(buffer, self.peer_addr)
@@ -271,9 +259,6 @@ pub struct UdpClientReadHalf {
 
 #[async_trait]
 impl ReadStream for UdpClientReadHalf {
-    fn peer_addr(&self) -> std::io::Result<SocketAddr> {
-        self.socket.peer_addr()
-    }
     async fn read_exact(&mut self, buffer: &mut [u8]) -> std::io::Result<()> {
         loop {
             if self.buffer.len() >= buffer.len() {
@@ -301,9 +286,6 @@ impl AsRef<UdpSocket> for UdpClientWriteHalf {
 
 #[async_trait]
 impl WriteStream for UdpClientWriteHalf {
-    fn peer_addr(&self) -> io::Result<SocketAddr> {
-        self.as_ref().peer_addr()
-    }
     async fn write_all(&mut self, buffer: &[u8]) -> std::io::Result<()> {
         self.socket
             .send(buffer)
