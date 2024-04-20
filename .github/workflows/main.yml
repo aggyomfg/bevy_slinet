@@ -1,74 +1,45 @@
-name: Check, Test, Lint
+name: Validate code and build
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
 
 jobs:
-  fmt:
-    name: Cargo fmt
+  validate-code:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout sources
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        id: cache
+        with:
+          path: |
+            ~/.cargo
+            ~/.rustup
+            target
+          key: rust-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install stable toolchain
         uses: actions-rs/toolchain@v1
         with:
           profile: minimal
           toolchain: stable
+          components: rustfmt, clippy
           override: true
-          components: rustfmt
-
+      
       - name: Run cargo fmt
         uses: actions-rs/cargo@v1
         with:
           command: fmt
           args: --all -- --check
 
-  clippy:
-    name: Cargo clippy
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v4
-
-      - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
-          components: clippy
-
-      - uses: Swatinem/rust-cache@v2
-        
       - name: Annotate commit with clippy warnings
         uses: actions-rs/clippy-check@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           args: --all-targets --all-features -- -D warnings
-
-  audit:
-    name: Cargo audit
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v4
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
-          components: clippy
 
       - name: Security audit
         uses: actions-rs/audit-check@v1
@@ -76,6 +47,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   build:
+    needs: validate-code
     name: Cargo build & test
     runs-on: ${{ matrix.os }}
     strategy:
@@ -85,12 +57,12 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             use-cross: false
-          - os: macos-latest-large
+          - os: macos-latest
             target: x86_64-apple-darwin
             use-cross: false
           - os: macos-latest
             target: aarch64-apple-darwin
-            use-cross: false
+            use-cross: true
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             cross: false
@@ -98,9 +70,13 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v4
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
         with:
-          sharedKey: ${{ matrix.target }}
+          path: |
+            ~/.cargo
+            ~/.rustup
+            target
+          key: rust-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.target }}
 
       - name: Install stable toolchain
         uses: actions-rs/toolchain@v1
@@ -109,7 +85,7 @@ jobs:
           toolchain: stable
           target: ${{ matrix.target }}
           override: true
-
+      
       - name: Run cargo build
         uses: actions-rs/cargo@v1
         with:
@@ -122,4 +98,4 @@ jobs:
         with:
           use-cross: ${{ matrix.use-cross }}
           command: test
-          args: --target=${{ matrix.target }} --all-features
+          args: --target=${{ matrix.target }} --all-features -- --test-threads=1

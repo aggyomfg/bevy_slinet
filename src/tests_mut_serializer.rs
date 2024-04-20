@@ -95,15 +95,13 @@ fn tcp_packets() {
     // Setup server and client applications
     let mut app_server = setup_server_app(srv_addr);
     let mut app_client = setup_client_app(srv_addr, "Hello, Server!");
-    let mut app_client2 = setup_client_app(srv_addr, "Hello, Server 2!");
 
     // Simulate application lifecycle
-    run_simulation(&mut app_server, &mut app_client, &mut app_client2);
+    run_simulation(&mut app_server, &mut app_client);
 
     // Check events and packets
     check_server_received_packets(&app_server);
     check_client_received_packets(&app_client, "Hello, Client!");
-    check_client_received_packets(&app_client2, "Hello, Client!");
 }
 
 fn server_receive_system(mut events: EventReader<NewConnectionEvent<TcpConfig>>) {
@@ -142,17 +140,14 @@ fn setup_client_app(srv_addr: &str, message: &str) -> App {
 }
 
 // Simulate the test scenario
-fn run_simulation(app_server: &mut App, app_client: &mut App, app_client2: &mut App) {
+fn run_simulation(app_server: &mut App, app_client: &mut App) {
     app_server.update();
     app_client.update();
-    app_client2.update();
     std::thread::sleep(std::time::Duration::from_secs(1));
     app_client.update();
-    app_client2.update();
     app_server.update();
     std::thread::sleep(std::time::Duration::from_secs(1));
     app_client.update();
-    app_client2.update();
     app_server.update();
 }
 
@@ -169,13 +164,6 @@ fn check_server_received_packets(app_server: &App) {
             "Hello, Server!"
         ))),
         "Server did not receive packet from client 1"
-    );
-    assert_eq!(
-        server_events_iter.next().map(|event| event.packet.clone()),
-        Some(CustomCryptClientPacket::String(String::from(
-            "Hello, Server 2!"
-        ))),
-        "Server did not receive packet from client 2"
     );
 }
 

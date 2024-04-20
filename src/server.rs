@@ -1,6 +1,5 @@
 //! Server part of the plugin. You can enable it by adding `server` feature.
 
-use core::default::Default;
 use std::marker::PhantomData;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
