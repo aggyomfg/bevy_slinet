@@ -16,7 +16,7 @@ use crate::connection::{
 use crate::protocol::ReadStream;
 use crate::protocol::WriteStream;
 use crate::protocol::{NetworkStream, ReceiveError};
-use crate::serializer::SerializerAdapter;
+use crate::serializer::Serializer;
 use crate::{ClientConfig, Protocol, SystemSets};
 
 /// Client-side connection to a server.
@@ -322,7 +322,7 @@ fn connection_request_system<Config: ClientConfig>(
 pub(crate) async fn create_connection<Config: ClientConfig>(
     addr: SocketAddr,
     serializer: Arc<
-        SerializerAdapter<Config::ServerPacket, Config::ClientPacket, Config::SerializerError>,
+        dyn Serializer<Config::ServerPacket, Config::ClientPacket, Error = Config::SerializerError>,
     >,
     packet_length_serializer: Config::LengthSerializer,
     packet_rx: UnboundedReceiver<Config::ClientPacket>,
