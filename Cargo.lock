@@ -364,7 +364,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_slinet"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "async-trait",
  "bevy",
