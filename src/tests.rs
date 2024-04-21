@@ -49,11 +49,13 @@ impl ClientConfig for TcpConfig {
 
 #[test]
 fn tcp_connection() {
+    let server_addr = "127.0.0.1:3000";
+
     let mut app_server = App::new();
-    app_server.add_plugins(ServerPlugin::<TcpConfig>::bind("127.0.0.1:3000"));
+    app_server.add_plugins(ServerPlugin::<TcpConfig>::bind(server_addr));
 
     let mut app_client = App::new();
-    app_client.add_plugins(ClientPlugin::<TcpConfig>::connect("127.0.0.1:3000"));
+    app_client.add_plugins(ClientPlugin::<TcpConfig>::connect(server_addr));
 
     app_server.update(); // bind
     app_client.update(); // connect
