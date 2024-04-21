@@ -16,7 +16,7 @@ use crate::protocol::{Listener, NetworkStream, Protocol, ReadStream, ReceiveErro
 use crate::{ServerConfig, SystemSets};
 
 /// Server-side connection to a server.
-pub type EcsServerConnection<Config> = EcsConnection<<Config as ServerConfig>::ServerPacket>;
+pub type ServerConnection<Config> = EcsConnection<<Config as ServerConfig>::ServerPacket>;
 type RawServerConnection<Config> = (
     RawConnection<
         <Config as ServerConfig>::ClientPacket,
@@ -25,18 +25,18 @@ type RawServerConnection<Config> = (
         <Config as ServerConfig>::SerializerError,
         <Config as ServerConfig>::LengthSerializer,
     >,
-    EcsServerConnection<Config>,
+    ServerConnection<Config>,
 );
 /// List of server-side connections to a server.
 #[derive(Resource)]
-pub struct ServerConnections<Config: ServerConfig>(Vec<EcsServerConnection<Config>>);
+pub struct ServerConnections<Config: ServerConfig>(Vec<ServerConnection<Config>>);
 impl<Config: ServerConfig> ServerConnections<Config> {
     fn new() -> Self {
         Self(Vec::new())
     }
 }
 impl<Config: ServerConfig> std::ops::Deref for ServerConnections<Config> {
-    type Target = Vec<EcsServerConnection<Config>>;
+    type Target = Vec<ServerConnection<Config>>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -107,7 +107,7 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
 
 #[derive(Resource)]
 struct ConnectionReceiver<Config: ServerConfig>(
-    UnboundedReceiver<(SocketAddr, EcsServerConnection<Config>)>,
+    UnboundedReceiver<(SocketAddr, ServerConnection<Config>)>,
 );
 
 #[allow(clippy::type_complexity)]
@@ -115,13 +115,13 @@ struct ConnectionReceiver<Config: ServerConfig>(
 struct DisconnectionReceiver<Config: ServerConfig>(
     UnboundedReceiver<(
         ReceiveError<Config::SerializerError, Config::LengthSerializer>,
-        EcsServerConnection<Config>,
+        ServerConnection<Config>,
     )>,
 );
 
 #[derive(Resource)]
 struct PacketReceiver<Config: ServerConfig>(
-    UnboundedReceiver<(EcsServerConnection<Config>, Config::ClientPacket)>,
+    UnboundedReceiver<(ServerConnection<Config>, Config::ClientPacket)>,
 );
 
 fn create_setup_system<Config: ServerConfig>(address: SocketAddr) -> impl Fn(Commands) {
@@ -262,7 +262,7 @@ fn create_setup_system<Config: ServerConfig>(address: SocketAddr) -> impl Fn(Com
 #[derive(Event)]
 pub struct NewConnectionEvent<Config: ServerConfig> {
     /// The connection.
-    pub connection: EcsServerConnection<Config>,
+    pub connection: ServerConnection<Config>,
     /// A client's IP address.
     pub address: SocketAddr,
 }
@@ -273,14 +273,14 @@ pub struct DisconnectionEvent<Config: ServerConfig> {
     /// The error.
     pub error: ReceiveError<Config::SerializerError, Config::LengthSerializer>,
     /// The connection.
-    pub connection: EcsServerConnection<Config>,
+    pub connection: ServerConnection<Config>,
 }
 
 /// Sent for every packet received.
 #[derive(Event)]
 pub struct PacketReceiveEvent<Config: ServerConfig> {
     /// The connection.
-    pub connection: EcsServerConnection<Config>,
+    pub connection: ServerConnection<Config>,
     /// The packet.
     pub packet: Config::ClientPacket,
 }

@@ -1,9 +1,9 @@
 //! A custom packet serializer capable of handling encryption and decryption.
 //! Demonstrates usage with mutable serializers that can mutate their internal state.
 
-use std::marker::PhantomData;
+use std::{error::Error, fmt::{self, Display}, marker::PhantomData};
 
-use crate::serializer::{DefaultSerializationError, MutableSerializer};
+use crate::serializer::MutableSerializer;
 use serde::{Deserialize, Serialize};
 
 /// Represents custom packets sent from the client, allowing different types of content.
@@ -18,10 +18,22 @@ pub enum CustomCryptServerPacket {
     String(String),
 }
 
+// Define a custom error type for serialization errors.
+#[derive(Debug)]
+pub struct CustomSerializationError;
+impl Display for CustomSerializationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SerializationFailed")
+    }
+}
+
+impl Error for CustomSerializationError {}
+
+
 /// Defines a trait for cryptographic engines with methods for packet encryption and decryption.
 pub trait CryptEngine<ReceivingPacket, SendingPacket>: Default {
-    fn encrypt(&mut self, packet: SendingPacket) -> Result<Vec<u8>, DefaultSerializationError>;
-    fn decrypt(&mut self, packet: &[u8]) -> Result<ReceivingPacket, DefaultSerializationError>;
+    fn encrypt(&mut self, packet: SendingPacket) -> Result<Vec<u8>, CustomSerializationError>;
+    fn decrypt(&mut self, packet: &[u8]) -> Result<ReceivingPacket, CustomSerializationError>;
 }
 
 /// A simple key pair structure used for XOR encryption operations.
@@ -72,7 +84,7 @@ impl CryptEngine<CustomCryptClientPacket, CustomCryptServerPacket> for CustomCry
     fn encrypt(
         &mut self,
         packet: CustomCryptServerPacket,
-    ) -> Result<Vec<u8>, DefaultSerializationError> {
+    ) -> Result<Vec<u8>, CustomSerializationError> {
         let packet_data = bincode::serialize(&packet).unwrap();
         let encrypted_data = self.xor_encrypt(packet_data);
         Ok(encrypted_data)
@@ -81,7 +93,7 @@ impl CryptEngine<CustomCryptClientPacket, CustomCryptServerPacket> for CustomCry
     fn decrypt(
         &mut self,
         packet: &[u8],
-    ) -> Result<CustomCryptClientPacket, DefaultSerializationError> {
+    ) -> Result<CustomCryptClientPacket, CustomSerializationError> {
         let decrypted_data = self.xor_decrypt(packet.to_vec());
         let packet = bincode::deserialize(&decrypted_data).unwrap();
         Ok(packet)
@@ -92,7 +104,7 @@ impl CryptEngine<CustomCryptServerPacket, CustomCryptClientPacket> for CustomCry
     fn encrypt(
         &mut self,
         packet: CustomCryptClientPacket,
-    ) -> Result<Vec<u8>, DefaultSerializationError> {
+    ) -> Result<Vec<u8>, CustomSerializationError> {
         let packet_data = bincode::serialize(&packet).unwrap();
         let encrypted_data = self.xor_encrypt(packet_data);
         Ok(encrypted_data)
@@ -101,7 +113,7 @@ impl CryptEngine<CustomCryptServerPacket, CustomCryptClientPacket> for CustomCry
     fn decrypt(
         &mut self,
         packet: &[u8],
-    ) -> Result<CustomCryptServerPacket, DefaultSerializationError> {
+    ) -> Result<CustomCryptServerPacket, CustomSerializationError> {
         let decrypted_data = self.xor_decrypt(packet.to_vec());
         let packet = bincode::deserialize(&decrypted_data).unwrap();
         Ok(packet)
@@ -141,7 +153,7 @@ where
     ReceivingPacket: Send + Sync + 'static,
     SendingPacket: Send + Sync + 'static,
 {
-    type Error = DefaultSerializationError;
+    type Error = CustomSerializationError;
 
     /// Serializes a packet into a byte vector.
     fn serialize(&mut self, packet: SendingPacket) -> Result<Vec<u8>, Self::Error> {

@@ -4,9 +4,9 @@ use bevy::ecs::event::{EventReader, Events};
 use crate::client::{self, ClientConnection, ClientPlugin, ConnectionEstablishEvent};
 use crate::packet_length_serializer::LittleEndian;
 use crate::protocols::tcp::TcpProtocol;
-use crate::serializer::{DefaultSerializationError, SerializerAdapter};
+use crate::serializer::SerializerAdapter;
 use crate::serializers::custom_crypt::{
-    CustomCryptClientPacket, CustomCryptEngine, CustomCryptSerializer, CustomCryptServerPacket,
+    CustomCryptClientPacket, CustomCryptEngine, CustomCryptSerializer, CustomCryptServerPacket, CustomSerializationError,
 };
 use crate::server::{self, NewConnectionEvent, ServerConnections, ServerPlugin};
 use crate::{ClientConfig, ServerConfig};
@@ -20,7 +20,7 @@ impl ServerConfig for TcpConfig {
     type ServerPacket = CustomCryptServerPacket;
     type Protocol = TcpProtocol;
 
-    type SerializerError = DefaultSerializationError;
+    type SerializerError = CustomSerializationError;
 
     type LengthSerializer = LittleEndian<u32>;
 
@@ -40,7 +40,7 @@ impl ClientConfig for TcpConfig {
     type ClientPacket = CustomCryptClientPacket;
     type ServerPacket = CustomCryptServerPacket;
     type Protocol = TcpProtocol;
-    type SerializerError = DefaultSerializationError;
+    type SerializerError = CustomSerializationError;
 
     type LengthSerializer = LittleEndian<u32>;
     fn build_serializer(

@@ -4,7 +4,6 @@
 use core::fmt::Debug;
 use std::{
     error::Error,
-    fmt::{self, Display},
     sync::{Arc, Mutex},
 };
 
@@ -24,21 +23,9 @@ where
     fn deserialize(&self, data: &[u8]) -> Result<ReceivingPacket, Self::Error>;
 }
 
-// DefaultSerializationError is a minimal implementation of an error that might occur during the
-// serialization process. Using Display trait for user-friendly error messaging.
-#[derive(Debug)]
-pub struct DefaultSerializationError;
-impl Display for DefaultSerializationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SerializationFailed")
-    }
-}
-
-impl Error for DefaultSerializationError {}
-
 // SerializerAdapter allows for flexibility in serializer implementation; supporting both immutable
 // and mutable serialization strategies.
-pub enum SerializerAdapter<ReceivingPacket, SendingPacket, E = DefaultSerializationError>
+pub enum SerializerAdapter<ReceivingPacket, SendingPacket, E>
 where
     E: Error + Send + Sync,
 {

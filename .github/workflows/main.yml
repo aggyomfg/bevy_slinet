@@ -2,9 +2,9 @@ name: Validate code and build
 
 on:
   push:
-    branches: [main]
+    branches: [ main ]
   pull_request:
-    branches: [main]
+    branches: [ main ]
 
 jobs:
   validate-code:
@@ -24,10 +24,9 @@ jobs:
 
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
-      
+
       - run: cargo install cargo-audit
       - run: cargo audit
-        
 
   build-and-test:
     needs: validate-code

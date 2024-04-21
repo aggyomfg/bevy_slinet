@@ -2,9 +2,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bevy::prelude::*;
-use bevy_slinet::serializer::{DefaultSerializationError, SerializerAdapter};
+use bevy_slinet::serializer::SerializerAdapter;
 use bevy_slinet::serializers::custom_crypt::{
-    CustomCryptClientPacket, CustomCryptEngine, CustomCryptSerializer, CustomCryptServerPacket,
+    CustomCryptClientPacket, CustomCryptEngine, CustomCryptSerializer, CustomCryptServerPacket, CustomSerializationError,
 };
 
 use serde::{Deserialize, Serialize};
@@ -22,7 +22,7 @@ impl ServerConfig for Config {
     type ClientPacket = CustomCryptClientPacket;
     type ServerPacket = CustomCryptServerPacket;
     type Protocol = TcpProtocol;
-    type SerializerError = DefaultSerializationError;
+    type SerializerError = CustomSerializationError;
     fn build_serializer(
     ) -> SerializerAdapter<Self::ClientPacket, Self::ServerPacket, Self::SerializerError> {
         SerializerAdapter::Mutable(Arc::new(Mutex::new(CustomCryptSerializer::<
@@ -40,7 +40,7 @@ impl ClientConfig for Config {
     type ClientPacket = CustomCryptClientPacket;
     type ServerPacket = CustomCryptServerPacket;
     type Protocol = TcpProtocol;
-    type SerializerError = DefaultSerializationError;
+    type SerializerError = CustomSerializationError;
 
     type LengthSerializer = LittleEndian<u32>;
     fn build_serializer(
