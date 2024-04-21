@@ -4,7 +4,8 @@ use std::time::Duration;
 use bevy::prelude::*;
 use bevy_slinet::serializer::SerializerAdapter;
 use bevy_slinet::serializers::custom_crypt::{
-    CustomCryptClientPacket, CustomCryptEngine, CustomCryptSerializer, CustomCryptServerPacket, CustomSerializationError,
+    CustomCryptClientPacket, CustomCryptEngine, CustomCryptSerializer, CustomCryptServerPacket,
+    CustomSerializationError,
 };
 
 use serde::{Deserialize, Serialize};

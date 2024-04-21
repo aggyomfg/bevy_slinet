@@ -6,7 +6,8 @@ use crate::packet_length_serializer::LittleEndian;
 use crate::protocols::tcp::TcpProtocol;
 use crate::serializer::SerializerAdapter;
 use crate::serializers::custom_crypt::{
-    CustomCryptClientPacket, CustomCryptEngine, CustomCryptSerializer, CustomCryptServerPacket, CustomSerializationError,
+    CustomCryptClientPacket, CustomCryptEngine, CustomCryptSerializer, CustomCryptServerPacket,
+    CustomSerializationError,
 };
 use crate::server::{self, NewConnectionEvent, ServerConnections, ServerPlugin};
 use crate::{ClientConfig, ServerConfig};

@@ -1,7 +1,11 @@
 //! A custom packet serializer capable of handling encryption and decryption.
 //! Demonstrates usage with mutable serializers that can mutate their internal state.
 
-use std::{error::Error, fmt::{self, Display}, marker::PhantomData};
+use std::{
+    error::Error,
+    fmt::{self, Display},
+    marker::PhantomData,
+};
 
 use crate::serializer::MutableSerializer;
 use serde::{Deserialize, Serialize};
@@ -28,7 +32,6 @@ impl Display for CustomSerializationError {
 }
 
 impl Error for CustomSerializationError {}
-
 
 /// Defines a trait for cryptographic engines with methods for packet encryption and decryption.
 pub trait CryptEngine<ReceivingPacket, SendingPacket>: Default {
