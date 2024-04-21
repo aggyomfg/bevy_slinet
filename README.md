@@ -29,11 +29,15 @@ use bevy_slinet::ClientConfig;
 struct Config;
 
 impl ClientConfig for Config {
-    type ClientPacket = ClientPacket;
-    type ServerPacket = ServerPacket;
+    type ClientPacket = Packet;
+    type ServerPacket = Packet;
     type Protocol = TcpProtocol;
-    type Serializer = BincodeSerializer<DefaultOptions>;
+    type SerializerError = bincode::Error;
     type LengthSerializer = LittleEndian<u32>;
+    fn build_serializer(
+    ) -> SerializerAdapter<Self::ClientPacket, Self::ServerPacket, Self::SerializerError> {
+        SerializerAdapter::ReadOnly(Arc::new(BincodeSerializer::<DefaultOptions>::default()))
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -87,11 +91,15 @@ use bevy_slinet::ServerConfig;
 struct Config;
 
 impl ServerConfig for Config {
-    type ClientPacket = ClientPacket;
-    type ServerPacket = ServerPacket;
+    type ClientPacket = Packet;
+    type ServerPacket = Packet;
     type Protocol = TcpProtocol;
-    type Serializer = BincodeSerializer<DefaultOptions>;
+    type SerializerError = bincode::Error;
     type LengthSerializer = LittleEndian<u32>;
+    fn build_serializer(
+    ) -> SerializerAdapter<Self::ClientPacket, Self::ServerPacket, Self::SerializerError> {
+        SerializerAdapter::ReadOnly(Arc::new(BincodeSerializer::<DefaultOptions>::default()))
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -151,4 +159,5 @@ Note: you should implement keep-alive and disconnection systems yourself, or loo
 | `0.7`          | `0.11`       |
 | `0.8`          | `0.12`       |
 | `0.9`          | `0.13`       |
+| `0.10`         | `0.13`       |
 | `main`         | `0.13`       |

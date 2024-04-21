@@ -104,10 +104,11 @@ impl NetworkStream for UdpServerStream {
     type WriteHalf = UdpServerWriteHalf;
 
     async fn into_split(self) -> io::Result<(Self::ReadHalf, Self::WriteHalf)> {
+        let peer_addr = self.peer_addr();
         Ok((
             UdpServerReadHalf(self.task.clone()),
             UdpServerWriteHalf {
-                peer_addr: self.peer_addr(),
+                peer_addr,
                 socket: self.socket,
             },
         ))

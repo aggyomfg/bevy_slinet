@@ -4,16 +4,19 @@
 //! Built-in protocols are listed in the [`protocols`](crate::protocols) module.
 
 use io::Write;
+use std::error::Error;
 use std::fmt::{Debug, Formatter};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use crate::connection::MAX_PACKET_SIZE;
 use crate::packet_length_serializer::PacketLengthDeserializationError;
-use crate::{PacketLengthSerializer, Serializer};
+use crate::serializer::Serializer;
+use crate::PacketLengthSerializer;
 
 /// In order to simplify protocol switching and implementation, there is a [`Protocol`] trait.
 /// Implement it or use built-in [`protocols`](crate::protocols).
@@ -95,13 +98,13 @@ pub trait ReadStream: Send + Sync + 'static {
     /// You shouldn't override this method unless you know what you're doing.
     async fn receive<ReceivingPacket, SendingPacket, S, LS>(
         &mut self,
-        serializer: &S,
+        serializer: Arc<S>,
         length_serializer: &LS,
-    ) -> Result<ReceivingPacket, ReceiveError<ReceivingPacket, SendingPacket, S, LS>>
+    ) -> Result<ReceivingPacket, ReceiveError<S::Error, LS>>
     where
         ReceivingPacket: Send + Sync + Debug + 'static,
         SendingPacket: Send + Sync + Debug + 'static,
-        S: Serializer<ReceivingPacket, SendingPacket>,
+        S: Serializer<ReceivingPacket, SendingPacket> + ?Sized,
         LS: PacketLengthSerializer,
     {
         let mut buf = Vec::new();
@@ -134,17 +137,15 @@ pub trait ReadStream: Send + Sync + 'static {
 }
 
 /// An error that may happen when receiving packets.
-pub enum ReceiveError<ReceivingPacket, SendingPacket, S, LS>
+pub enum ReceiveError<SerializationError, LS>
 where
-    ReceivingPacket: Send + Sync + Debug + 'static,
-    SendingPacket: Send + Sync + Debug + 'static,
-    S: Serializer<ReceivingPacket, SendingPacket>,
+    SerializationError: Error + Send + Sync,
     LS: PacketLengthSerializer,
 {
     /// IO error.
     Io(io::Error),
     /// Deserialization error.
-    Deserialization(S::Error),
+    Deserialization(SerializationError),
     /// Length deserialization error.
     LengthDeserialization(LS::Error),
     /// The packet size is too large (set by [`MaxPacketSize`](crate::connection::MaxPacketSize) resource).
@@ -155,12 +156,9 @@ where
     IntentionalDisconnection,
 }
 
-impl<ReceivingPacket, SendingPacket, S, LS> Debug
-    for ReceiveError<ReceivingPacket, SendingPacket, S, LS>
+impl<SerializationError, LS> Debug for ReceiveError<SerializationError, LS>
 where
-    ReceivingPacket: Send + Sync + Debug + 'static,
-    SendingPacket: Send + Sync + Debug + 'static,
-    S: Serializer<ReceivingPacket, SendingPacket>,
+    SerializationError: Error + Send + Sync,
     LS: PacketLengthSerializer,
 {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -191,13 +189,13 @@ pub trait WriteStream: Send + Sync + 'static {
     async fn send<ReceivingPacket, SendingPacket, S, LS>(
         &mut self,
         packet: SendingPacket,
-        serializer: &S,
+        serializer: Arc<S>,
         length_serializer: &LS,
     ) -> io::Result<()>
     where
         ReceivingPacket: Send + Sync + Debug + 'static,
         SendingPacket: Send + Sync + Debug + 'static,
-        S: Serializer<ReceivingPacket, SendingPacket>,
+        S: Serializer<ReceivingPacket, SendingPacket> + ?Sized,
         LS: PacketLengthSerializer,
     {
         let serialized = serializer

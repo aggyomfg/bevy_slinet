@@ -2,12 +2,12 @@
 #![cfg_attr(not(debug_assertions), deny(missing_docs))]
 #![cfg_attr(not(doctest), doc = include_str!("../README.md"))]
 
-use std::fmt::Debug;
+use std::{error::Error, fmt::Debug};
 
 use crate::packet_length_serializer::PacketLengthSerializer;
 use crate::protocol::Protocol;
-use crate::serializer::Serializer;
 use bevy::prelude::SystemSet;
+use serializer::SerializerAdapter;
 
 #[cfg(feature = "client")]
 pub mod client;
@@ -20,9 +20,10 @@ pub mod serializers;
 #[cfg(feature = "server")]
 pub mod server;
 
-// Tests work fine on my pc but fail on CI, idk how to make them pass, networking speed depends on machine
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_mut_serializer;
 
 /// [`SystemSets`](bevy::ecs::schedule::SystemSet) in [`bevy`] are used for system ordering.
 /// See [System Order of Execution][cheatbook_order] on unofficial bevy cheatbook for details.
@@ -52,8 +53,10 @@ pub trait ServerConfig: Send + Sync + 'static {
     type ServerPacket: Send + Sync + Debug + 'static;
     /// The connection's protocol.
     type Protocol: Protocol;
+    type SerializerError: Error + Send + Sync;
     /// A packet serializer.
-    type Serializer: Serializer<Self::ClientPacket, Self::ServerPacket> + Default;
+    fn build_serializer(
+    ) -> SerializerAdapter<Self::ClientPacket, Self::ServerPacket, Self::SerializerError>;
     /// A packet length serializer
     type LengthSerializer: PacketLengthSerializer + Default;
 }
@@ -66,8 +69,10 @@ pub trait ClientConfig: Send + Sync + 'static {
     type ServerPacket: Send + Sync + Debug + 'static;
     /// The connection's protocol.
     type Protocol: Protocol;
+    type SerializerError: Error + Send + Sync;
     /// A packet serializer.
-    type Serializer: Serializer<Self::ServerPacket, Self::ClientPacket> + Default;
+    fn build_serializer(
+    ) -> SerializerAdapter<Self::ServerPacket, Self::ClientPacket, Self::SerializerError>;
     /// A packet length serializer
     type LengthSerializer: PacketLengthSerializer + Default;
 }

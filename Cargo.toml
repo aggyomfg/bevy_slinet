@@ -1,7 +1,10 @@
 [package]
 name = "bevy_slinet"
-version = "0.9.0"
-authors = ["Sliman4 <4sliman4@gmail.com>"]
+version = "0.10.0"
+authors = [
+    "Sliman4 <4sliman4@gmail.com>",
+    "aggyomfg <aggyomfg@yandex.com>"
+    ]
 edition = "2021"
 license = "Apache-2.0 OR MIT"
 readme = "README.md"
@@ -54,6 +57,12 @@ serde = { version = "1", features = ["derive"] }
 name = "hello_world_tcp"
 path = "examples/hello_world_tcp.rs"
 required-features = ["client", "server", "protocol_tcp", "serializer_bincode"]
+
+[[example]]
+name = "hello_world_tcp_encrypted"
+path = "examples/hello_world_tcp_encrypted.rs"
+required-features = ["client", "server", "protocol_tcp", "serializer_bincode"]
+
 
 [[example]]
 name = "hello_world_udp"
