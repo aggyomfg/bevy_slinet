@@ -126,7 +126,7 @@ struct PacketReceiver<Config: ServerConfig>(
 
 fn create_setup_system<Config: ServerConfig>(address: SocketAddr) -> impl Fn(Commands) {
     #[cfg(target_family = "wasm")]
-    compile_error!("Why would you run a bevy_slinet server on WASM? If you really need this, please open an issue (https://github.com/Sliman4/bevy_slinet/issues/new)");
+    compile_error!("Why would you run a bevy_slinet server on WASM? If you really need this, please open an issue (https://github.com/aggyomfg/bevy_slinet/issues/new)");
 
     move |mut commands: Commands| {
         let (conn_tx, conn_rx) = tokio::sync::mpsc::unbounded_channel();

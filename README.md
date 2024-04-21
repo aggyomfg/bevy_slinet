@@ -4,7 +4,7 @@ A simple networking plugin for bevy.
 
 [![docs.rs](https://img.shields.io/docsrs/bevy_slinet)](https://docs.rs/bevy_slinet)
 [![Crates.io](https://img.shields.io/crates/v/bevy_slinet)](https://crates.io/crates/bevy_slinet)
-[![Crates.io](https://img.shields.io/crates/l/bevy_slinet)](https://github.com/Sliman4/bevy_slinet/tree/main/LICENSE)
+[![Crates.io](https://img.shields.io/crates/l/bevy_slinet)](https://github.com/aggyomfg/bevy_slinet/tree/main/LICENSE)
 
 ## Features
 
@@ -144,7 +144,7 @@ Note: you should implement keep-alive and disconnection systems yourself, or loo
 
 ## More examples
 
-[Here](https://github.com/Sliman4/bevy_slinet/tree/main/examples).
+[Here](https://github.com/aggyomfg/bevy_slinet/tree/main/examples).
 
 ### Compatibility table
 
