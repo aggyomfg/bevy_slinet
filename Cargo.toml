@@ -26,7 +26,7 @@ features = [
 
 [dependencies]
 bevy = { version = "0.14", default-features = false }
-serde = "1"
+serde = { version = "1", features = ["derive"] }
 byteorder = "1"
 bincode = { version = "1", optional = true }
 dashmap = { version = "6", optional = true }
@@ -49,9 +49,6 @@ server = []
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 wasm-bindgen-futures = "0.4.29"
-
-[dev-dependencies]
-serde = { version = "1", features = ["derive"] }
 
 [[example]]
 name = "hello_world_tcp"
