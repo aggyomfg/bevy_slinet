@@ -65,14 +65,14 @@ fn tcp_connection() {
 
     assert!(
         app_client
-            .world
+            .world()
             .get_resource::<ClientConnection<TcpConfig>>()
             .is_some(),
         "No ClientConnection resource found"
     );
     assert_eq!(
         app_server
-            .world
+            .world()
             .get_resource::<ServerConnections<TcpConfig>>()
             .unwrap()
             .len(),
@@ -124,7 +124,7 @@ fn tcp_packets() {
     app_server.update(); // handle packet
 
     let server_events = app_server
-        .world
+        .world()
         .resource::<Events<server::PacketReceiveEvent<TcpConfig>>>();
     let mut server_reader = server_events.get_reader();
     let mut server_events_iter = server_reader.read(server_events);
@@ -135,7 +135,7 @@ fn tcp_packets() {
     );
 
     let client_events = app_client
-        .world
+        .world()
         .resource::<Events<client::PacketReceiveEvent<TcpConfig>>>();
     let mut client_reader = client_events.get_reader();
     let mut client_events_iter = client_reader.read(client_events);

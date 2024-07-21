@@ -1,6 +1,6 @@
 [package]
 name = "bevy_slinet"
-version = "0.10.1"
+version = "0.11.0"
 authors = [
     "Sliman4 <4sliman4@gmail.com>",
     "aggyomfg <aggyomfg@yandex.com>"
@@ -25,11 +25,11 @@ features = [
 ]
 
 [dependencies]
-bevy = { version = "0.13", default-features = false }
+bevy = { version = "0.14", default-features = false }
 serde = "1"
 byteorder = "1"
 bincode = { version = "1", optional = true }
-dashmap = { version = "5", optional = true }
+dashmap = { version = "6", optional = true }
 log = "0.4"
 tokio = { version = "1", features = [
     "io-util",

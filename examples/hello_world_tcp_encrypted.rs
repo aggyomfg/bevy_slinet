@@ -8,8 +8,6 @@ use bevy_slinet::serializers::custom_crypt::{
     CustomSerializationError,
 };
 
-use serde::{Deserialize, Serialize};
-
 use bevy_slinet::client::ClientPlugin;
 use bevy_slinet::packet_length_serializer::LittleEndian;
 use bevy_slinet::protocols::tcp::TcpProtocol;
@@ -54,16 +52,6 @@ impl ClientConfig for Config {
             CustomCryptEngine::default()
         ))))
     }
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-enum ClientPacket {
-    String(String),
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-enum ServerPacket {
-    String(String),
 }
 
 fn main() {

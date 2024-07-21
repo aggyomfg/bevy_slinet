@@ -160,4 +160,5 @@ Note: you should implement keep-alive and disconnection systems yourself, or loo
 | `0.8`          | `0.12`       |
 | `0.9`          | `0.13`       |
 | `0.10`         | `0.13`       |
-| `main`         | `0.13`       |
+| `0.11`         | `0.14`       |
+| `main`         | `0.14`       |
