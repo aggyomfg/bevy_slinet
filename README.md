@@ -36,7 +36,9 @@ impl ClientConfig for Config {
     type LengthSerializer = LittleEndian<u32>;
     fn build_serializer(
     ) -> SerializerAdapter<Self::ClientPacket, Self::ServerPacket, Self::SerializerError> {
-        SerializerAdapter::ReadOnly(Arc::new(BincodeSerializer::<DefaultOptions>::default()))
+        SerializerAdapter::ReadOnly(Arc::new(
+            BincodeSerializer::<DefaultOptions>::default(),
+        ))
     }
 }
 
@@ -54,25 +56,24 @@ fn main() {
     App::new()
         .add_plugins(MinimalPlugins)
         .add_plugins(ClientPlugin::<Config>::connect("127.0.0.1:3000"))
-        .add_systems(Update, (connection_establish_system, packet_receive_system))
+        .observe(connection_establish_system)
+        .observe(packet_receive_system)
         .run()
 }
 
-fn connection_establish_system(mut events: EventReader<ConnectionEstablishEvent<Config>>) {
-    for _event in events.read() {
-        println!("Connected!");
-    }
+fn connection_establish_system(event: Trigger<ConnectionEstablishEvent<Config>>) {
+    println!("Connected!");
 }
 
-fn packet_receive_system(mut events: EventReader<PacketReceiveEvent<Config>>) {
-    for event in events.read() {
-        match &event.packet {
-            ServerPacket::String(s) => println!("Got a message: {}", s),
-        }
-        event
-            .connection
-            .send(ClientPacket::String("Hello, Server!".to_string())).unwrap();
+fn packet_receive_system(event: Trigger<PacketReceiveEvent<Config>>) {
+    match &event.event().packet {
+        ServerPacket::String(s) => println!("Got a message: {}", s),
     }
+    event
+        .event()
+        .connection
+        .send(ClientPacket::String("Hello, Server!".to_string()))
+        .unwrap();
 }
 ```
 
@@ -98,7 +99,9 @@ impl ServerConfig for Config {
     type LengthSerializer = LittleEndian<u32>;
     fn build_serializer(
     ) -> SerializerAdapter<Self::ClientPacket, Self::ServerPacket, Self::SerializerError> {
-        SerializerAdapter::ReadOnly(Arc::new(BincodeSerializer::<DefaultOptions>::default()))
+        SerializerAdapter::ReadOnly(Arc::new(
+            BincodeSerializer::<DefaultOptions>::default(),
+        ))
     }
 }
 
@@ -116,27 +119,28 @@ fn main() {
     App::new()
         .add_plugins(MinimalPlugins)
         .add_plugins(ServerPlugin::<Config>::bind("127.0.0.1:3000").unwrap())
-        .add_systems(Update, (new_connection_system, packet_receive_system))
+        .observe(new_connection_system)
+        .observe(packet_receive_system)
         .run()
 }
 
-fn new_connection_system(mut events: EventReader<NewConnectionEvent<Config>>) {
-    for event in events.read() {
-        event
-            .connection
-            .send(ServerPacket::String("Hello, Client!".to_string())).unwrap();
-    }
+fn new_connection_system(event: Trigger<NewConnectionEvent<Config>>) {
+    event
+        .event()
+        .connection
+        .send(ServerPacket::String("Hello, Client!".to_string()))
+        .unwrap();
 }
 
-fn packet_receive_system(mut events: EventReader<PacketReceiveEvent<Config>>) {
-    for event in events.read() {
-        match &event.packet {
-            ClientPacket::String(s) => println!("Got a message from a client: {}", s),
-        }
-        event
-            .connection
-            .send(ServerPacket::String("Hello, Client!".to_string())).unwrap();
+fn packet_receive_system(event: Trigger<PacketReceiveEvent<Config>>) {
+    match &event.event().packet {
+        ClientPacket::String(s) => println!("Got a message from a client: {}", s),
     }
+    event
+        .event()
+        .connection
+        .send(ServerPacket::String("Hello, Client!".to_string()))
+        .unwrap();
 }
 ```
 

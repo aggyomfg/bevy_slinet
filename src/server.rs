@@ -80,11 +80,9 @@ impl<Config: ServerConfig> Plugin for ServerPlugin<Config> {
             )
             .add_systems(
                 PostUpdate,
-                (
-                    remove_connections::<Config>.in_set(SystemSets::ServerRemoveConnections),
-                    connection_add_system::<Config>.in_set(SystemSets::ServerConnectionAdd),
-                ),
-            );
+                (remove_connections::<Config>.in_set(SystemSets::ServerRemoveConnections),),
+            )
+            .observe(connection_add_system::<Config>);
     }
 }
 
@@ -287,41 +285,39 @@ pub struct PacketReceiveEvent<Config: ServerConfig> {
 
 fn accept_new_connections<Config: ServerConfig>(
     mut receiver: ResMut<ConnectionReceiver<Config>>,
-    mut event_writer: EventWriter<NewConnectionEvent<Config>>,
+    mut commands: Commands,
 ) {
     while let Ok((address, connection)) = receiver.0.try_recv() {
-        let _id = event_writer.send(NewConnectionEvent {
+        commands.trigger(NewConnectionEvent::<Config> {
             connection,
             address,
         });
     }
 }
 
+fn connection_add_system<Config: ServerConfig>(
+    new_connection: Trigger<NewConnectionEvent<Config>>,
+    mut connections: ResMut<ServerConnections<Config>>,
+) {
+    connections.push(new_connection.event().connection.clone());
+}
+
 fn accept_new_packets<Config: ServerConfig>(
     mut receiver: ResMut<PacketReceiver<Config>>,
-    mut event_writer: EventWriter<PacketReceiveEvent<Config>>,
+    mut commands: Commands,
 ) {
     while let Ok((connection, packet)) = receiver.0.try_recv() {
-        let _id = event_writer.send(PacketReceiveEvent { connection, packet });
+        commands.trigger(PacketReceiveEvent::<Config> { connection, packet });
     }
 }
 
 fn remove_connections<Config: ServerConfig>(
     mut connections: ResMut<ServerConnections<Config>>,
     mut disconnections: ResMut<DisconnectionReceiver<Config>>,
-    mut event_writer: EventWriter<DisconnectionEvent<Config>>,
+    mut commands: Commands,
 ) {
     while let Ok((error, connection)) = disconnections.0.try_recv() {
         connections.retain(|conn| conn.id() != connection.id());
-        event_writer.send(DisconnectionEvent { error, connection });
-    }
-}
-
-fn connection_add_system<Config: ServerConfig>(
-    mut connections: ResMut<ServerConnections<Config>>,
-    mut events: EventReader<NewConnectionEvent<Config>>,
-) {
-    for event in events.read() {
-        connections.push(event.connection.clone());
+        commands.trigger(DisconnectionEvent::<Config> { error, connection });
     }
 }

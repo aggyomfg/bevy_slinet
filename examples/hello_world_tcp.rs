@@ -54,54 +54,53 @@ fn main() {
     let server = std::thread::spawn(move || {
         App::new()
             .add_plugins((MinimalPlugins, ServerPlugin::<Config>::bind(server_addr)))
-            .add_systems(
-                Update,
-                (server_new_connection_system, server_packet_receive_system),
-            )
+            .observe(server_new_connection_system)
+            .observe(server_packet_receive_system)
             .run();
     });
-    println!("Waiting 5000ms to make sure the server side has started");
-    std::thread::sleep(Duration::from_millis(5000));
+    println!("Waiting 1000ms to make sure the server side has started");
+    std::thread::sleep(Duration::from_millis(1000));
     let client = std::thread::spawn(move || {
         App::new()
             .add_plugins(MinimalPlugins)
             .add_plugins(ClientPlugin::<Config>::connect(server_addr))
-            .add_systems(Update, client_packet_receive_system)
+            .observe(client_packet_receive_system)
             .run();
     });
     server.join().unwrap();
     client.join().unwrap();
 }
 
-fn server_new_connection_system(mut events: EventReader<NewConnectionEvent<Config>>) {
-    for event in events.read() {
-        event
-            .connection
-            .send(ServerPacket::String("Hello, World!".to_string()))
-            .unwrap();
-    }
+fn server_new_connection_system(new_connection: Trigger<NewConnectionEvent<Config>>) {
+    new_connection
+        .event()
+        .connection
+        .send(ServerPacket::String("Hello, World!".to_string()))
+        .unwrap();
+    println!(
+        "New connection from {:?}",
+        new_connection.event().connection.peer_addr()
+    );
 }
 
-fn client_packet_receive_system(mut events: EventReader<client::PacketReceiveEvent<Config>>) {
-    for event in events.read() {
-        match &event.packet {
-            ServerPacket::String(s) => println!("Server -> Client: {s}"),
-        }
-        event
-            .connection
-            .send(ClientPacket::String("Hello, Server!".to_string()))
-            .unwrap();
+fn client_packet_receive_system(new_packet: Trigger<client::PacketReceiveEvent<Config>>) {
+    match &new_packet.event().packet {
+        ServerPacket::String(s) => println!("Server -> Client: {s}"),
     }
+    new_packet
+        .event()
+        .connection
+        .send(ClientPacket::String("Hello, Server!".to_string()))
+        .unwrap();
 }
 
-fn server_packet_receive_system(mut events: EventReader<server::PacketReceiveEvent<Config>>) {
-    for event in events.read() {
-        match &event.packet {
-            ClientPacket::String(s) => println!("Server <- Client: {s}"),
-        }
-        event
-            .connection
-            .send(ServerPacket::String("Hello, Client!".to_string()))
-            .unwrap();
+fn server_packet_receive_system(new_packet: Trigger<server::PacketReceiveEvent<Config>>) {
+    match &new_packet.event().packet {
+        ClientPacket::String(s) => println!("Server <- Client: {s}"),
     }
+    new_packet
+        .event()
+        .connection
+        .send(ServerPacket::String("Hello, Client!".to_string()))
+        .unwrap();
 }
