@@ -53,32 +53,29 @@ impl ClientConfig for Config {
         ))))
     }
 }
-
 fn main() {
     let server_addr = "127.0.0.1:3000";
     let server = std::thread::spawn(move || {
         App::new()
             .add_plugins((MinimalPlugins, ServerPlugin::<Config>::bind(server_addr)))
-            .add_systems(
-                Update,
-                (server_new_connection_system, server_packet_receive_system),
-            )
+            .observe(server_new_connection_system)
+            .observe(server_packet_receive_system)
             .run();
     });
-    println!("Waiting 5000ms to make sure the server side has started");
-    std::thread::sleep(Duration::from_millis(5000));
+    println!("Waiting 1000ms to make sure the server side has started");
+    std::thread::sleep(Duration::from_millis(1000));
     let client = std::thread::spawn(move || {
         App::new()
             .add_plugins(MinimalPlugins)
             .add_plugins(ClientPlugin::<Config>::connect(server_addr))
-            .add_systems(Update, client_packet_receive_system)
+            .observe(client_packet_receive_system)
             .run();
     });
     let client2 = std::thread::spawn(move || {
         App::new()
             .add_plugins(MinimalPlugins)
             .add_plugins(ClientPlugin::<Config>::connect(server_addr))
-            .add_systems(Update, client2_packet_receive_system)
+            .observe(client2_packet_receive_system)
             .run();
     });
     server.join().unwrap();
@@ -86,53 +83,53 @@ fn main() {
     client2.join().unwrap();
 }
 
-fn server_new_connection_system(mut events: EventReader<NewConnectionEvent<Config>>) {
-    for event in events.read() {
-        event
-            .connection
-            .send(CustomCryptServerPacket::String("Hello, World!".to_string()))
-            .unwrap();
-    }
+fn server_new_connection_system(new_connection: Trigger<NewConnectionEvent<Config>>) {
+    new_connection
+        .event()
+        .connection
+        .send(CustomCryptServerPacket::String("Hello, World!".to_string()))
+        .unwrap();
+    println!(
+        "New connection from: {:?}",
+        new_connection.event().connection.peer_addr()
+    );
 }
 
-fn client_packet_receive_system(mut events: EventReader<client::PacketReceiveEvent<Config>>) {
-    for event in events.read() {
-        match &event.packet {
-            CustomCryptServerPacket::String(s) => println!("Server -> Client: {s}"),
-        }
-        event
-            .connection
-            .send(CustomCryptClientPacket::String(
-                "Hello, Server!".to_string(),
-            ))
-            .unwrap();
+fn client_packet_receive_system(new_packet: Trigger<client::PacketReceiveEvent<Config>>) {
+    match &new_packet.event().packet {
+        CustomCryptServerPacket::String(s) => println!("Server -> Client: {s}"),
     }
+    new_packet
+        .event()
+        .connection
+        .send(CustomCryptClientPacket::String(
+            "Hello, Server!".to_string(),
+        ))
+        .unwrap();
 }
 
-fn client2_packet_receive_system(mut events: EventReader<client::PacketReceiveEvent<Config>>) {
-    for event in events.read() {
-        match &event.packet {
-            CustomCryptServerPacket::String(s) => println!("Server -> Client2: {s}"),
-        }
-        event
-            .connection
-            .send(CustomCryptClientPacket::String(
-                "Hello, Server!, I'm Client2".to_string(),
-            ))
-            .unwrap();
+fn client2_packet_receive_system(new_packet: Trigger<client::PacketReceiveEvent<Config>>) {
+    match &new_packet.event().packet {
+        CustomCryptServerPacket::String(s) => println!("Server -> Client2: {s}"),
     }
+    new_packet
+        .event()
+        .connection
+        .send(CustomCryptClientPacket::String(
+            "Hello, Server!, I'm Client2".to_string(),
+        ))
+        .unwrap();
 }
 
-fn server_packet_receive_system(mut events: EventReader<server::PacketReceiveEvent<Config>>) {
-    for event in events.read() {
-        match &event.packet {
-            CustomCryptClientPacket::String(s) => println!("Server <- Client: {s}"),
-        }
-        event
-            .connection
-            .send(CustomCryptServerPacket::String(
-                "Hello, Client!".to_string(),
-            ))
-            .unwrap();
+fn server_packet_receive_system(new_packet: Trigger<server::PacketReceiveEvent<Config>>) {
+    match &new_packet.event().packet {
+        CustomCryptClientPacket::String(s) => println!("Server <- Client: {s}"),
     }
+    new_packet
+        .event()
+        .connection
+        .send(CustomCryptServerPacket::String(
+            "Hello, Client!".to_string(),
+        ))
+        .unwrap();
 }

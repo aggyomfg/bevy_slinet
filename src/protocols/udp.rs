@@ -156,22 +156,18 @@ impl Future for UdpReadTask<'_> {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let UdpReadTask { read, buffer } = &mut *self;
-        let mut bytes = read.0.bytes.try_lock().unwrap();
 
-        // quick check to avoid registration if already done.
-        if bytes.len() >= buffer.len() {
-            buffer.copy_from_slice(&bytes[..buffer.len()]);
-            *bytes = bytes[buffer.len()..].to_vec();
-            return Poll::Ready(Ok(()));
-        }
-
-        read.0.waker.register(cx.waker());
-
-        if bytes.len() >= buffer.len() {
-            buffer.copy_from_slice(&bytes[..buffer.len()]);
-            *bytes = bytes[buffer.len()..].to_vec();
-            Poll::Ready(Ok(()))
+        if let Ok(mut bytes) = read.0.bytes.try_lock() {
+            if bytes.len() >= buffer.len() {
+                buffer.copy_from_slice(&bytes[..buffer.len()]);
+                *bytes = bytes[buffer.len()..].to_vec();
+                Poll::Ready(Ok(()))
+            } else {
+                read.0.waker.register(cx.waker());
+                Poll::Pending
+            }
         } else {
+            read.0.waker.register(cx.waker());
             Poll::Pending
         }
     }

@@ -16,10 +16,22 @@ pub enum CustomCryptClientPacket {
     String(String),
 }
 
+impl Default for CustomCryptClientPacket {
+    fn default() -> Self {
+        CustomCryptClientPacket::String(String::new())
+    }
+}
+
 /// Represents custom packets received by the server, allowing different types of content.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum CustomCryptServerPacket {
     String(String),
+}
+
+impl Default for CustomCryptServerPacket {
+    fn default() -> Self {
+        CustomCryptServerPacket::String(String::new())
+    }
 }
 
 // Define a custom error type for serialization errors.

@@ -38,7 +38,6 @@ impl ClientConfig for Config {
     }
     type LengthSerializer = LittleEndian<u32>;
 }
-
 #[derive(Serialize, Deserialize, Debug)]
 enum ServerPacket {
     Hello,
@@ -61,14 +60,12 @@ fn main() {
                 MinimalPlugins,
                 ServerPlugin::<Config>::bind("127.0.0.1:3000"),
             ))
-            .add_systems(
-                Update,
-                (server_new_connection_system, server_packet_receive_system),
-            )
+            .observe(server_new_connection_system)
+            .observe(server_packet_receive_system)
             .run();
     });
-    println!("Waiting 5000ms to make sure the server has started");
-    std::thread::sleep(Duration::from_millis(5000));
+    println!("Waiting 1000ms to make sure the server has started");
+    std::thread::sleep(Duration::from_millis(1000));
     for id in 0..10 {
         std::thread::spawn(move || {
             App::new()
@@ -77,49 +74,73 @@ fn main() {
                     ClientPlugin::<Config>::connect("127.0.0.1:3000"),
                 ))
                 .insert_resource(ClientId(id))
-                .add_systems(Update, client_packet_receive_system)
+                .observe(client_packet_receive_system)
                 .run();
         });
     }
     server.join().unwrap();
 }
 
-fn server_new_connection_system(mut events: EventReader<NewConnectionEvent<Config>>) {
-    for event in events.read() {
-        println!("Connection");
-        event.connection.send(ServerPacket::Hello).unwrap();
-    }
+fn server_new_connection_system(new_connection: Trigger<NewConnectionEvent<Config>>) {
+    new_connection
+        .event()
+        .connection
+        .send(ServerPacket::Hello)
+        .unwrap();
+    println!(
+        "Connection from {:?}",
+        new_connection.event().connection.peer_addr()
+    );
 }
 
 fn client_packet_receive_system(
-    mut events: EventReader<client::PacketReceiveEvent<Config>>,
+    new_packet: Trigger<client::PacketReceiveEvent<Config>>,
     client_number: Res<ClientId>,
 ) {
-    for event in events.read() {
-        match &event.packet {
-            ServerPacket::Hello => {
-                println!("Server -> Client: Hello (client #{})", client_number.0);
-                event.connection.send(ClientPacket::Hello).unwrap();
-            }
-            ServerPacket::Message(i) => {
-                println!("Server -> Client: {} (client #{})", i, client_number.0);
-                event.connection.send(ClientPacket::Reply(*i)).unwrap();
-            }
+    match &new_packet.event().packet {
+        ServerPacket::Hello => {
+            println!("Server -> Client: Hello (client #{})", client_number.0);
+            new_packet
+                .event()
+                .connection
+                .send(ClientPacket::Hello)
+                .unwrap();
+        }
+        ServerPacket::Message(i) => {
+            println!("Server -> Client: {} (client #{})", i, client_number.0);
+            new_packet
+                .event()
+                .connection
+                .send(ClientPacket::Reply(*i))
+                .unwrap();
         }
     }
 }
 
-fn server_packet_receive_system(mut events: EventReader<server::PacketReceiveEvent<Config>>) {
-    for event in events.read() {
-        match &event.packet {
-            ClientPacket::Hello => {
-                println!("Server <- Client {:04?}: Hello", event.connection.id());
-                event.connection.send(ServerPacket::Message(0)).unwrap();
-            }
-            ClientPacket::Reply(i) => {
-                println!("Server <- Client {:04?}: {}", event.connection.id(), i);
-                event.connection.send(ServerPacket::Message(i + 1)).unwrap();
-            }
+fn server_packet_receive_system(new_packet: Trigger<server::PacketReceiveEvent<Config>>) {
+    match &new_packet.event().packet {
+        ClientPacket::Hello => {
+            println!(
+                "Server <- Client {:04?}: Hello",
+                new_packet.event().connection.id()
+            );
+            new_packet
+                .event()
+                .connection
+                .send(ServerPacket::Message(0))
+                .unwrap();
+        }
+        ClientPacket::Reply(i) => {
+            println!(
+                "Server <- Client {:04?}: {}",
+                new_packet.event().connection.id(),
+                i
+            );
+            new_packet
+                .event()
+                .connection
+                .send(ServerPacket::Message(i + 1))
+                .unwrap();
         }
     }
 }

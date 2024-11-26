@@ -81,11 +81,8 @@ impl<Config: ClientConfig> Plugin for ClientPlugin<Config> {
             )
             .add_systems(
                 PreUpdate,
-                (
-                    connection_request_system::<Config>.in_set(SystemSets::ClientConnectionRequest),
-                    connection_establish_system::<Config>
-                        .in_set(SystemSets::ClientConnectionEstablish),
-                ),
+                (connection_establish_system::<Config>
+                    .in_set(SystemSets::ClientConnectionEstablish),),
             )
             .add_systems(
                 PostUpdate,
@@ -97,13 +94,13 @@ impl<Config: ClientConfig> Plugin for ClientPlugin<Config> {
             .add_systems(
                 Startup,
                 (
-                    (move |mut events: EventWriter<ConnectionRequestEvent<Config>>| {
+                    setup_system::<Config>.before(AddInitialConnectionRequestEventLabel),
+                    (move |mut commands: Commands| {
                         if let Some(address) = address {
-                            events.send(ConnectionRequestEvent::new(address));
+                            commands.trigger(ConnectionRequestEvent::<Config>::new(address));
                         }
                     })
                     .in_set(AddInitialConnectionRequestEventLabel),
-                    setup_system::<Config>.after(AddInitialConnectionRequestEventLabel),
                 ),
             );
     }
@@ -209,6 +206,7 @@ fn setup_system<Config: ClientConfig>(mut commands: Commands) {
     commands.insert_resource(ConnectionReceiver::<Config>(conn_rx));
     commands.insert_resource(DisconnectionReceiver::<Config>(disc_rx, PhantomData));
     commands.insert_resource(PacketReceiver::<Config>(pack_rx));
+    commands.spawn(Observer::new(connection_request_system::<Config>));
 
     // Connection
     let disc_tx2 = disc_tx.clone();
@@ -310,15 +308,6 @@ fn setup_system<Config: ClientConfig>(mut commands: Commands) {
     });
 }
 
-fn connection_request_system<Config: ClientConfig>(
-    requests: Res<ConnectionRequestSender<Config>>,
-    mut events: EventReader<ConnectionRequestEvent<Config>>,
-) {
-    for event in events.read() {
-        requests.0.send(event.address).unwrap();
-    }
-}
-
 pub(crate) async fn create_connection<Config: ClientConfig>(
     addr: SocketAddr,
     serializer: Arc<
@@ -335,12 +324,19 @@ pub(crate) async fn create_connection<Config: ClientConfig>(
     ))
 }
 
+fn connection_request_system<Config: ClientConfig>(
+    connection_request: Trigger<ConnectionRequestEvent<Config>>,
+    requests: Res<ConnectionRequestSender<Config>>,
+) {
+    requests.0.send(connection_request.event().address).unwrap();
+}
+
 fn packet_receive_system<Config: ClientConfig>(
     mut packets: ResMut<PacketReceiver<Config>>,
-    mut event_writer: EventWriter<PacketReceiveEvent<Config>>,
+    mut commands: Commands,
 ) {
     while let Ok((connection, packet)) = packets.0.try_recv() {
-        let _id = event_writer.send(PacketReceiveEvent { connection, packet });
+        commands.trigger(PacketReceiveEvent::<Config> { connection, packet });
     }
 }
 
@@ -348,12 +344,11 @@ fn connection_establish_system<Config: ClientConfig>(
     mut commands: Commands,
     mut new_connections: ResMut<ConnectionReceiver<Config>>,
     mut connections: ResMut<ClientConnections<Config>>,
-    mut event_writer: EventWriter<ConnectionEstablishEvent<Config>>,
 ) {
     while let Ok((address, connection)) = new_connections.0.try_recv() {
         commands.insert_resource(connection.clone());
         connections.push(connection.clone());
-        let _id = event_writer.send(ConnectionEstablishEvent {
+        commands.trigger(ConnectionEstablishEvent::<Config> {
             address,
             connection,
         });
@@ -364,7 +359,6 @@ fn connection_remove_system<Config: ClientConfig>(
     mut commands: Commands,
     mut old_connections: ResMut<DisconnectionReceiver<Config>>,
     mut connections: ResMut<ClientConnections<Config>>,
-    mut event_writer: EventWriter<DisconnectionEvent<Config>>,
 ) {
     while let Ok((error, address)) = old_connections.0.try_recv() {
         commands.remove_resource::<ClientConnection<Config>>();
@@ -372,7 +366,7 @@ fn connection_remove_system<Config: ClientConfig>(
         if let Some(connection) = connections.last() {
             commands.insert_resource(connection.clone());
         }
-        let _id = event_writer.send(DisconnectionEvent {
+        commands.trigger(DisconnectionEvent::<Config> {
             error,
             address,
             _marker: PhantomData,

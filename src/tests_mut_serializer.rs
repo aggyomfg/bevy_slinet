@@ -1,5 +1,5 @@
-use bevy::app::{App, Update};
-use bevy::ecs::event::{EventReader, Events};
+use bevy::app::App;
+use bevy::prelude::*;
 
 use crate::client::{self, ClientConnection, ClientPlugin, ConnectionEstablishEvent};
 use crate::packet_length_serializer::LittleEndian;
@@ -13,6 +13,7 @@ use crate::server::{self, NewConnectionEvent, ServerConnections, ServerPlugin};
 use crate::{ClientConfig, ServerConfig};
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 struct TcpConfig;
 
@@ -88,98 +89,107 @@ fn tcp_connection() {
     )
 }
 
+#[derive(Resource, Default)]
+struct ReceivedPackets<T> {
+    packets: Vec<T>,
+}
+
+#[derive(Resource)]
+struct ClientToServerPacketResource(CustomCryptClientPacket);
+
+#[derive(Resource)]
+struct ServerToClientPacketResource(CustomCryptServerPacket);
+
 #[test]
-fn tcp_packets() {
-    // Define server and client configurations
-    let srv_addr = "127.0.0.1:3005";
+fn tcp_encrypted_packets() {
+    let client_to_server_packet = CustomCryptClientPacket::String("Hello, Server!".to_string());
+    let server_to_client_packet = CustomCryptServerPacket::String("Hello, Client!".to_string());
+    let server_addr = "127.0.0.1:3005";
 
-    // Setup server and client applications
-    let mut app_server = setup_server_app(srv_addr);
-    let mut app_client = setup_client_app(srv_addr, "Hello, Server!");
+    let mut app_server = App::new();
+    app_server.add_plugins(ServerPlugin::<TcpConfig>::bind(server_addr));
+    app_server.insert_resource(ReceivedPackets::<CustomCryptClientPacket>::default());
+    app_server.insert_resource(ServerToClientPacketResource(
+        server_to_client_packet.clone(),
+    ));
 
-    // Simulate application lifecycle
-    run_simulation(&mut app_server, &mut app_client);
+    app_server.observe(server_new_connection_system);
+    app_server.observe(server_packet_receive_system);
 
-    // Check events and packets
-    check_server_received_packets(&app_server);
-    check_client_received_packets(&app_client, "Hello, Client!");
-}
+    let mut app_client = App::new();
+    app_client.add_plugins(ClientPlugin::<TcpConfig>::connect(server_addr));
+    app_client.insert_resource(ReceivedPackets::<CustomCryptServerPacket>::default());
+    app_client.insert_resource(ClientToServerPacketResource(
+        client_to_server_packet.clone(),
+    ));
 
-fn server_receive_system(mut events: EventReader<NewConnectionEvent<TcpConfig>>) {
-    let server_to_client_packet = CustomCryptServerPacket::String(String::from("Hello, Client!"));
-    for event in events.read() {
-        event
-            .connection
-            .send(server_to_client_packet.clone())
-            .expect("Failed to send packet to client");
-    }
-}
+    app_client.observe(client_connection_establish_system);
+    app_client.observe(client_packet_receive_system);
 
-fn setup_server_app(srv_addr: &str) -> App {
-    let mut app = App::new();
-    app.add_plugins(ServerPlugin::<TcpConfig>::bind(srv_addr));
-    app.add_systems(Update, server_receive_system);
-    app
-}
+    app_server.update(); // bind
+    app_client.update(); // connect
+    std::thread::sleep(Duration::from_secs(1));
+    app_client.update(); // add connection resource
+    app_server.update(); // handle connection
+    std::thread::sleep(Duration::from_secs(1));
+    app_client.update(); // handle packet
+    app_server.update(); // handle packet
 
-fn setup_client_app(srv_addr: &str, message: &str) -> App {
-    let packet = CustomCryptClientPacket::String(String::from(message));
-    let mut app = App::new();
-    app.add_plugins(ClientPlugin::<TcpConfig>::connect(srv_addr));
-    app.add_systems(
-        Update,
-        move |mut events: EventReader<ConnectionEstablishEvent<TcpConfig>>| {
-            for event in events.read() {
-                event
-                    .connection
-                    .send(packet.clone())
-                    .expect("Failed to send packet");
-            }
-        },
-    );
-    app
-}
-
-// Simulate the test scenario
-fn run_simulation(app_server: &mut App, app_client: &mut App) {
-    app_server.update();
-    app_client.update();
-    std::thread::sleep(std::time::Duration::from_secs(1));
-    app_client.update();
-    app_server.update();
-    std::thread::sleep(std::time::Duration::from_secs(1));
-    app_client.update();
-    app_server.update();
-}
-
-fn check_server_received_packets(app_server: &App) {
-    let server_events = app_server
+    // Check if the server received the packet from the client
+    let server_received_packets = app_server
         .world()
-        .resource::<Events<server::PacketReceiveEvent<TcpConfig>>>();
-    let mut server_reader = server_events.get_reader();
-    let mut server_events_iter = server_reader.read(server_events);
-
+        .get_resource::<ReceivedPackets<CustomCryptClientPacket>>()
+        .unwrap();
     assert_eq!(
-        server_events_iter.next().map(|event| event.packet.clone()),
-        Some(CustomCryptClientPacket::String(String::from(
-            "Hello, Server!"
-        ))),
-        "Server did not receive packet from client 1"
+        server_received_packets.packets.get(0),
+        Some(&client_to_server_packet),
+        "Server did not receive the expected packet from client"
+    );
+
+    // Check if the client received the packet from the server
+    let client_received_packets = app_client
+        .world()
+        .get_resource::<ReceivedPackets<CustomCryptServerPacket>>()
+        .unwrap();
+    assert_eq!(
+        client_received_packets.packets.get(0),
+        Some(&server_to_client_packet),
+        "Client did not receive the expected packet from server"
     );
 }
 
-fn check_client_received_packets(app_client: &App, expected_message: &str) {
-    let client_events = app_client
-        .world()
-        .resource::<Events<client::PacketReceiveEvent<TcpConfig>>>();
-    let mut client_reader = client_events.get_reader();
-    let mut client_events_iter = client_reader.read(client_events);
+fn server_new_connection_system(
+    event: Trigger<NewConnectionEvent<TcpConfig>>,
+    server_to_client_packet: Res<ServerToClientPacketResource>,
+) {
+    event
+        .event()
+        .connection
+        .send(server_to_client_packet.0.clone())
+        .expect("Couldn't send server packet");
+}
 
-    assert_eq!(
-        client_events_iter.next().map(|event| event.packet.clone()),
-        Some(CustomCryptServerPacket::String(String::from(
-            expected_message
-        ))),
-        "Client did not receive packet from server"
-    );
+fn server_packet_receive_system(
+    event: Trigger<server::PacketReceiveEvent<TcpConfig>>,
+    mut received_packets: ResMut<ReceivedPackets<CustomCryptClientPacket>>,
+) {
+    received_packets.packets.push(event.event().packet.clone());
+}
+
+fn client_connection_establish_system(
+    event: Trigger<ConnectionEstablishEvent<TcpConfig>>,
+    client_to_server_packet: Res<ClientToServerPacketResource>,
+) {
+    event
+        .event()
+        .connection
+        .send(client_to_server_packet.0.clone())
+        .expect("Couldn't send client packet");
+}
+
+fn client_packet_receive_system(
+    event: Trigger<client::PacketReceiveEvent<TcpConfig>>,
+    mut received_packets: ResMut<ReceivedPackets<CustomCryptServerPacket>>,
+) {
+    received_packets.packets.push(event.event().packet.clone());
 }
