@@ -99,9 +99,7 @@ fn tcp_packets() {
     let mut app_server = App::new();
     app_server.add_plugins(ServerPlugin::<TcpConfig>::bind(server_addr));
     app_server.insert_resource(ReceivedPackets::<Packet>::default());
-    app_server.insert_resource(ServerToClientPacketResource(
-        server_to_client_packet.clone(),
-    ));
+    app_server.insert_resource(ServerToClientPacketResource(server_to_client_packet));
 
     app_server.observe(server_new_connection_system);
     app_server.observe(server_packet_receive_system);
@@ -109,9 +107,7 @@ fn tcp_packets() {
     let mut app_client = App::new();
     app_client.add_plugins(ClientPlugin::<TcpConfig>::connect(server_addr));
     app_client.insert_resource(ReceivedPackets::<Packet>::default());
-    app_client.insert_resource(ClientToServerPacketResource(
-        client_to_server_packet.clone(),
-    ));
+    app_client.insert_resource(ClientToServerPacketResource(client_to_server_packet));
 
     app_client.observe(client_connection_establish_system);
     app_client.observe(client_packet_receive_system);
@@ -131,7 +127,7 @@ fn tcp_packets() {
         .get_resource::<ReceivedPackets<Packet>>()
         .unwrap();
     assert_eq!(
-        server_received_packets.packets.get(0),
+        server_received_packets.packets.first(),
         Some(&client_to_server_packet),
         "Server did not receive the expected packet from client"
     );
@@ -142,7 +138,7 @@ fn tcp_packets() {
         .get_resource::<ReceivedPackets<Packet>>()
         .unwrap();
     assert_eq!(
-        client_received_packets.packets.get(0),
+        client_received_packets.packets.first(),
         Some(&server_to_client_packet),
         "Client did not receive the expected packet from server"
     );
@@ -155,7 +151,7 @@ fn server_new_connection_system(
     event
         .event()
         .connection
-        .send(server_to_client_packet.0.clone())
+        .send(server_to_client_packet.0)
         .expect("Couldn't send server packet");
 }
 
@@ -173,7 +169,7 @@ fn client_connection_establish_system(
     event
         .event()
         .connection
-        .send(client_to_server_packet.0.clone())
+        .send(client_to_server_packet.0)
         .expect("Couldn't send client packet");
 }
 

@@ -141,7 +141,7 @@ fn tcp_encrypted_packets() {
         .get_resource::<ReceivedPackets<CustomCryptClientPacket>>()
         .unwrap();
     assert_eq!(
-        server_received_packets.packets.get(0),
+        server_received_packets.packets.first(),
         Some(&client_to_server_packet),
         "Server did not receive the expected packet from client"
     );
@@ -152,7 +152,7 @@ fn tcp_encrypted_packets() {
         .get_resource::<ReceivedPackets<CustomCryptServerPacket>>()
         .unwrap();
     assert_eq!(
-        client_received_packets.packets.get(0),
+        client_received_packets.packets.first(),
         Some(&server_to_client_packet),
         "Client did not receive the expected packet from server"
     );

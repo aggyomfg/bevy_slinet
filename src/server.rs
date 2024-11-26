@@ -80,10 +80,7 @@ impl<Config: ServerConfig> Plugin for ServerPlugin<Config> {
             )
             .add_systems(
                 PostUpdate,
-                (
-                    remove_connections::<Config>.in_set(SystemSets::ServerRemoveConnections),
-                    // connection_add_system::<Config>.in_set(SystemSets::ServerConnectionAdd),
-                ),
+                (remove_connections::<Config>.in_set(SystemSets::ServerRemoveConnections),),
             )
             .observe(connection_add_system::<Config>);
     }
