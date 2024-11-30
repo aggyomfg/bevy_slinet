@@ -206,7 +206,7 @@ fn setup_system<Config: ClientConfig>(mut commands: Commands) {
     commands.insert_resource(ConnectionReceiver::<Config>(conn_rx));
     commands.insert_resource(DisconnectionReceiver::<Config>(disc_rx, PhantomData));
     commands.insert_resource(PacketReceiver::<Config>(pack_rx));
-    commands.spawn(Observer::new(connection_request_system::<Config>));
+    commands.add_observer(connection_request_system::<Config>);
 
     // Connection
     let disc_tx2 = disc_tx.clone();

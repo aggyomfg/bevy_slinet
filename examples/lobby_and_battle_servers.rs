@@ -169,12 +169,12 @@ fn main() {
         .add_plugins((LogPlugin::default(), MinimalPlugins))
         // Lobby server
         .add_plugins(ServerPlugin::<LobbyConfig>::bind(LOBBY_SERVER))
-        .observe(lobby_server_accept_new_connections)
-        .observe(lobby_server_packet_handler)
+        .add_observer(lobby_server_accept_new_connections)
+        .add_observer(lobby_server_packet_handler)
         // Battle server
         .add_plugins(ServerPlugin::<BattleConfig>::bind(BATTLE_SERVER))
-        .observe(battle_server_accept_new_connections)
-        .observe(battle_server_packet_handler)
+        .add_observer(battle_server_accept_new_connections)
+        .add_observer(battle_server_packet_handler)
         // Keep-alive packets
         .init_resource::<ClientKeepAliveTimeout>()
         .init_resource::<ServerKeepAliveMap<LobbyConfig>>()
@@ -190,19 +190,19 @@ fn main() {
         )
         // Lobby client
         .add_plugins(ClientPlugin::<LobbyConfig>::connect(LOBBY_SERVER))
-        .observe(lobby_client_connect_handler)
-        .observe(lobby_client_packet_handler)
+        .add_observer(lobby_client_connect_handler)
+        .add_observer(lobby_client_packet_handler)
         // Battle client (doesn't connect immediately)
         .add_plugins(ClientPlugin::<BattleConfig>::new())
-        .observe(battle_client_connect_handler)
-        .observe(battle_client_packet_handler)
+        .add_observer(battle_client_connect_handler)
+        .add_observer(battle_client_packet_handler)
         // Reconnection handlers
-        .observe(lobby_client_reconnect_if_error)
-        .observe(battle_client_reconnect_if_error)
-        .observe(lobby_client_keepalive_handler)
-        .observe(battle_client_keepalive_handler)
-        .observe(lobby_server_keepalive_handler)
-        .observe(battle_server_keepalive_handler)
+        .add_observer(lobby_client_reconnect_if_error)
+        .add_observer(battle_client_reconnect_if_error)
+        .add_observer(lobby_client_keepalive_handler)
+        .add_observer(battle_client_keepalive_handler)
+        .add_observer(lobby_server_keepalive_handler)
+        .add_observer(battle_server_keepalive_handler)
         .run();
 }
 

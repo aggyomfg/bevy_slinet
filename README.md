@@ -56,8 +56,8 @@ fn main() {
     App::new()
         .add_plugins(MinimalPlugins)
         .add_plugins(ClientPlugin::<Config>::connect("127.0.0.1:3000"))
-        .observe(connection_establish_system)
-        .observe(packet_receive_system)
+        .add_observer(connection_establish_system)
+        .add_observer(packet_receive_system)
         .run()
 }
 
@@ -119,8 +119,8 @@ fn main() {
     App::new()
         .add_plugins(MinimalPlugins)
         .add_plugins(ServerPlugin::<Config>::bind("127.0.0.1:3000").unwrap())
-        .observe(new_connection_system)
-        .observe(packet_receive_system)
+        .add_observer(new_connection_system)
+        .add_observer(packet_receive_system)
         .run()
 }
 
@@ -165,4 +165,6 @@ Note: you should implement keep-alive and disconnection systems yourself, or loo
 | `0.9`          | `0.13`       |
 | `0.10`         | `0.13`       |
 | `0.11`         | `0.14`       |
-| `main`         | `0.14`       |
+| `0.12`         | `0.14`       |
+| `0.13`         | `0.15`       |
+| `main`         | `0.15`       |
