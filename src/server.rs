@@ -82,7 +82,7 @@ impl<Config: ServerConfig> Plugin for ServerPlugin<Config> {
                 PostUpdate,
                 (remove_connections::<Config>.in_set(SystemSets::ServerRemoveConnections),),
             )
-            .observe(connection_add_system::<Config>);
+            .add_observer(connection_add_system::<Config>);
     }
 }
 

@@ -58,8 +58,8 @@ fn main() {
     let server = std::thread::spawn(move || {
         App::new()
             .add_plugins((MinimalPlugins, ServerPlugin::<Config>::bind(server_addr)))
-            .observe(server_new_connection_system)
-            .observe(server_packet_receive_system)
+            .add_observer(server_new_connection_system)
+            .add_observer(server_packet_receive_system)
             .run();
     });
     println!("Waiting 1000ms to make sure the server side has started");
@@ -68,14 +68,14 @@ fn main() {
         App::new()
             .add_plugins(MinimalPlugins)
             .add_plugins(ClientPlugin::<Config>::connect(server_addr))
-            .observe(client_packet_receive_system)
+            .add_observer(client_packet_receive_system)
             .run();
     });
     let client2 = std::thread::spawn(move || {
         App::new()
             .add_plugins(MinimalPlugins)
             .add_plugins(ClientPlugin::<Config>::connect(server_addr))
-            .observe(client2_packet_receive_system)
+            .add_observer(client2_packet_receive_system)
             .run();
     });
     server.join().unwrap();

@@ -101,16 +101,16 @@ fn tcp_packets() {
     app_server.insert_resource(ReceivedPackets::<Packet>::default());
     app_server.insert_resource(ServerToClientPacketResource(server_to_client_packet));
 
-    app_server.observe(server_new_connection_system);
-    app_server.observe(server_packet_receive_system);
+    app_server.add_observer(server_new_connection_system);
+    app_server.add_observer(server_packet_receive_system);
 
     let mut app_client = App::new();
     app_client.add_plugins(ClientPlugin::<TcpConfig>::connect(server_addr));
     app_client.insert_resource(ReceivedPackets::<Packet>::default());
     app_client.insert_resource(ClientToServerPacketResource(client_to_server_packet));
 
-    app_client.observe(client_connection_establish_system);
-    app_client.observe(client_packet_receive_system);
+    app_client.add_observer(client_connection_establish_system);
+    app_client.add_observer(client_packet_receive_system);
 
     app_server.update(); // bind
     app_client.update(); // connect

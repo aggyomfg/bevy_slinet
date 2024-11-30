@@ -60,8 +60,8 @@ fn main() {
                 MinimalPlugins,
                 ServerPlugin::<Config>::bind("127.0.0.1:3000"),
             ))
-            .observe(server_new_connection_system)
-            .observe(server_packet_receive_system)
+            .add_observer(server_new_connection_system)
+            .add_observer(server_packet_receive_system)
             .run();
     });
     println!("Waiting 1000ms to make sure the server has started");
@@ -74,7 +74,7 @@ fn main() {
                     ClientPlugin::<Config>::connect("127.0.0.1:3000"),
                 ))
                 .insert_resource(ClientId(id))
-                .observe(client_packet_receive_system)
+                .add_observer(client_packet_receive_system)
                 .run();
         });
     }
