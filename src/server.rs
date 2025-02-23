@@ -75,7 +75,9 @@ impl<Config: ServerConfig> Plugin for ServerPlugin<Config> {
                 PreUpdate,
                 (
                     accept_new_connections::<Config>.in_set(SystemSets::ServerAcceptNewConnections),
-                    accept_new_packets::<Config>.in_set(SystemSets::ServerAcceptNewPackets),
+                    accept_new_packets::<Config>
+                        .in_set(SystemSets::ServerAcceptNewPackets)
+                        .after(SystemSets::ServerAcceptNewConnections),
                 ),
             )
             .add_systems(
