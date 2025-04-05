@@ -229,14 +229,20 @@ fn setup_system<Config: ClientConfig>(mut commands: Commands) {
                         local_addr: connection.local_addr(),
                         peer_addr: connection.peer_addr(),
                     };
-                    conn_tx.send((address, ecs_conn.clone())).unwrap();
-                    conn_tx2.send((connection, ecs_conn)).unwrap();
+                    if let Err(err) = conn_tx.send((address, ecs_conn.clone())) {
+                        log::error!("Failed to send connection establishment: {err:?}");
+                        return;
+                    }
+                    if let Err(err) = conn_tx2.send((connection, ecs_conn)) {
+                        log::error!("Failed to send raw connection: {err:?}");
+                    }
                 }
                 Err(err) => {
                     log::warn!("Couldn't connect to server: {err:?}");
-                    disc_tx2
-                        .send((ReceiveError::NoConnection(err), address))
-                        .unwrap();
+                    if let Err(send_err) = disc_tx2.send((ReceiveError::NoConnection(err), address))
+                    {
+                        log::error!("Failed to send disconnection event: {send_err:?}");
+                    }
                 }
             }
         }
@@ -257,7 +263,15 @@ fn setup_system<Config: ClientConfig>(mut commands: Commands) {
             let serializer2 = Arc::clone(&serializer);
             let packet_length_serializer2 = Arc::clone(&packet_length_serializer);
             let peer_addr = stream.peer_addr();
-            let (mut read, mut write) = stream.into_split().await.expect("Couldn't split stream");
+            
+            let (mut read, mut write) = match stream.into_split().await {
+                Ok(split) => split,
+                Err(err) => {
+                    log::error!("({:?}) Couldn't split stream: {}", id, err);
+                    continue;
+                }
+            };
+
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
@@ -280,7 +294,9 @@ fn setup_system<Config: ClientConfig>(mut commands: Commands) {
                         }
                         _ = disconnect_task.clone() => {
                             log::debug!("({id:?}) Client disconnected intentionally");
-                            disc_tx2.send((ReceiveError::IntentionalDisconnection, peer_addr)).unwrap();
+                            if let Err(err) = disc_tx2.send((ReceiveError::IntentionalDisconnection, peer_addr)) {
+                                log::error!("({id:?}) Failed to send disconnection event: {err:?}");
+                            }
                             break
                         }
                     }
@@ -328,7 +344,9 @@ fn connection_request_system<Config: ClientConfig>(
     connection_request: Trigger<ConnectionRequestEvent<Config>>,
     requests: Res<ConnectionRequestSender<Config>>,
 ) {
-    requests.0.send(connection_request.event().address).unwrap();
+    if let Err(err) = requests.0.send(connection_request.event().address) {
+        log::error!("Failed to send connection request: {err:?}");
+    }
 }
 
 fn packet_receive_system<Config: ClientConfig>(
@@ -408,16 +426,25 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
+        let runtime_result = tokio::runtime::Builder::new_current_thread()
             .enable_all()
-            .build()
-            .expect("Cannot start tokio runtime");
+            .build();
 
-        rt.block_on(async move {
+        let runtime = match runtime_result {
+            Ok(rt) => rt,
+            Err(err) => {
+                log::error!("Failed to create tokio runtime: {:?}", err);
+                return;
+            }
+        };
+
+        runtime.block_on(async move {
             let local = tokio::task::LocalSet::new();
             local
                 .run_until(async move {
-                    tokio::task::spawn_local(future).await.unwrap();
+                    if let Err(err) = tokio::task::spawn_local(future).await {
+                        log::error!("Failed to run async task: {}", err);
+                    }
                 })
                 .await;
         });
@@ -433,7 +460,9 @@ where
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async move {
-                tokio::task::spawn_local(future).await.unwrap();
+                if let Err(err) = tokio::task::spawn_local(future).await {
+                    log::error!("Failed to run async task: {:?}", err);
+                }
             })
             .await;
     });

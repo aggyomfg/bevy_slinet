@@ -142,118 +142,153 @@ fn create_setup_system<Config: ServerConfig>(address: SocketAddr) -> impl Fn(Com
         commands.insert_resource(PacketReceiver::<Config>(pack_rx));
 
         std::thread::spawn(move || {
-            tokio::runtime::Builder::new_multi_thread()
+            let runtime_result = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
-                .build()
-                .expect("Cannot start tokio runtime")
-                .block_on(async move {
-                    // Receiving packets
-                    tokio::spawn(async move {
-                        while let Some((connection, ecs_conn)) = conn_rx2.recv().await {
-                            let RawConnection {
-                                disconnect_task,
-                                stream,
-                                serializer,
-                                packet_length_serializer,
-                                mut packets_rx,
-                                id,
-                            } = connection;
-                            let (mut read, mut write) =
-                                stream.into_split().await.expect("Couldn't split stream");
-                            let pack_tx2 = pack_tx.clone();
-                            let disc_tx_2 = disc_tx.clone();
-                            let serializer2 = Arc::clone(&serializer);
-                            let disc_tx2_2 = disc_tx2.clone();
-                            let packet_length_serializer2 = Arc::clone(&packet_length_serializer);
-                            tokio::spawn(async move {
-                                loop {
-                                    // `select!` handles intentional disconnections (ecs_connection.disconnect()).
-                                    // AsyncReadExt::read_exact is not cancel-safe and loses data, but we don't need that data anymore
-                                    tokio::select! {
-                                        result = read.receive(Arc::clone(&serializer2), &*packet_length_serializer2) => {
-                                            match result {
-                                                Ok(packet) => {
-                                                    log::trace!("({id:?}) Received packet {:?}", packet);
-                                                    pack_tx2.send((ecs_conn.clone(), packet)).unwrap();
-                                                }
-                                                Err(err) => {
-                                                    disc_tx_2.send((err, ecs_conn.clone())).unwrap();
-                                                    disc_tx2_2.send(ecs_conn.peer_addr).unwrap();
-                                                    break;
+                .build();
+            
+            let runtime = match runtime_result {
+                Ok(rt) => rt,
+                Err(err) => {
+                    log::error!("Failed to create tokio runtime: {}", err);
+                    return;
+                }
+            };
+            
+            runtime.block_on(async move {
+                // Receiving packets
+                tokio::spawn(async move {
+                    while let Some((connection, ecs_conn)) = conn_rx2.recv().await {
+                        let RawConnection {
+                            disconnect_task,
+                            stream,
+                            serializer,
+                            packet_length_serializer,
+                            mut packets_rx,
+                            id,
+                        } = connection;
+                        
+                        let (mut read, mut write) = match stream.into_split().await {
+                            Ok(split) => split,
+                            Err(err) => {
+                                log::error!("({:?}) Couldn't split stream: {}", id, err);
+                                continue;
+                            }
+                        };
+                        
+                        let pack_tx2 = pack_tx.clone();
+                        let disc_tx_2 = disc_tx.clone();
+                        let serializer2 = Arc::clone(&serializer);
+                        let disc_tx2_2 = disc_tx2.clone();
+                        let packet_length_serializer2 = Arc::clone(&packet_length_serializer);
+                        tokio::spawn(async move {
+                            loop {
+                                // `select!` handles intentional disconnections (ecs_connection.disconnect()).
+                                // AsyncReadExt::read_exact is not cancel-safe and loses data, but we don't need that data anymore
+                                tokio::select! {
+                                    result = read.receive(Arc::clone(&serializer2), &*packet_length_serializer2) => {
+                                        match result {
+                                            Ok(packet) => {
+                                                log::trace!("({id:?}) Received packet {:?}", packet);
+                                                if let Err(err) = pack_tx2.send((ecs_conn.clone(), packet)) {
+                                                    log::error!("({id:?}) Failed to forward received packet: {err}");
                                                 }
                                             }
-                                        }
-                                        _ = disconnect_task.clone() => {
-                                            log::debug!("({id:?}) Client was disconnected intentionally");
-                                            disc_tx_2.send((ReceiveError::IntentionalDisconnection, ecs_conn.clone())).unwrap();
-                                            disc_tx2_2.send(ecs_conn.peer_addr).unwrap();
-                                            break;
-                                        }
-                                    };
-                                }
-                            });
-                            // `select!` is not needed because `packets_rx` returns `None` when
-                            // all senders are be dropped, and `disc_tx2.send(...)` above should
-                            // remove all senders from ECS.
-                            tokio::spawn(async move {
-                                while let Some(packet) = packets_rx.recv().await {
-                                    log::trace!("({id:?}) Sending packet {:?}", packet);
-                                    match write
-                                        .send(packet, Arc::clone(&serializer), &*packet_length_serializer)
-                                        .await
-                                    {
-                                        Ok(()) => (),
-                                        Err(err) => {
-                                            log::error!("({id:?}) Error sending packet: {err}");
-                                            break;
+                                            Err(err) => {
+                                                if let Err(send_err) = disc_tx_2.send((err, ecs_conn.clone())) {
+                                                    log::error!("({id:?}) Failed to send disconnection event: {send_err}");
+                                                }
+                                                if let Err(send_err) = disc_tx2_2.send(ecs_conn.peer_addr) {
+                                                    log::error!("({id:?}) Failed to send address for disconnection handling: {send_err}");
+                                                }
+                                                break;
+                                            }
                                         }
                                     }
+                                    _ = disconnect_task.clone() => {
+                                        log::debug!("({id:?}) Client was disconnected intentionally");
+                                        if let Err(send_err) = disc_tx_2.send((ReceiveError::IntentionalDisconnection, ecs_conn.clone())) {
+                                            log::error!("({id:?}) Failed to send intentional disconnection event: {send_err}");
+                                        }
+                                        if let Err(send_err) = disc_tx2_2.send(ecs_conn.peer_addr) {
+                                            log::error!("({id:?}) Failed to send address for intentional disconnection handling: {send_err}");
+                                        }
+                                        break;
+                                    }
+                                };
+                            }
+                        });
+                        // `select!` is not needed because `packets_rx` returns `None` when
+                        // all senders are be dropped, and `disc_tx2.send(...)` above should
+                        // remove all senders from ECS.
+                        tokio::spawn(async move {
+                            while let Some(packet) = packets_rx.recv().await {
+                                log::trace!("({id:?}) Sending packet {:?}", packet);
+                                match write
+                                    .send(packet, Arc::clone(&serializer), &*packet_length_serializer)
+                                    .await
+                                {
+                                    Ok(()) => (),
+                                    Err(err) => {
+                                        log::error!("({id:?}) Error sending packet: {err}");
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+                    }
+                });
+
+                // New connections
+                let binding_result = Config::Protocol::bind(address).await;
+                let listener = match binding_result {
+                    Ok(listener) => listener,
+                    Err(err) => {
+                        log::error!("Couldn't create listener at {}: {}", address, err);
+                        return;
+                    }
+                };
+
+                loop {
+                    select! {
+                        Ok(connection) = listener.accept() => {
+                            log::debug!("Accepting a connection from {:?}", connection.peer_addr());
+                            let (conn_tx_2, conn_tx2_2) = (conn_tx.clone(), conn_tx2.clone());
+                            tokio::spawn(async move {
+                                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                                let disconnect_task = DisconnectTask::default();
+                                let connection = RawConnection {
+                                    disconnect_task: disconnect_task.clone(),
+                                    stream: connection,
+                                    serializer: Arc::new(Config::build_serializer()),
+                                    packet_length_serializer: Arc::new(Default::default()),
+                                    id: ConnectionId::next(),
+                                    packets_rx: rx,
+                                };
+                                let ecs_conn = EcsConnection {
+                                    disconnect_task,
+                                    id: connection.id(),
+                                    packet_tx: tx,
+                                    local_addr: connection.local_addr(),
+                                    peer_addr: connection.peer_addr(),
+                                };
+                                if let Err(err) = conn_tx_2.send((address, ecs_conn.clone())) {
+                                    log::error!("Failed to send new connection to ECS: {}", err);
+                                    return;
+                                }
+                                if let Err(err) = conn_tx2_2.send((connection, ecs_conn)) {
+                                    log::error!("Failed to send new raw connection: {}", err);
                                 }
                             });
                         }
-                    });
-
-                    // New connections
-                    let listener = Config::Protocol::bind(address)
-                        .await
-                        .expect("Couldn't create listener");
-
-                    loop {
-                        select! {
-                            Ok(connection) = listener.accept() => {
-                                log::debug!("Accepting a connection from {:?}", connection.peer_addr());
-                                let (conn_tx_2, conn_tx2_2) = (conn_tx.clone(), conn_tx2.clone());
-                                tokio::spawn(async move {
-                                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                                    let disconnect_task = DisconnectTask::default();
-                                    let connection = RawConnection {
-                                        disconnect_task: disconnect_task.clone(),
-                                        stream: connection,
-                                        serializer: Arc::new(Config::build_serializer()),
-                                        packet_length_serializer: Arc::new(Default::default()),
-                                        id: ConnectionId::next(),
-                                        packets_rx: rx,
-                                    };
-                                    let ecs_conn = EcsConnection {
-                                        disconnect_task,
-                                        id: connection.id(),
-                                        packet_tx: tx,
-                                        local_addr: connection.local_addr(),
-                                        peer_addr: connection.peer_addr(),
-                                    };
-                                    conn_tx_2.send((address, ecs_conn.clone())).unwrap();
-                                    conn_tx2_2.send((connection, ecs_conn)).unwrap();
-                                });
-                            }
-                            Some(addr) = disc_rx2.recv() => {
-                                listener.handle_disconnection(addr);
-                            }
-                            else => {
-                                break;
-                            }
+                        Some(addr) = disc_rx2.recv() => {
+                            listener.handle_disconnection(addr);
+                        }
+                        else => {
+                            break;
                         }
                     }
-                });
+                }
+            });
         });
     }
 }
