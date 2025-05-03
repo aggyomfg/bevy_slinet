@@ -1,6 +1,6 @@
 [package]
 name = "bevy_slinet"
-version = "0.13.2"
+version = "0.14.0"
 authors = [
     "Sliman4 <4sliman4@gmail.com>",
     "aggyomfg <aggyomfg@yandex.com>"
@@ -25,7 +25,7 @@ features = [
 ]
 
 [dependencies]
-bevy = { version = "0.15", default-features = false }
+bevy = { version = "0.16", default-features = false, features = ["bevy_log"]}
 serde = { version = "1", features = ["derive"] }
 byteorder = "1"
 bincode = { version = "1", optional = true }
