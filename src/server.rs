@@ -145,7 +145,7 @@ fn create_setup_system<Config: ServerConfig>(address: SocketAddr) -> impl Fn(Com
             let runtime_result = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build();
-            
+
             let runtime = match runtime_result {
                 Ok(rt) => rt,
                 Err(err) => {
@@ -153,7 +153,7 @@ fn create_setup_system<Config: ServerConfig>(address: SocketAddr) -> impl Fn(Com
                     return;
                 }
             };
-            
+
             runtime.block_on(async move {
                 // Receiving packets
                 tokio::spawn(async move {
@@ -166,7 +166,6 @@ fn create_setup_system<Config: ServerConfig>(address: SocketAddr) -> impl Fn(Com
                             mut packets_rx,
                             id,
                         } = connection;
-                        
                         let (mut read, mut write) = match stream.into_split().await {
                             Ok(split) => split,
                             Err(err) => {
@@ -174,7 +173,6 @@ fn create_setup_system<Config: ServerConfig>(address: SocketAddr) -> impl Fn(Com
                                 continue;
                             }
                         };
-                        
                         let pack_tx2 = pack_tx.clone();
                         let disc_tx_2 = disc_tx.clone();
                         let serializer2 = Arc::clone(&serializer);

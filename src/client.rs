@@ -263,7 +263,7 @@ fn setup_system<Config: ClientConfig>(mut commands: Commands) {
             let serializer2 = Arc::clone(&serializer);
             let packet_length_serializer2 = Arc::clone(&packet_length_serializer);
             let peer_addr = stream.peer_addr();
-            
+
             let (mut read, mut write) = match stream.into_split().await {
                 Ok(split) => split,
                 Err(err) => {
