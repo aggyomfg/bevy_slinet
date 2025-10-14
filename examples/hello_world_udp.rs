@@ -39,12 +39,12 @@ impl ClientConfig for Config {
     type LengthSerializer = BigEndian<u8>;
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Debug, Deserialize, Serialize)]
 enum ClientPacket {
     String(String),
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Debug, Deserialize, Serialize)]
 enum ServerPacket {
     String(String),
 }
@@ -71,7 +71,7 @@ fn main() {
     client.join().unwrap();
 }
 
-fn server_new_connection_system(new_connection: Trigger<NewConnectionEvent<Config>>) {
+fn server_new_connection_system(new_connection: On<NewConnectionEvent<Config>>) {
     new_connection
         .event()
         .connection
@@ -83,7 +83,7 @@ fn server_new_connection_system(new_connection: Trigger<NewConnectionEvent<Confi
     );
 }
 
-fn client_packet_receive_system(new_packet: Trigger<client::PacketReceiveEvent<Config>>) {
+fn client_packet_receive_system(new_packet: On<client::PacketReceiveEvent<Config>>) {
     match &new_packet.event().packet {
         ServerPacket::String(s) => println!("Server -> Client: {s}"),
     }
@@ -94,7 +94,7 @@ fn client_packet_receive_system(new_packet: Trigger<client::PacketReceiveEvent<C
         .unwrap();
 }
 
-fn server_packet_receive_system(new_packet: Trigger<server::PacketReceiveEvent<Config>>) {
+fn server_packet_receive_system(new_packet: On<server::PacketReceiveEvent<Config>>) {
     match &new_packet.event().packet {
         ClientPacket::String(s) => println!("Server <- Client: {s}"),
     }

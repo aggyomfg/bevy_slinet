@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use bevy::log;
 use bevy::prelude::{DetectChanges, Res, Resource};
 use futures::task::AtomicWaker;
 use tokio::sync::mpsc::error::SendError;
@@ -126,7 +127,7 @@ where
 /// every server restart. If there are multiple clients/servers running
 /// (like in multiple_connections example), they'll have a single connection
 /// counter that increments for every clientside/serverside connection.
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, bevy::ecs::component::Component)]
+#[derive(Clone, bevy::ecs::component::Component, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ConnectionId(usize);
 impl Debug for ConnectionId {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -154,7 +155,7 @@ pub(crate) static MAX_PACKET_SIZE: AtomicUsize = AtomicUsize::new(usize::MAX);
 /// because using trait consts as const generics require `generic_const_exprs` feature. You should set
 /// this resource to avoid out-of-memory attacks (where a client sends a packet with length-prefix of
 /// 100000000000 bytes and bevy_slinet tries to allocate a buffer of that size).
-#[derive(Copy, Clone, Resource)]
+#[derive(Clone, Copy, Resource)]
 pub struct MaxPacketSize(pub usize);
 
 impl<ReceivingPacket, SendingPacket, NS, SE, LS>
@@ -196,7 +197,7 @@ where
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone, Default)]
 pub(crate) struct DisconnectTask(Arc<DisconnectTaskInner>);
 
 #[derive(Default)]

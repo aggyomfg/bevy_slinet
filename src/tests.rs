@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 
-#[derive(Default, Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
 struct Packet(u64);
 
 struct TcpConfig;
@@ -79,7 +79,7 @@ fn tcp_connection() {
     );
 }
 
-#[derive(Resource, Default)]
+#[derive(Default, Resource)]
 struct ReceivedPackets<T> {
     packets: Vec<T>,
 }
@@ -145,7 +145,7 @@ fn tcp_packets() {
 }
 
 fn server_new_connection_system(
-    event: Trigger<NewConnectionEvent<TcpConfig>>,
+    event: On<NewConnectionEvent<TcpConfig>>,
     server_to_client_packet: Res<ServerToClientPacketResource>,
 ) {
     event
@@ -156,14 +156,14 @@ fn server_new_connection_system(
 }
 
 fn server_packet_receive_system(
-    event: Trigger<server::PacketReceiveEvent<TcpConfig>>,
+    event: On<server::PacketReceiveEvent<TcpConfig>>,
     mut received_packets: ResMut<ReceivedPackets<Packet>>,
 ) {
     received_packets.packets.push(event.event().packet);
 }
 
 fn client_connection_establish_system(
-    event: Trigger<ConnectionEstablishEvent<TcpConfig>>,
+    event: On<ConnectionEstablishEvent<TcpConfig>>,
     client_to_server_packet: Res<ClientToServerPacketResource>,
 ) {
     event
@@ -174,7 +174,7 @@ fn client_connection_establish_system(
 }
 
 fn client_packet_receive_system(
-    event: Trigger<client::PacketReceiveEvent<TcpConfig>>,
+    event: On<client::PacketReceiveEvent<TcpConfig>>,
     mut received_packets: ResMut<ReceivedPackets<Packet>>,
 ) {
     received_packets.packets.push(event.event().packet);

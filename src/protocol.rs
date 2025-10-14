@@ -3,6 +3,7 @@
 //!
 //! Built-in protocols are listed in the [`protocols`](crate::protocols) module.
 
+use bevy::log;
 use io::Write;
 use std::error::Error;
 use std::fmt::{Debug, Formatter};

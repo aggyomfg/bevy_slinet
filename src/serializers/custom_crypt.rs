@@ -8,10 +8,11 @@ use std::{
 };
 
 use crate::serializer::MutableSerializer;
+use bevy::log;
 use serde::{Deserialize, Serialize};
 
 /// Represents custom packets sent from the client, allowing different types of content.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub enum CustomCryptClientPacket {
     String(String),
 }
@@ -23,7 +24,7 @@ impl Default for CustomCryptClientPacket {
 }
 
 /// Represents custom packets received by the server, allowing different types of content.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub enum CustomCryptServerPacket {
     String(String),
 }
@@ -52,11 +53,11 @@ pub trait CryptEngine<ReceivingPacket, SendingPacket>: Default {
 }
 
 /// A simple key pair structure used for XOR encryption operations.
-#[derive(Debug, Default, Clone)]
+#[derive(Clone, Debug, Default)]
 pub struct ExampleKeyPair(u64, u64);
 
 /// A cryptographic engine implementing XOR encryption, typically not secure but used for demonstration.
-#[derive(Debug, Default, Clone)]
+#[derive(Clone, Debug, Default)]
 pub struct CustomCryptEngine {
     key_pair: ExampleKeyPair,
 }
@@ -136,7 +137,7 @@ impl CryptEngine<CustomCryptServerPacket, CustomCryptClientPacket> for CustomCry
 }
 
 /// A serializer that integrates encryption, using a cryptographic engine to ensure secure data transmission.
-#[derive(Default, Clone)]
+#[derive(Clone, Default)]
 pub struct CustomCryptSerializer<C, ReceivingPacket, SendingPacket>
 where
     C: Send + Sync + 'static + CryptEngine<ReceivingPacket, SendingPacket>,

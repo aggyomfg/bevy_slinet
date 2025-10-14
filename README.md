@@ -61,11 +61,11 @@ fn main() {
         .run()
 }
 
-fn connection_establish_system(event: Trigger<ConnectionEstablishEvent<Config>>) {
+fn connection_establish_system(event: On<ConnectionEstablishEvent<Config>>) {
     println!("Connected!");
 }
 
-fn packet_receive_system(event: Trigger<PacketReceiveEvent<Config>>) {
+fn packet_receive_system(event: On<PacketReceiveEvent<Config>>) {
     match &event.event().packet {
         ServerPacket::String(s) => println!("Got a message: {}", s),
     }
@@ -124,7 +124,7 @@ fn main() {
         .run()
 }
 
-fn new_connection_system(event: Trigger<NewConnectionEvent<Config>>) {
+fn new_connection_system(event: On<NewConnectionEvent<Config>>) {
     event
         .event()
         .connection
@@ -132,7 +132,7 @@ fn new_connection_system(event: Trigger<NewConnectionEvent<Config>>) {
         .unwrap();
 }
 
-fn packet_receive_system(event: Trigger<PacketReceiveEvent<Config>>) {
+fn packet_receive_system(event: On<PacketReceiveEvent<Config>>) {
     match &event.event().packet {
         ClientPacket::String(s) => println!("Got a message from a client: {}", s),
     }
@@ -148,7 +148,7 @@ Note: you should implement keep-alive and disconnection systems yourself, or loo
 
 ## More examples
 
-[Here](https://github.com/aggyomfg/bevy_slinet/tree/main/examples).
+[Examples](https://github.com/aggyomfg/bevy_slinet/tree/main/examples).
 
 ### Compatibility table
 
@@ -168,4 +168,5 @@ Note: you should implement keep-alive and disconnection systems yourself, or loo
 | `0.12`         | `0.14`       |
 | `0.13`         | `0.15`       |
 | `0.14`         | `0.16`       |
-| `main`         | `0.16`       |
+| `0.15`         | `0.17`       |
+| `main`         | `0.17`       |

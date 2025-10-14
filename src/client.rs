@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
 
+use bevy::log;
 use bevy::prelude::*;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -59,18 +60,14 @@ pub struct ClientPlugin<Config: ClientConfig> {
     _marker: PhantomData<Config>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, SystemSet)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, SystemSet)]
 struct AddInitialConnectionRequestEventLabel;
 
 impl<Config: ClientConfig> Plugin for ClientPlugin<Config> {
     fn build(&self, app: &mut App) {
         let address = self.address;
 
-        app.add_event::<ConnectionRequestEvent<Config>>()
-            .add_event::<ConnectionEstablishEvent<Config>>()
-            .add_event::<DisconnectionEvent<Config>>()
-            .add_event::<PacketReceiveEvent<Config>>()
-            .insert_resource(ClientConnections::<Config>::new())
+        app.insert_resource(ClientConnections::<Config>::new())
             .add_systems(
                 Startup,
                 max_packet_size_warning_system.in_set(SystemSets::MaxPacketSizeWarning),
@@ -341,7 +338,7 @@ pub(crate) async fn create_connection<Config: ClientConfig>(
 }
 
 fn connection_request_system<Config: ClientConfig>(
-    connection_request: Trigger<ConnectionRequestEvent<Config>>,
+    connection_request: On<ConnectionRequestEvent<Config>>,
     requests: Res<ConnectionRequestSender<Config>>,
 ) {
     if let Err(err) = requests.0.send(connection_request.event().address) {

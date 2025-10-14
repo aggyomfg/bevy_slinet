@@ -83,7 +83,7 @@ fn main() {
     client2.join().unwrap();
 }
 
-fn server_new_connection_system(new_connection: Trigger<NewConnectionEvent<Config>>) {
+fn server_new_connection_system(new_connection: On<NewConnectionEvent<Config>>) {
     new_connection
         .event()
         .connection
@@ -95,7 +95,7 @@ fn server_new_connection_system(new_connection: Trigger<NewConnectionEvent<Confi
     );
 }
 
-fn client_packet_receive_system(new_packet: Trigger<client::PacketReceiveEvent<Config>>) {
+fn client_packet_receive_system(new_packet: On<client::PacketReceiveEvent<Config>>) {
     match &new_packet.event().packet {
         CustomCryptServerPacket::String(s) => println!("Server -> Client: {s}"),
     }
@@ -108,7 +108,7 @@ fn client_packet_receive_system(new_packet: Trigger<client::PacketReceiveEvent<C
         .unwrap();
 }
 
-fn client2_packet_receive_system(new_packet: Trigger<client::PacketReceiveEvent<Config>>) {
+fn client2_packet_receive_system(new_packet: On<client::PacketReceiveEvent<Config>>) {
     match &new_packet.event().packet {
         CustomCryptServerPacket::String(s) => println!("Server -> Client2: {s}"),
     }
@@ -121,7 +121,7 @@ fn client2_packet_receive_system(new_packet: Trigger<client::PacketReceiveEvent<
         .unwrap();
 }
 
-fn server_packet_receive_system(new_packet: Trigger<server::PacketReceiveEvent<Config>>) {
+fn server_packet_receive_system(new_packet: On<server::PacketReceiveEvent<Config>>) {
     match &new_packet.event().packet {
         CustomCryptClientPacket::String(s) => println!("Server <- Client: {s}"),
     }

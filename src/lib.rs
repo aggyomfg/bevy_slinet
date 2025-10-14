@@ -30,7 +30,7 @@ mod tests_mut_serializer;
 /// For more details on what each SystemSet means, refer to [`client`](crate::client) or [`server`](crate::server) source code
 ///
 /// [cheatbook_systemsets]: https://bevy-cheatbook.github.io/programming/system-sets.html
-#[derive(SystemSet, Clone, Hash, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, SystemSet)]
 #[allow(missing_docs)]
 pub enum SystemSets {
     ClientPacketReceive,

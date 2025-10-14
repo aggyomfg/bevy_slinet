@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 
-use bevy::prelude::*;
+use bevy::{log, prelude::*};
 use tokio::select;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -56,10 +56,7 @@ pub struct ServerPlugin<Config: ServerConfig> {
 
 impl<Config: ServerConfig> Plugin for ServerPlugin<Config> {
     fn build(&self, app: &mut App) {
-        app.add_event::<NewConnectionEvent<Config>>()
-            .add_event::<DisconnectionEvent<Config>>()
-            .add_event::<PacketReceiveEvent<Config>>()
-            .insert_resource(ServerConnections::<Config>::new())
+        app.insert_resource(ServerConnections::<Config>::new())
             .add_systems(
                 Startup,
                 (
@@ -331,7 +328,7 @@ fn accept_new_connections<Config: ServerConfig>(
 }
 
 fn connection_add_system<Config: ServerConfig>(
-    new_connection: Trigger<NewConnectionEvent<Config>>,
+    new_connection: On<NewConnectionEvent<Config>>,
     mut connections: ResMut<ServerConnections<Config>>,
 ) {
     connections.push(new_connection.event().connection.clone());

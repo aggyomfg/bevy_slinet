@@ -5,7 +5,7 @@ pub use bincode::{DefaultOptions, Options};
 use serde::{Deserialize, Serialize};
 
 /// See [`bincode`] and [`bincode::Options`] for details.
-#[derive(Default, Clone)]
+#[derive(Clone, Default)]
 pub struct BincodeSerializer<O>(pub O)
 where
     O: Options + Send + Sync + 'static;

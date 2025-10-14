@@ -23,7 +23,7 @@ pub trait PacketLengthSerializer: Send + Sync + 'static {
 }
 
 /// An error that [`PacketLengthSerializer::deserialize_packet_length`] may return.
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub enum PacketLengthDeserializationError<E: Error> {
     /// The deserializer needs more bytes. This is useful for serializers
     /// with dynamic packet length length, e.g., 1 byte to store packet

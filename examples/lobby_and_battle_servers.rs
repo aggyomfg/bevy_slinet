@@ -38,7 +38,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bevy::log::LogPlugin;
+use bevy::log::{self, LogPlugin};
 use bevy::prelude::*;
 use bevy::time::common_conditions::on_timer;
 use bevy_slinet::serializer::SerializerAdapter;
@@ -112,27 +112,27 @@ impl ClientConfig for BattleConfig {
     type LengthSerializer = LittleEndian<u16>;
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
 enum LobbyClientPacket {
     Hello,
     Battle,
     KeepAlive,
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
 enum LobbyServerPacket {
     Hello,
     BattleServer(SocketAddr),
     KeepAlive,
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
 enum BattleClientPacket {
     Play,
     KeepAlive,
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
 enum BattleServerPacket {
     BroadcastPlayerJoin,
     BattleStart,
@@ -206,7 +206,7 @@ fn main() {
         .run();
 }
 
-fn lobby_server_packet_handler(lobby_packet: Trigger<server::PacketReceiveEvent<LobbyConfig>>) {
+fn lobby_server_packet_handler(lobby_packet: On<server::PacketReceiveEvent<LobbyConfig>>) {
     let event = lobby_packet.event();
     log::info!("Client -> Lobby: {:?}", event.packet);
     match event.packet {
@@ -226,7 +226,7 @@ fn lobby_server_packet_handler(lobby_packet: Trigger<server::PacketReceiveEvent<
 }
 
 fn lobby_server_accept_new_connections(
-    new_connection: Trigger<NewConnectionEvent<LobbyConfig>>,
+    new_connection: On<NewConnectionEvent<LobbyConfig>>,
     mut keep_alive_map: ResMut<ServerKeepAliveMap<LobbyConfig>>,
 ) {
     keep_alive_map.map.insert(
@@ -236,7 +236,7 @@ fn lobby_server_accept_new_connections(
 }
 
 fn battle_server_accept_new_connections(
-    new_connection: Trigger<NewConnectionEvent<BattleConfig>>,
+    new_connection: On<NewConnectionEvent<BattleConfig>>,
     mut keep_alive_map: ResMut<ServerKeepAliveMap<BattleConfig>>,
     connections: Res<ServerConnections<BattleConfig>>,
 ) {
@@ -258,7 +258,7 @@ fn battle_server_accept_new_connections(
         .unwrap();
 }
 
-fn battle_server_packet_handler(packet: Trigger<server::PacketReceiveEvent<BattleConfig>>) {
+fn battle_server_packet_handler(packet: On<server::PacketReceiveEvent<BattleConfig>>) {
     let event = packet.event();
     log::info!("Client -> Battle: {:?}", event.packet);
     #[allow(clippy::single_match)]
@@ -272,7 +272,7 @@ fn battle_server_packet_handler(packet: Trigger<server::PacketReceiveEvent<Battl
 }
 
 fn lobby_client_packet_handler(
-    packet: Trigger<client::PacketReceiveEvent<LobbyConfig>>,
+    packet: On<client::PacketReceiveEvent<LobbyConfig>>,
     mut commands: Commands,
 ) {
     let event = packet.event();
@@ -296,7 +296,7 @@ fn lobby_client_packet_handler(
 }
 
 fn battle_client_packet_handler(
-    packet: Trigger<client::PacketReceiveEvent<BattleConfig>>,
+    packet: On<client::PacketReceiveEvent<BattleConfig>>,
     mut commands: Commands,
 ) {
     let event = packet.event();
@@ -342,7 +342,7 @@ fn battle_client_packet_handler(
 }
 
 fn lobby_client_connect_handler(
-    connection: Trigger<ConnectionEstablishEvent<LobbyConfig>>,
+    connection: On<ConnectionEstablishEvent<LobbyConfig>>,
     mut timeout: ResMut<ClientKeepAliveTimeout>,
 ) {
     connection
@@ -354,14 +354,14 @@ fn lobby_client_connect_handler(
 }
 
 fn battle_client_connect_handler(
-    _connection: Trigger<ConnectionEstablishEvent<BattleConfig>>,
+    _connection: On<ConnectionEstablishEvent<BattleConfig>>,
     mut timeout: ResMut<ClientKeepAliveTimeout>,
 ) {
     timeout.0.reset();
 }
 
 fn lobby_client_keepalive_handler(
-    packet: Trigger<client::PacketReceiveEvent<LobbyConfig>>,
+    packet: On<client::PacketReceiveEvent<LobbyConfig>>,
     mut timeout: ResMut<ClientKeepAliveTimeout>,
 ) {
     if packet.event().packet == LobbyServerPacket::KeepAlive {
@@ -370,7 +370,7 @@ fn lobby_client_keepalive_handler(
 }
 
 fn battle_client_keepalive_handler(
-    packet: Trigger<client::PacketReceiveEvent<BattleConfig>>,
+    packet: On<client::PacketReceiveEvent<BattleConfig>>,
     mut timeout: ResMut<ClientKeepAliveTimeout>,
 ) {
     if packet.event().packet == BattleServerPacket::KeepAlive {
@@ -405,7 +405,7 @@ fn client_check_timeout(
 }
 
 fn lobby_client_reconnect_if_error(
-    disconnect: Trigger<client::DisconnectionEvent<LobbyConfig>>,
+    disconnect: On<client::DisconnectionEvent<LobbyConfig>>,
     mut commands: Commands,
 ) {
     let event = disconnect.event();
@@ -416,7 +416,7 @@ fn lobby_client_reconnect_if_error(
 }
 
 fn battle_client_reconnect_if_error(
-    disconnect: Trigger<client::DisconnectionEvent<BattleConfig>>,
+    disconnect: On<client::DisconnectionEvent<BattleConfig>>,
     mut commands: Commands,
 ) {
     let event = disconnect.event();
@@ -451,7 +451,7 @@ fn server_send_keepalive(
 }
 
 fn lobby_server_keepalive_handler(
-    packet: Trigger<server::PacketReceiveEvent<LobbyConfig>>,
+    packet: On<server::PacketReceiveEvent<LobbyConfig>>,
     mut lobby_map: ResMut<ServerKeepAliveMap<LobbyConfig>>,
 ) {
     let event = packet.event();
@@ -464,7 +464,7 @@ fn lobby_server_keepalive_handler(
 }
 
 fn battle_server_keepalive_handler(
-    packet: Trigger<server::PacketReceiveEvent<BattleConfig>>,
+    packet: On<server::PacketReceiveEvent<BattleConfig>>,
     mut battle_map: ResMut<ServerKeepAliveMap<BattleConfig>>,
 ) {
     let event = packet.event();

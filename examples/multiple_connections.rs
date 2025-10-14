@@ -38,13 +38,13 @@ impl ClientConfig for Config {
     }
     type LengthSerializer = LittleEndian<u32>;
 }
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Debug, Deserialize, Serialize)]
 enum ServerPacket {
     Hello,
     Message(usize),
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Debug, Deserialize, Serialize)]
 enum ClientPacket {
     Hello,
     Reply(usize),
@@ -81,7 +81,7 @@ fn main() {
     server.join().unwrap();
 }
 
-fn server_new_connection_system(new_connection: Trigger<NewConnectionEvent<Config>>) {
+fn server_new_connection_system(new_connection: On<NewConnectionEvent<Config>>) {
     new_connection
         .event()
         .connection
@@ -94,7 +94,7 @@ fn server_new_connection_system(new_connection: Trigger<NewConnectionEvent<Confi
 }
 
 fn client_packet_receive_system(
-    new_packet: Trigger<client::PacketReceiveEvent<Config>>,
+    new_packet: On<client::PacketReceiveEvent<Config>>,
     client_number: Res<ClientId>,
 ) {
     match &new_packet.event().packet {
@@ -117,7 +117,7 @@ fn client_packet_receive_system(
     }
 }
 
-fn server_packet_receive_system(new_packet: Trigger<server::PacketReceiveEvent<Config>>) {
+fn server_packet_receive_system(new_packet: On<server::PacketReceiveEvent<Config>>) {
     match &new_packet.event().packet {
         ClientPacket::Hello => {
             println!(

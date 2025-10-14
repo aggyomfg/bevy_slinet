@@ -89,7 +89,7 @@ fn tcp_connection() {
     )
 }
 
-#[derive(Resource, Default)]
+#[derive(Default, Resource)]
 struct ReceivedPackets<T> {
     packets: Vec<T>,
 }
@@ -159,7 +159,7 @@ fn tcp_encrypted_packets() {
 }
 
 fn server_new_connection_system(
-    event: Trigger<NewConnectionEvent<TcpConfig>>,
+    event: On<NewConnectionEvent<TcpConfig>>,
     server_to_client_packet: Res<ServerToClientPacketResource>,
 ) {
     event
@@ -170,14 +170,14 @@ fn server_new_connection_system(
 }
 
 fn server_packet_receive_system(
-    event: Trigger<server::PacketReceiveEvent<TcpConfig>>,
+    event: On<server::PacketReceiveEvent<TcpConfig>>,
     mut received_packets: ResMut<ReceivedPackets<CustomCryptClientPacket>>,
 ) {
     received_packets.packets.push(event.event().packet.clone());
 }
 
 fn client_connection_establish_system(
-    event: Trigger<ConnectionEstablishEvent<TcpConfig>>,
+    event: On<ConnectionEstablishEvent<TcpConfig>>,
     client_to_server_packet: Res<ClientToServerPacketResource>,
 ) {
     event
@@ -188,7 +188,7 @@ fn client_connection_establish_system(
 }
 
 fn client_packet_receive_system(
-    event: Trigger<client::PacketReceiveEvent<TcpConfig>>,
+    event: On<client::PacketReceiveEvent<TcpConfig>>,
     mut received_packets: ResMut<ReceivedPackets<CustomCryptServerPacket>>,
 ) {
     received_packets.packets.push(event.event().packet.clone());
