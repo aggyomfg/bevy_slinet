@@ -1,25 +1,26 @@
-//! A [`bincode`]-based packet serializer using native bincode traits.
+//! A [`bincode`]-based packet serializer with serde support.
 
 use crate::serializer::ReadOnlySerializer;
 pub use bincode::config;
 use bincode::config::Configuration;
+use serde::{Deserialize, Serialize};
 
-/// Bincode 2.x serializer using native Encode/Decode traits.
-/// This provides the best performance without serde overhead.
+/// Bincode 2.x serializer using serde traits and standard configuration.
+/// Provides compatibility with other serde-based formats.
 ///
-/// For serde compatibility, use `BincodeSerdeSerializer` instead.
+/// For better performance without serde overhead, use `BincodeSerializer` instead.
 #[derive(Clone)]
-pub struct BincodeSerializer {
+pub struct BincodeSerdeSerializer {
     config: Configuration,
 }
 
-impl BincodeSerializer {
+impl BincodeSerdeSerializer {
     pub fn new() -> Self {
         Self::default()
     }
 }
 
-impl Default for BincodeSerializer {
+impl Default for BincodeSerdeSerializer {
     fn default() -> Self {
         Self {
             config: bincode::config::standard(),
@@ -28,28 +29,29 @@ impl Default for BincodeSerializer {
 }
 
 impl<ReceivingPacket, SendingPacket> ReadOnlySerializer<ReceivingPacket, SendingPacket>
-    for BincodeSerializer
+    for BincodeSerdeSerializer
 where
-    ReceivingPacket: bincode::Decode<()>,
-    SendingPacket: bincode::Encode,
+    ReceivingPacket: for<'de> Deserialize<'de>,
+    SendingPacket: Serialize,
 {
     type EncodeError = bincode::error::EncodeError;
     type DecodeError = bincode::error::DecodeError;
 
     fn serialize(&self, t: SendingPacket) -> Result<Vec<u8>, Self::EncodeError> {
-        bincode::encode_to_vec(&t, self.config)
+        bincode::serde::encode_to_vec(&t, self.config)
     }
 
     fn deserialize(&self, bytes: &[u8]) -> Result<ReceivingPacket, Self::DecodeError> {
-        bincode::decode_from_slice(bytes, self.config).map(|(packet, _len)| packet)
+        bincode::serde::decode_from_slice(bytes, self.config).map(|(packet, _len)| packet)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::{Deserialize, Serialize};
 
-    #[derive(Clone, Debug, bincode::Decode, bincode::Encode, PartialEq)]
+    #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
     struct TestPacket {
         id: u32,
         message: String,
@@ -57,7 +59,7 @@ mod tests {
 
     #[test]
     fn test_serialize_deserialize_default() {
-        let serializer = BincodeSerializer::default();
+        let serializer = BincodeSerdeSerializer::default();
         let packet = TestPacket {
             id: 42,
             message: "Hello".to_string(),
@@ -75,7 +77,7 @@ mod tests {
 
     #[test]
     fn test_large_packet() {
-        let serializer = BincodeSerializer::default();
+        let serializer = BincodeSerdeSerializer::default();
         let packet = TestPacket {
             id: 999999,
             message: "A".repeat(10000),
@@ -93,7 +95,7 @@ mod tests {
 
     #[test]
     fn test_empty_string() {
-        let serializer = BincodeSerializer::default();
+        let serializer = BincodeSerdeSerializer::default();
         let packet = TestPacket {
             id: 0,
             message: String::new(),

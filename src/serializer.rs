@@ -14,39 +14,63 @@ where
     ReceivingPacket: Send + Sync + Debug + 'static,
     SendingPacket: Send + Sync + Debug + 'static,
 {
-    type Error: Error + Send + Sync; // Defines a custom error type that must also be thread-safe.
+    type EncodeError: Error + Send + Sync; // Error type for serialization/encoding operations
+    type DecodeError: Error + Send + Sync; // Error type for deserialization/decoding operations
 
     // Serializes a packet into bytes to be sent over a network. The method takes ownership of the packet
     // and a peer address, returning either a byte vector or an error if serialization fails.
-    fn serialize(&self, packet: SendingPacket) -> Result<Vec<u8>, Self::Error>;
+    fn serialize(&self, packet: SendingPacket) -> Result<Vec<u8>, Self::EncodeError>;
     // Deserializes bytes received from a network back into a packet structure.
-    fn deserialize(&self, data: &[u8]) -> Result<ReceivingPacket, Self::Error>;
+    fn deserialize(&self, data: &[u8]) -> Result<ReceivingPacket, Self::DecodeError>;
 }
 
 // SerializerAdapter allows for flexibility in serializer implementation; supporting both immutable
 // and mutable serialization strategies.
-pub enum SerializerAdapter<ReceivingPacket, SendingPacket, E>
+pub enum SerializerAdapter<ReceivingPacket, SendingPacket, EncErr, DecErr>
 where
-    E: Error + Send + Sync,
+    EncErr: Error + Send + Sync,
+    DecErr: Error + Send + Sync,
 {
-    ReadOnly(Arc<dyn ReadOnlySerializer<ReceivingPacket, SendingPacket, Error = E>>),
-    Mutable(Arc<Mutex<dyn MutableSerializer<ReceivingPacket, SendingPacket, Error = E>>>),
+    ReadOnly(
+        Arc<
+            dyn ReadOnlySerializer<
+                ReceivingPacket,
+                SendingPacket,
+                EncodeError = EncErr,
+                DecodeError = DecErr,
+            >,
+        >,
+    ),
+    Mutable(
+        Arc<
+            Mutex<
+                dyn MutableSerializer<
+                    ReceivingPacket,
+                    SendingPacket,
+                    EncodeError = EncErr,
+                    DecodeError = DecErr,
+                >,
+            >,
+        >,
+    ),
 }
 
 // Implementing Serializer for SerializerAdapter provides a concrete example of polymorphism,
 // enabling different serialization strategies under the same interface.
-impl<ReceivingPacket, SendingPacket, E> Serializer<ReceivingPacket, SendingPacket>
-    for SerializerAdapter<ReceivingPacket, SendingPacket, E>
+impl<ReceivingPacket, SendingPacket, EncErr, DecErr> Serializer<ReceivingPacket, SendingPacket>
+    for SerializerAdapter<ReceivingPacket, SendingPacket, EncErr, DecErr>
 where
     SendingPacket: Send + Sync + Debug + 'static,
     ReceivingPacket: Send + Sync + Debug + 'static,
-    E: Error + Send + Sync + 'static,
+    EncErr: Error + Send + Sync + 'static,
+    DecErr: Error + Send + Sync + 'static,
 {
-    type Error = E;
+    type EncodeError = EncErr;
+    type DecodeError = DecErr;
 
     // Depending on the adapter's type, serialization can either directly pass the data or
     // require locking a mutex to ensure thread-safety in mutable contexts.
-    fn serialize(&self, packet: SendingPacket) -> Result<Vec<u8>, Self::Error> {
+    fn serialize(&self, packet: SendingPacket) -> Result<Vec<u8>, Self::EncodeError> {
         match self {
             SerializerAdapter::ReadOnly(serializer) => serializer.serialize(packet),
             SerializerAdapter::Mutable(serializer) => serializer.lock().unwrap().serialize(packet),
@@ -54,7 +78,7 @@ where
     }
 
     // Deserialization behaves similarly to serialization, respecting the adapter's type.
-    fn deserialize(&self, data: &[u8]) -> Result<ReceivingPacket, Self::Error> {
+    fn deserialize(&self, data: &[u8]) -> Result<ReceivingPacket, Self::DecodeError> {
         match self {
             SerializerAdapter::ReadOnly(serializer) => serializer.deserialize(data),
             SerializerAdapter::Mutable(serializer) => serializer.lock().unwrap().deserialize(data),
@@ -65,14 +89,16 @@ where
 /// ReadOnlySerializer is designed for scenarios where the data structure does not change,
 /// ensuring efficient and thread-safe operations without the overhead of locking mechanisms.
 pub trait ReadOnlySerializer<ReceivingPacket, SendingPacket>: Send + Sync + 'static {
-    type Error: Error + Send + Sync;
-    fn serialize(&self, packet: SendingPacket) -> Result<Vec<u8>, Self::Error>;
-    fn deserialize(&self, buffer: &[u8]) -> Result<ReceivingPacket, Self::Error>;
+    type EncodeError: Error + Send + Sync;
+    type DecodeError: Error + Send + Sync;
+    fn serialize(&self, packet: SendingPacket) -> Result<Vec<u8>, Self::EncodeError>;
+    fn deserialize(&self, buffer: &[u8]) -> Result<ReceivingPacket, Self::DecodeError>;
 }
 /// MutableSerializer supports scenarios where serialization state needs to be altered during operation,
 /// useful in cases like cryptographic transformations where state is critical.
 pub trait MutableSerializer<ReceivingPacket, SendingPacket>: Send + Sync + 'static {
-    type Error: Error + Send + Sync;
-    fn serialize(&mut self, p: SendingPacket) -> Result<Vec<u8>, Self::Error>;
-    fn deserialize(&mut self, buf: &[u8]) -> Result<ReceivingPacket, Self::Error>;
+    type EncodeError: Error + Send + Sync;
+    type DecodeError: Error + Send + Sync;
+    fn serialize(&mut self, p: SendingPacket) -> Result<Vec<u8>, Self::EncodeError>;
+    fn deserialize(&mut self, buf: &[u8]) -> Result<ReceivingPacket, Self::DecodeError>;
 }

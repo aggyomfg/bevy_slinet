@@ -26,7 +26,8 @@ type RawClientConnection<Config> = RawConnection<
     <Config as ClientConfig>::ServerPacket,
     <Config as ClientConfig>::ClientPacket,
     <<Config as ClientConfig>::Protocol as Protocol>::ClientStream,
-    <Config as ClientConfig>::SerializerError,
+    <Config as ClientConfig>::EncodeError,
+    <Config as ClientConfig>::DecodeError,
     <Config as ClientConfig>::LengthSerializer,
 >;
 
@@ -181,7 +182,7 @@ struct ConnectionReceiver<Config: ClientConfig>(
 
 struct DisconnectionReceiver<Config: ClientConfig>(
     UnboundedReceiver<(
-        ReceiveError<Config::SerializerError, Config::LengthSerializer>,
+        ReceiveError<Config::DecodeError, Config::LengthSerializer>,
         SocketAddr,
     )>,
     PhantomData<Config>,
@@ -324,7 +325,12 @@ fn setup_system<Config: ClientConfig>(mut commands: Commands) {
 pub(crate) async fn create_connection<Config: ClientConfig>(
     addr: SocketAddr,
     serializer: Arc<
-        dyn Serializer<Config::ServerPacket, Config::ClientPacket, Error = Config::SerializerError>,
+        dyn Serializer<
+            Config::ServerPacket,
+            Config::ClientPacket,
+            EncodeError = Config::EncodeError,
+            DecodeError = Config::DecodeError,
+        >,
     >,
     packet_length_serializer: Config::LengthSerializer,
     packet_rx: UnboundedReceiver<Config::ClientPacket>,
@@ -402,7 +408,7 @@ pub struct ConnectionEstablishEvent<Config: ClientConfig> {
 #[derive(Event)]
 pub struct DisconnectionEvent<Config: ClientConfig> {
     /// The error.
-    pub error: ReceiveError<Config::SerializerError, Config::LengthSerializer>,
+    pub error: ReceiveError<Config::DecodeError, Config::LengthSerializer>,
     /// A server's IP address.
     pub address: SocketAddr,
     _marker: PhantomData<Config>,

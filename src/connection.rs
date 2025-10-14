@@ -89,29 +89,33 @@ where
     }
 }
 
-pub(crate) struct RawConnection<ReceivingPacket, SendingPacket, NS, SE, LS>
+pub struct RawConnection<ReceivingPacket, SendingPacket, NS, EncErr, DecErr, LS>
 where
     ReceivingPacket: Send + Sync + Debug + 'static,
     SendingPacket: Send + Sync + Debug + 'static,
     NS: NetworkStream,
-    SE: Error + Send + Sync,
+    EncErr: Error + Send + Sync,
+    DecErr: Error + Send + Sync,
     LS: PacketLengthSerializer,
 {
     pub disconnect_task: DisconnectTask,
     pub stream: NS,
-    pub serializer: Arc<dyn Serializer<ReceivingPacket, SendingPacket, Error = SE>>,
+    pub serializer: Arc<
+        dyn Serializer<ReceivingPacket, SendingPacket, EncodeError = EncErr, DecodeError = DecErr>,
+    >,
     pub packet_length_serializer: Arc<LS>,
     pub packets_rx: UnboundedReceiver<SendingPacket>,
     pub id: ConnectionId,
 }
 
-impl<ReceivingPacket, SendingPacket, NS, SE, LS> Debug
-    for RawConnection<ReceivingPacket, SendingPacket, NS, SE, LS>
+impl<ReceivingPacket, SendingPacket, NS, EncErr, DecErr, LS> Debug
+    for RawConnection<ReceivingPacket, SendingPacket, NS, EncErr, DecErr, LS>
 where
     ReceivingPacket: Send + Sync + Debug + 'static,
     SendingPacket: Send + Sync + Debug + 'static,
     NS: NetworkStream,
-    SE: Error + Send + Sync,
+    EncErr: Error + Send + Sync,
+    DecErr: Error + Send + Sync,
     LS: PacketLengthSerializer,
 {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -158,19 +162,27 @@ pub(crate) static MAX_PACKET_SIZE: AtomicUsize = AtomicUsize::new(usize::MAX);
 #[derive(Clone, Copy, Resource)]
 pub struct MaxPacketSize(pub usize);
 
-impl<ReceivingPacket, SendingPacket, NS, SE, LS>
-    RawConnection<ReceivingPacket, SendingPacket, NS, SE, LS>
+impl<ReceivingPacket, SendingPacket, NS, EncErr, DecErr, LS>
+    RawConnection<ReceivingPacket, SendingPacket, NS, EncErr, DecErr, LS>
 where
     ReceivingPacket: Send + Sync + Debug + 'static,
     SendingPacket: Send + Sync + Debug + 'static,
     NS: NetworkStream,
-    SE: Error + Send + Sync,
+    EncErr: Error + Send + Sync,
+    DecErr: Error + Send + Sync,
     LS: PacketLengthSerializer,
 {
     #[cfg(feature = "client")]
     pub fn new(
         stream: NS,
-        serializer: Arc<dyn Serializer<ReceivingPacket, SendingPacket, Error = SE>>,
+        serializer: Arc<
+            dyn Serializer<
+                ReceivingPacket,
+                SendingPacket,
+                EncodeError = EncErr,
+                DecodeError = DecErr,
+            >,
+        >,
         packet_length_serializer: LS,
         packets_rx: UnboundedReceiver<SendingPacket>,
     ) -> Self {
@@ -198,7 +210,7 @@ where
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct DisconnectTask(Arc<DisconnectTaskInner>);
+pub struct DisconnectTask(Arc<DisconnectTaskInner>);
 
 #[derive(Default)]
 struct DisconnectTaskInner {

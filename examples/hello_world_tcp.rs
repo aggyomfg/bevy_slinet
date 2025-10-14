@@ -3,8 +3,7 @@ use std::time::Duration;
 
 use bevy::prelude::*;
 use bevy_slinet::serializer::SerializerAdapter;
-use bincode::DefaultOptions;
-use serde::{Deserialize, Serialize};
+use bincode::{Decode, Encode};
 
 use bevy_slinet::client::ClientPlugin;
 use bevy_slinet::packet_length_serializer::LittleEndian;
@@ -19,10 +18,15 @@ impl ServerConfig for Config {
     type ClientPacket = ClientPacket;
     type ServerPacket = ServerPacket;
     type Protocol = TcpProtocol;
-    type SerializerError = bincode::Error;
-    fn build_serializer(
-    ) -> SerializerAdapter<Self::ClientPacket, Self::ServerPacket, Self::SerializerError> {
-        SerializerAdapter::ReadOnly(Arc::new(BincodeSerializer::<DefaultOptions>::default()))
+    type EncodeError = bincode::error::EncodeError;
+    type DecodeError = bincode::error::DecodeError;
+    fn build_serializer() -> SerializerAdapter<
+        Self::ClientPacket,
+        Self::ServerPacket,
+        Self::EncodeError,
+        Self::DecodeError,
+    > {
+        SerializerAdapter::ReadOnly(Arc::new(BincodeSerializer::default()))
     }
     type LengthSerializer = LittleEndian<u32>;
 }
@@ -31,20 +35,25 @@ impl ClientConfig for Config {
     type ClientPacket = ClientPacket;
     type ServerPacket = ServerPacket;
     type Protocol = TcpProtocol;
-    type SerializerError = bincode::Error;
-    fn build_serializer(
-    ) -> SerializerAdapter<Self::ServerPacket, Self::ClientPacket, Self::SerializerError> {
-        SerializerAdapter::ReadOnly(Arc::new(BincodeSerializer::<DefaultOptions>::default()))
+    type EncodeError = bincode::error::EncodeError;
+    type DecodeError = bincode::error::DecodeError;
+    fn build_serializer() -> SerializerAdapter<
+        Self::ServerPacket,
+        Self::ClientPacket,
+        Self::EncodeError,
+        Self::DecodeError,
+    > {
+        SerializerAdapter::ReadOnly(Arc::new(BincodeSerializer::default()))
     }
     type LengthSerializer = LittleEndian<u32>;
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Decode, Encode)]
 enum ClientPacket {
     String(String),
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Decode, Encode)]
 enum ServerPacket {
     String(String),
 }

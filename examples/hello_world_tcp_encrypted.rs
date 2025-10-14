@@ -21,9 +21,14 @@ impl ServerConfig for Config {
     type ClientPacket = CustomCryptClientPacket;
     type ServerPacket = CustomCryptServerPacket;
     type Protocol = TcpProtocol;
-    type SerializerError = CustomSerializationError;
-    fn build_serializer(
-    ) -> SerializerAdapter<Self::ClientPacket, Self::ServerPacket, Self::SerializerError> {
+    type EncodeError = CustomSerializationError;
+    type DecodeError = CustomSerializationError;
+    fn build_serializer() -> SerializerAdapter<
+        Self::ClientPacket,
+        Self::ServerPacket,
+        Self::EncodeError,
+        Self::DecodeError,
+    > {
         SerializerAdapter::Mutable(Arc::new(Mutex::new(CustomCryptSerializer::<
             CustomCryptEngine,
             CustomCryptClientPacket,
@@ -39,11 +44,16 @@ impl ClientConfig for Config {
     type ClientPacket = CustomCryptClientPacket;
     type ServerPacket = CustomCryptServerPacket;
     type Protocol = TcpProtocol;
-    type SerializerError = CustomSerializationError;
+    type EncodeError = CustomSerializationError;
+    type DecodeError = CustomSerializationError;
 
     type LengthSerializer = LittleEndian<u32>;
-    fn build_serializer(
-    ) -> SerializerAdapter<Self::ServerPacket, Self::ClientPacket, Self::SerializerError> {
+    fn build_serializer() -> SerializerAdapter<
+        Self::ServerPacket,
+        Self::ClientPacket,
+        Self::EncodeError,
+        Self::DecodeError,
+    > {
         SerializerAdapter::Mutable(Arc::new(Mutex::new(CustomCryptSerializer::<
             CustomCryptEngine,
             Self::ServerPacket,

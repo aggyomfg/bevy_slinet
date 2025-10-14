@@ -22,7 +22,8 @@ type RawServerConnection<Config> = (
         <Config as ServerConfig>::ClientPacket,
         <Config as ServerConfig>::ServerPacket,
         <<Config as ServerConfig>::Protocol as Protocol>::ServerStream,
-        <Config as ServerConfig>::SerializerError,
+        <Config as ServerConfig>::EncodeError,
+        <Config as ServerConfig>::DecodeError,
         <Config as ServerConfig>::LengthSerializer,
     >,
     ServerConnection<Config>,
@@ -111,7 +112,7 @@ struct ConnectionReceiver<Config: ServerConfig>(
 #[derive(Resource)]
 struct DisconnectionReceiver<Config: ServerConfig>(
     UnboundedReceiver<(
-        ReceiveError<Config::SerializerError, Config::LengthSerializer>,
+        ReceiveError<Config::DecodeError, Config::LengthSerializer>,
         ServerConnection<Config>,
     )>,
 );
@@ -301,7 +302,7 @@ pub struct NewConnectionEvent<Config: ServerConfig> {
 #[derive(Event)]
 pub struct DisconnectionEvent<Config: ServerConfig> {
     /// The error.
-    pub error: ReceiveError<Config::SerializerError, Config::LengthSerializer>,
+    pub error: ReceiveError<Config::DecodeError, Config::LengthSerializer>,
     /// The connection.
     pub connection: ServerConnection<Config>,
 }

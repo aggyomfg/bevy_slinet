@@ -32,12 +32,17 @@ impl ClientConfig for Config {
     type ClientPacket = Packet;
     type ServerPacket = Packet;
     type Protocol = TcpProtocol;
-    type SerializerError = bincode::Error;
+    type EncodeError = bincode::error::EncodeError;
+    type DecodeError = bincode::error::DecodeError;
     type LengthSerializer = LittleEndian<u32>;
-    fn build_serializer(
-    ) -> SerializerAdapter<Self::ClientPacket, Self::ServerPacket, Self::SerializerError> {
+    fn build_serializer() -> SerializerAdapter<
+        Self::ServerPacket,
+        Self::ClientPacket,
+        Self::EncodeError,
+        Self::DecodeError,
+    > {
         SerializerAdapter::ReadOnly(Arc::new(
-            BincodeSerializer::<DefaultOptions>::default(),
+            BincodeSerializer::default(),
         ))
     }
 }
@@ -95,12 +100,17 @@ impl ServerConfig for Config {
     type ClientPacket = Packet;
     type ServerPacket = Packet;
     type Protocol = TcpProtocol;
-    type SerializerError = bincode::Error;
+    type EncodeError = bincode::error::EncodeError;
+    type DecodeError = bincode::error::DecodeError;
     type LengthSerializer = LittleEndian<u32>;
-    fn build_serializer(
-    ) -> SerializerAdapter<Self::ClientPacket, Self::ServerPacket, Self::SerializerError> {
+    fn build_serializer() -> SerializerAdapter<
+        Self::ClientPacket,
+        Self::ServerPacket,
+        Self::EncodeError,
+        Self::DecodeError,
+    > {
         SerializerAdapter::ReadOnly(Arc::new(
-            BincodeSerializer::<DefaultOptions>::default(),
+            BincodeSerializer::default(),
         ))
     }
 }
@@ -169,4 +179,5 @@ Note: you should implement keep-alive and disconnection systems yourself, or loo
 | `0.13`         | `0.15`       |
 | `0.14`         | `0.16`       |
 | `0.15`         | `0.17`       |
+| `0.16`         | `0.17`       |
 | `main`         | `0.17`       |

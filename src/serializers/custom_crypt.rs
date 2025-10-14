@@ -9,10 +9,10 @@ use std::{
 
 use crate::serializer::MutableSerializer;
 use bevy::log;
-use serde::{Deserialize, Serialize};
+use bincode::{Decode, Encode};
 
 /// Represents custom packets sent from the client, allowing different types of content.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Decode, Encode, PartialEq)]
 pub enum CustomCryptClientPacket {
     String(String),
 }
@@ -24,7 +24,7 @@ impl Default for CustomCryptClientPacket {
 }
 
 /// Represents custom packets received by the server, allowing different types of content.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Decode, Encode, PartialEq)]
 pub enum CustomCryptServerPacket {
     String(String),
 }
@@ -57,9 +57,19 @@ pub trait CryptEngine<ReceivingPacket, SendingPacket>: Default {
 pub struct ExampleKeyPair(u64, u64);
 
 /// A cryptographic engine implementing XOR encryption, typically not secure but used for demonstration.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone)]
 pub struct CustomCryptEngine {
     key_pair: ExampleKeyPair,
+    bincode_config: bincode::config::Configuration,
+}
+
+impl Default for CustomCryptEngine {
+    fn default() -> Self {
+        Self {
+            key_pair: ExampleKeyPair::default(),
+            bincode_config: bincode::config::standard(),
+        }
+    }
 }
 
 impl CustomCryptEngine {
@@ -101,7 +111,7 @@ impl CryptEngine<CustomCryptClientPacket, CustomCryptServerPacket> for CustomCry
         &mut self,
         packet: CustomCryptServerPacket,
     ) -> Result<Vec<u8>, CustomSerializationError> {
-        let packet_data = bincode::serialize(&packet).unwrap();
+        let packet_data = bincode::encode_to_vec(&packet, self.bincode_config).unwrap();
         let encrypted_data = self.xor_encrypt(packet_data);
         Ok(encrypted_data)
     }
@@ -111,7 +121,9 @@ impl CryptEngine<CustomCryptClientPacket, CustomCryptServerPacket> for CustomCry
         packet: &[u8],
     ) -> Result<CustomCryptClientPacket, CustomSerializationError> {
         let decrypted_data = self.xor_decrypt(packet.to_vec());
-        let packet = bincode::deserialize(&decrypted_data).unwrap();
+        let packet = bincode::decode_from_slice(&decrypted_data, self.bincode_config)
+            .map(|(p, _)| p)
+            .unwrap();
         Ok(packet)
     }
 }
@@ -121,7 +133,7 @@ impl CryptEngine<CustomCryptServerPacket, CustomCryptClientPacket> for CustomCry
         &mut self,
         packet: CustomCryptClientPacket,
     ) -> Result<Vec<u8>, CustomSerializationError> {
-        let packet_data = bincode::serialize(&packet).unwrap();
+        let packet_data = bincode::encode_to_vec(&packet, self.bincode_config).unwrap();
         let encrypted_data = self.xor_encrypt(packet_data);
         Ok(encrypted_data)
     }
@@ -131,7 +143,9 @@ impl CryptEngine<CustomCryptServerPacket, CustomCryptClientPacket> for CustomCry
         packet: &[u8],
     ) -> Result<CustomCryptServerPacket, CustomSerializationError> {
         let decrypted_data = self.xor_decrypt(packet.to_vec());
-        let packet = bincode::deserialize(&decrypted_data).unwrap();
+        let packet = bincode::decode_from_slice(&decrypted_data, self.bincode_config)
+            .map(|(p, _)| p)
+            .unwrap();
         Ok(packet)
     }
 }
@@ -169,15 +183,16 @@ where
     ReceivingPacket: Send + Sync + 'static,
     SendingPacket: Send + Sync + 'static,
 {
-    type Error = CustomSerializationError;
+    type EncodeError = CustomSerializationError;
+    type DecodeError = CustomSerializationError;
 
     /// Serializes a packet into a byte vector.
-    fn serialize(&mut self, packet: SendingPacket) -> Result<Vec<u8>, Self::Error> {
+    fn serialize(&mut self, packet: SendingPacket) -> Result<Vec<u8>, Self::EncodeError> {
         Ok(self.crypt_engine.encrypt(packet).unwrap())
     }
 
     /// Deserializes a packet from a byte slice
-    fn deserialize(&mut self, buffer: &[u8]) -> Result<ReceivingPacket, Self::Error> {
+    fn deserialize(&mut self, buffer: &[u8]) -> Result<ReceivingPacket, Self::DecodeError> {
         match self.crypt_engine.decrypt(buffer) {
             Ok(encrypted) => Ok(encrypted),
             Err(e) => {

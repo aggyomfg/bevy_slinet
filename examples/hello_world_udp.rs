@@ -3,8 +3,6 @@ use std::time::Duration;
 
 use bevy::prelude::*;
 use bevy_slinet::serializer::SerializerAdapter;
-use bincode::DefaultOptions;
-use serde::{Deserialize, Serialize};
 
 use bevy_slinet::client::ClientPlugin;
 use bevy_slinet::packet_length_serializer::BigEndian;
@@ -12,6 +10,7 @@ use bevy_slinet::protocols::udp::UdpProtocol;
 use bevy_slinet::serializers::bincode::BincodeSerializer;
 use bevy_slinet::server::{NewConnectionEvent, ServerPlugin};
 use bevy_slinet::{client, server, ClientConfig, ServerConfig};
+use bincode::{Decode, Encode};
 
 struct Config;
 
@@ -19,10 +18,15 @@ impl ServerConfig for Config {
     type ClientPacket = ClientPacket;
     type ServerPacket = ServerPacket;
     type Protocol = UdpProtocol;
-    type SerializerError = bincode::Error;
-    fn build_serializer(
-    ) -> SerializerAdapter<Self::ClientPacket, Self::ServerPacket, Self::SerializerError> {
-        SerializerAdapter::ReadOnly(Arc::new(BincodeSerializer::<DefaultOptions>::default()))
+    type EncodeError = bincode::error::EncodeError;
+    type DecodeError = bincode::error::DecodeError;
+    fn build_serializer() -> SerializerAdapter<
+        Self::ClientPacket,
+        Self::ServerPacket,
+        Self::EncodeError,
+        Self::DecodeError,
+    > {
+        SerializerAdapter::ReadOnly(Arc::new(BincodeSerializer::default()))
     }
     type LengthSerializer = BigEndian<u8>;
 }
@@ -31,20 +35,25 @@ impl ClientConfig for Config {
     type ClientPacket = ClientPacket;
     type ServerPacket = ServerPacket;
     type Protocol = UdpProtocol;
-    type SerializerError = bincode::Error;
-    fn build_serializer(
-    ) -> SerializerAdapter<Self::ServerPacket, Self::ClientPacket, Self::SerializerError> {
-        SerializerAdapter::ReadOnly(Arc::new(BincodeSerializer::<DefaultOptions>::default()))
+    type EncodeError = bincode::error::EncodeError;
+    type DecodeError = bincode::error::DecodeError;
+    fn build_serializer() -> SerializerAdapter<
+        Self::ServerPacket,
+        Self::ClientPacket,
+        Self::EncodeError,
+        Self::DecodeError,
+    > {
+        SerializerAdapter::ReadOnly(Arc::new(BincodeSerializer::default()))
     }
     type LengthSerializer = BigEndian<u8>;
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Decode, Encode)]
 enum ClientPacket {
     String(String),
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Decode, Encode)]
 enum ServerPacket {
     String(String),
 }

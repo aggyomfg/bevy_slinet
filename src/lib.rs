@@ -53,10 +53,17 @@ pub trait ServerConfig: Send + Sync + 'static {
     type ServerPacket: Send + Sync + Debug + 'static;
     /// The connection's protocol.
     type Protocol: Protocol;
-    type SerializerError: Error + Send + Sync;
+    /// Error type for encoding operations
+    type EncodeError: Error + Send + Sync;
+    /// Error type for decoding operations
+    type DecodeError: Error + Send + Sync;
     /// A packet serializer.
-    fn build_serializer(
-    ) -> SerializerAdapter<Self::ClientPacket, Self::ServerPacket, Self::SerializerError>;
+    fn build_serializer() -> SerializerAdapter<
+        Self::ClientPacket,
+        Self::ServerPacket,
+        Self::EncodeError,
+        Self::DecodeError,
+    >;
     /// A packet length serializer
     type LengthSerializer: PacketLengthSerializer + Default;
 }
@@ -69,10 +76,17 @@ pub trait ClientConfig: Send + Sync + 'static {
     type ServerPacket: Send + Sync + Debug + 'static;
     /// The connection's protocol.
     type Protocol: Protocol;
-    type SerializerError: Error + Send + Sync;
+    /// Error type for encoding operations
+    type EncodeError: Error + Send + Sync;
+    /// Error type for decoding operations
+    type DecodeError: Error + Send + Sync;
     /// A packet serializer.
-    fn build_serializer(
-    ) -> SerializerAdapter<Self::ServerPacket, Self::ClientPacket, Self::SerializerError>;
+    fn build_serializer() -> SerializerAdapter<
+        Self::ServerPacket,
+        Self::ClientPacket,
+        Self::EncodeError,
+        Self::DecodeError,
+    >;
     /// A packet length serializer
     type LengthSerializer: PacketLengthSerializer + Default;
 }

@@ -3,12 +3,11 @@ use crate::client::{ClientConnection, ClientPlugin, ConnectionEstablishEvent};
 use crate::packet_length_serializer::LittleEndian;
 use crate::protocols::tcp::TcpProtocol;
 use crate::serializer::SerializerAdapter;
-use crate::serializers::bincode::BincodeSerializer;
+use crate::serializers::bincode_serde::BincodeSerdeSerializer;
 use crate::server::{NewConnectionEvent, ServerConnections, ServerPlugin};
 use crate::{server, ClientConfig, ServerConfig};
 use bevy::app::App;
 use bevy::prelude::*;
-use bincode::DefaultOptions;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,13 +22,18 @@ impl ServerConfig for TcpConfig {
     type ServerPacket = Packet;
     type Protocol = TcpProtocol;
 
-    type SerializerError = bincode::Error;
+    type EncodeError = bincode::error::EncodeError;
+    type DecodeError = bincode::error::DecodeError;
 
     type LengthSerializer = LittleEndian<u32>;
 
-    fn build_serializer(
-    ) -> SerializerAdapter<Self::ClientPacket, Self::ServerPacket, Self::SerializerError> {
-        SerializerAdapter::ReadOnly(Arc::new(BincodeSerializer::<DefaultOptions>::default()))
+    fn build_serializer() -> SerializerAdapter<
+        Self::ClientPacket,
+        Self::ServerPacket,
+        Self::EncodeError,
+        Self::DecodeError,
+    > {
+        SerializerAdapter::ReadOnly(Arc::new(BincodeSerdeSerializer::default()))
     }
 }
 
@@ -37,12 +41,17 @@ impl ClientConfig for TcpConfig {
     type ClientPacket = Packet;
     type ServerPacket = Packet;
     type Protocol = TcpProtocol;
-    type SerializerError = bincode::Error;
+    type EncodeError = bincode::error::EncodeError;
+    type DecodeError = bincode::error::DecodeError;
 
     type LengthSerializer = LittleEndian<u32>;
-    fn build_serializer(
-    ) -> SerializerAdapter<Self::ClientPacket, Self::ServerPacket, Self::SerializerError> {
-        SerializerAdapter::ReadOnly(Arc::new(BincodeSerializer::<DefaultOptions>::default()))
+    fn build_serializer() -> SerializerAdapter<
+        Self::ServerPacket,
+        Self::ClientPacket,
+        Self::EncodeError,
+        Self::DecodeError,
+    > {
+        SerializerAdapter::ReadOnly(Arc::new(BincodeSerdeSerializer::default()))
     }
 }
 

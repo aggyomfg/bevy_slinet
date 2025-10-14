@@ -101,7 +101,7 @@ pub trait ReadStream: Send + Sync + 'static {
         &mut self,
         serializer: Arc<S>,
         length_serializer: &LS,
-    ) -> Result<ReceivingPacket, ReceiveError<S::Error, LS>>
+    ) -> Result<ReceivingPacket, ReceiveError<S::DecodeError, LS>>
     where
         ReceivingPacket: Send + Sync + Debug + 'static,
         SendingPacket: Send + Sync + Debug + 'static,
