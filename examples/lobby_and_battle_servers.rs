@@ -33,6 +33,7 @@
 //! and the loop goes on
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -51,10 +52,10 @@ use bevy_slinet::packet_length_serializer::LittleEndian;
 use bevy_slinet::protocol::ReceiveError;
 use bevy_slinet::protocols::tcp::TcpProtocol;
 use bevy_slinet::protocols::udp::UdpProtocol;
-use bevy_slinet::serializers::bincode::BincodeSerializer;
+use bevy_slinet::serializers::bitcode::BitcodeSerializer;
 use bevy_slinet::server::{NewConnectionEvent, ServerConnections, ServerPlugin};
 use bevy_slinet::{client, server, ClientConfig, ServerConfig};
-use bincode::{Decode, Encode};
+use bitcode::{Decode, Encode};
 
 pub const LOBBY_SERVER: &str = "127.0.0.1:3000";
 pub const BATTLE_SERVER: &str = "127.0.0.1:3000";
@@ -65,15 +66,15 @@ impl ServerConfig for LobbyConfig {
     type ClientPacket = LobbyClientPacket;
     type ServerPacket = LobbyServerPacket;
     type Protocol = TcpProtocol;
-    type EncodeError = bincode::error::EncodeError;
-    type DecodeError = bincode::error::DecodeError;
+    type EncodeError = Infallible;
+    type DecodeError = bitcode::Error;
     fn build_serializer() -> SerializerAdapter<
         Self::ClientPacket,
         Self::ServerPacket,
         Self::EncodeError,
         Self::DecodeError,
     > {
-        SerializerAdapter::ReadOnly(Arc::new(BincodeSerializer::default()))
+        SerializerAdapter::ReadOnly(Arc::new(BitcodeSerializer))
     }
     type LengthSerializer = LittleEndian<u16>;
 }
@@ -82,15 +83,15 @@ impl ClientConfig for LobbyConfig {
     type ClientPacket = LobbyClientPacket;
     type ServerPacket = LobbyServerPacket;
     type Protocol = TcpProtocol;
-    type EncodeError = bincode::error::EncodeError;
-    type DecodeError = bincode::error::DecodeError;
+    type EncodeError = Infallible;
+    type DecodeError = bitcode::Error;
     fn build_serializer() -> SerializerAdapter<
         Self::ServerPacket,
         Self::ClientPacket,
         Self::EncodeError,
         Self::DecodeError,
     > {
-        SerializerAdapter::ReadOnly(Arc::new(BincodeSerializer::default()))
+        SerializerAdapter::ReadOnly(Arc::new(BitcodeSerializer))
     }
     type LengthSerializer = LittleEndian<u16>;
 }
@@ -101,15 +102,15 @@ impl ServerConfig for BattleConfig {
     type ClientPacket = BattleClientPacket;
     type ServerPacket = BattleServerPacket;
     type Protocol = UdpProtocol;
-    type EncodeError = bincode::error::EncodeError;
-    type DecodeError = bincode::error::DecodeError;
+    type EncodeError = Infallible;
+    type DecodeError = bitcode::Error;
     fn build_serializer() -> SerializerAdapter<
         Self::ClientPacket,
         Self::ServerPacket,
         Self::EncodeError,
         Self::DecodeError,
     > {
-        SerializerAdapter::ReadOnly(Arc::new(BincodeSerializer::default()))
+        SerializerAdapter::ReadOnly(Arc::new(BitcodeSerializer))
     }
     type LengthSerializer = LittleEndian<u16>;
 }
@@ -118,15 +119,15 @@ impl ClientConfig for BattleConfig {
     type ClientPacket = BattleClientPacket;
     type ServerPacket = BattleServerPacket;
     type Protocol = UdpProtocol;
-    type EncodeError = bincode::error::EncodeError;
-    type DecodeError = bincode::error::DecodeError;
+    type EncodeError = Infallible;
+    type DecodeError = bitcode::Error;
     fn build_serializer() -> SerializerAdapter<
         Self::ServerPacket,
         Self::ClientPacket,
         Self::EncodeError,
         Self::DecodeError,
     > {
-        SerializerAdapter::ReadOnly(Arc::new(BincodeSerializer::default()))
+        SerializerAdapter::ReadOnly(Arc::new(BitcodeSerializer))
     }
     type LengthSerializer = LittleEndian<u16>;
 }

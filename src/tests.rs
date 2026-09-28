@@ -3,7 +3,7 @@ use crate::client::{ClientConnection, ClientPlugin, ConnectionEstablishEvent};
 use crate::packet_length_serializer::LittleEndian;
 use crate::protocols::tcp::TcpProtocol;
 use crate::serializer::SerializerAdapter;
-use crate::serializers::bincode_serde::BincodeSerdeSerializer;
+use crate::serializers::bitcode_serde::BitcodeSerdeSerializer;
 use crate::server::{NewConnectionEvent, ServerAddress, ServerConnections, ServerPlugin};
 use crate::{server, ClientConfig, ServerConfig};
 use bevy::app::App;
@@ -31,8 +31,8 @@ impl ServerConfig for TcpConfig {
     type ServerPacket = Packet;
     type Protocol = TcpProtocol;
 
-    type EncodeError = bincode::error::EncodeError;
-    type DecodeError = bincode::error::DecodeError;
+    type EncodeError = bitcode::Error;
+    type DecodeError = bitcode::Error;
 
     type LengthSerializer = LittleEndian<u32>;
 
@@ -42,7 +42,7 @@ impl ServerConfig for TcpConfig {
         Self::EncodeError,
         Self::DecodeError,
     > {
-        SerializerAdapter::ReadOnly(Arc::new(BincodeSerdeSerializer::default()))
+        SerializerAdapter::ReadOnly(Arc::new(BitcodeSerdeSerializer))
     }
 }
 
@@ -50,8 +50,8 @@ impl ClientConfig for TcpConfig {
     type ClientPacket = Packet;
     type ServerPacket = Packet;
     type Protocol = TcpProtocol;
-    type EncodeError = bincode::error::EncodeError;
-    type DecodeError = bincode::error::DecodeError;
+    type EncodeError = bitcode::Error;
+    type DecodeError = bitcode::Error;
 
     type LengthSerializer = LittleEndian<u32>;
     fn build_serializer() -> SerializerAdapter<
@@ -60,7 +60,7 @@ impl ClientConfig for TcpConfig {
         Self::EncodeError,
         Self::DecodeError,
     > {
-        SerializerAdapter::ReadOnly(Arc::new(BincodeSerdeSerializer::default()))
+        SerializerAdapter::ReadOnly(Arc::new(BitcodeSerdeSerializer))
     }
 }
 

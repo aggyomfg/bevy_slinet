@@ -1,5 +1,5 @@
 //! Implement the [`ReadOnlySerializer`] or [`MutableSerializer`] trait for serialzer and build it in config refer
-//! BincodeSerializer to check how to do this.
+//! BitcodeSerializer to check how to do this.
 
 use core::fmt::Debug;
 use std::{

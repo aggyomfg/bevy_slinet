@@ -1,4 +1,6 @@
 //! A [`bincode`]-based packet serializer with serde support.
+//!
+//! Kept for compatibility only: bincode is unmaintained upstream. Prefer `serializer_bitcode_serde`.
 
 use crate::serializer::ReadOnlySerializer;
 pub use bincode::config;
@@ -6,9 +8,8 @@ use bincode::config::Configuration;
 use serde::{Deserialize, Serialize};
 
 /// Bincode 2.x serializer using serde traits and standard configuration.
-/// Provides compatibility with other serde-based formats.
 ///
-/// For better performance without serde overhead, use `BincodeSerializer` instead.
+/// For new code, use `BitcodeSerdeSerializer` instead.
 #[derive(Clone)]
 pub struct BincodeSerdeSerializer {
     config: Configuration,

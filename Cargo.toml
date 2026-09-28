@@ -1,11 +1,12 @@
 [package]
 name = "bevy_slinet"
-version = "0.18.0"
+version = "0.18.1"
 authors = [
     "Sliman4 <4sliman4@gmail.com>",
     "aggyomfg <aggyomfg@yandex.com>"
     ]
 edition = "2021"
+rust-version = "1.95"
 license = "Apache-2.0 OR MIT"
 readme = "README.md"
 repository = "https://github.com/aggyomfg/bevy_slinet"
@@ -17,6 +18,8 @@ keywords = ["gamedev", "networking", "bevy"]
 
 [package.metadata.docs.rs]
 features = [
+    "serializer_bitcode",
+    "serializer_bitcode_serde",
     "serializer_bincode",
     "serializer_bincode_serde",
     "protocol_tcp",
@@ -30,6 +33,7 @@ bevy = { version = "0.19", default-features = false, features = ["bevy_log"]}
 byteorder = "1"
 serde = { version = "1", features = ["derive"], optional = true }
 bincode = { version = "2.0", optional = true }
+bitcode = { version = "0.6", optional = true }
 dashmap = { version = "6", optional = true }
 tokio = { version = "1", features = [
     "io-util",
@@ -41,6 +45,8 @@ async-trait = "0.1"
 futures = { version = "0.3" }
 
 [features]
+serializer_bitcode = ["bitcode"]
+serializer_bitcode_serde = ["bitcode", "bitcode/serde", "serde"]
 serializer_bincode = ["bincode"]
 serializer_bincode_serde = ["bincode", "bincode/serde", "serde"]
 protocol_tcp = ["tokio/net"]
@@ -54,23 +60,23 @@ wasm-bindgen-futures = "0.4.29"
 [[example]]
 name = "hello_world_tcp"
 path = "examples/hello_world_tcp.rs"
-required-features = ["client", "server", "protocol_tcp", "serializer_bincode"]
+required-features = ["client", "server", "protocol_tcp", "serializer_bitcode"]
 
 [[example]]
 name = "hello_world_tcp_encrypted"
 path = "examples/hello_world_tcp_encrypted.rs"
-required-features = ["client", "server", "protocol_tcp", "serializer_bincode"]
+required-features = ["client", "server", "protocol_tcp", "serializer_bitcode"]
 
 
 [[example]]
 name = "hello_world_udp"
 path = "examples/hello_world_udp.rs"
-required-features = ["client", "server", "protocol_udp", "serializer_bincode"]
+required-features = ["client", "server", "protocol_udp", "serializer_bitcode"]
 
 [[example]]
 name = "multiple_connections"
 path = "examples/multiple_connections.rs"
-required-features = ["client", "server", "protocol_udp", "serializer_bincode"]
+required-features = ["client", "server", "protocol_udp", "serializer_bitcode"]
 
 [[example]]
 name = "lobby_and_battle_servers"
@@ -80,5 +86,5 @@ required-features = [
     "server",
     "protocol_udp",
     "protocol_tcp",
-    "serializer_bincode",
+    "serializer_bitcode",
 ]

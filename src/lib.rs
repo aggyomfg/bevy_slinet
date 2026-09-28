@@ -25,7 +25,7 @@ pub mod server;
     feature = "client",
     feature = "server",
     feature = "protocol_tcp",
-    feature = "serializer_bincode_serde"
+    feature = "serializer_bitcode_serde"
 ))]
 mod tests;
 #[cfg(all(
@@ -33,8 +33,8 @@ mod tests;
     feature = "client",
     feature = "server",
     feature = "protocol_tcp",
-    feature = "serializer_bincode",
-    feature = "serializer_bincode_serde"
+    feature = "serializer_bitcode",
+    feature = "serializer_bitcode_serde"
 ))]
 mod tests_mut_serializer;
 

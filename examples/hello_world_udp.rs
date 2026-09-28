@@ -1,3 +1,4 @@
+use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,10 +8,10 @@ use bevy_slinet::serializer::SerializerAdapter;
 use bevy_slinet::client::ClientPlugin;
 use bevy_slinet::packet_length_serializer::BigEndian;
 use bevy_slinet::protocols::udp::UdpProtocol;
-use bevy_slinet::serializers::bincode::BincodeSerializer;
+use bevy_slinet::serializers::bitcode::BitcodeSerializer;
 use bevy_slinet::server::{NewConnectionEvent, ServerPlugin};
 use bevy_slinet::{client, server, ClientConfig, ServerConfig};
-use bincode::{Decode, Encode};
+use bitcode::{Decode, Encode};
 
 struct Config;
 
@@ -18,15 +19,15 @@ impl ServerConfig for Config {
     type ClientPacket = ClientPacket;
     type ServerPacket = ServerPacket;
     type Protocol = UdpProtocol;
-    type EncodeError = bincode::error::EncodeError;
-    type DecodeError = bincode::error::DecodeError;
+    type EncodeError = Infallible;
+    type DecodeError = bitcode::Error;
     fn build_serializer() -> SerializerAdapter<
         Self::ClientPacket,
         Self::ServerPacket,
         Self::EncodeError,
         Self::DecodeError,
     > {
-        SerializerAdapter::ReadOnly(Arc::new(BincodeSerializer::default()))
+        SerializerAdapter::ReadOnly(Arc::new(BitcodeSerializer))
     }
     type LengthSerializer = BigEndian<u8>;
 }
@@ -35,15 +36,15 @@ impl ClientConfig for Config {
     type ClientPacket = ClientPacket;
     type ServerPacket = ServerPacket;
     type Protocol = UdpProtocol;
-    type EncodeError = bincode::error::EncodeError;
-    type DecodeError = bincode::error::DecodeError;
+    type EncodeError = Infallible;
+    type DecodeError = bitcode::Error;
     fn build_serializer() -> SerializerAdapter<
         Self::ServerPacket,
         Self::ClientPacket,
         Self::EncodeError,
         Self::DecodeError,
     > {
-        SerializerAdapter::ReadOnly(Arc::new(BincodeSerializer::default()))
+        SerializerAdapter::ReadOnly(Arc::new(BitcodeSerializer))
     }
     type LengthSerializer = BigEndian<u8>;
 }

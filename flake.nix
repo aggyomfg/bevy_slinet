@@ -36,10 +36,11 @@
               })
               pkg-config
               cargo-audit
+              cargo-hack
             ];
 
             # Not needed by the current minimal bevy features, but required once rendering/audio/input features are enabled.
-            buildInputs = lib.optionals stdenv.isLinux [
+            buildInputs = lib.optionals stdenv.hostPlatform.isLinux [
               udev
               alsa-lib-with-plugins
               vulkan-loader
