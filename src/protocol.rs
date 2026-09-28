@@ -304,8 +304,9 @@ mod tests {
 
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let listener = Arc::new(P::bind(([127, 0, 0, 1], 0).into()).await.unwrap());
-            let client = P::connect_to_server(listener.address()).await.unwrap();
-            let server = listener.accept().await.unwrap();
+            let (client, server) =
+                tokio::join!(P::connect_to_server(listener.address()), listener.accept());
+            let (client, server) = (client.unwrap(), server.unwrap());
             let pump = tokio::spawn(async move { while listener.accept().await.is_ok() {} });
             let (mut client_read, mut client_write) = client.into_split().await.unwrap();
             let (mut server_read, mut server_write) = server.into_split().await.unwrap();

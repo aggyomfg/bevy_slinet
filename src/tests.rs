@@ -184,20 +184,18 @@ fn udp_packets_and_disconnection() {
         .resource::<ServerConnections<UdpConfig>>()
         .is_empty());
 
-    // The client keeps sending keep-alives, which must not reopen the connection.
-    let deadline = Instant::now() + crate::protocols::udp::KEEPALIVE_INTERVAL * 2;
-    while Instant::now() < deadline {
+    // The server's disconnect datagrams close the client too.
+    wait_until(|| {
         app_client.update();
         app_server.update();
-        std::thread::sleep(Duration::from_millis(10));
-    }
+        !app_client
+            .world()
+            .contains_resource::<ClientConnection<UdpConfig>>()
+    });
     assert!(app_server
         .world()
         .resource::<ServerConnections<UdpConfig>>()
         .is_empty());
-    assert!(app_client
-        .world()
-        .contains_resource::<ClientConnection<UdpConfig>>());
 }
 
 fn exchange_packets<C: TestConfig>() -> (App, App) {
