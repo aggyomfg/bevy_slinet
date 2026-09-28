@@ -352,7 +352,7 @@ fn failed_parallel_attempt_must_not_remove_live_connection() {
     let stopped = Arc::clone(&stop);
     let worker = std::thread::spawn(move || {
         let mut ignored = None;
-        let mut buffer = [0; 64];
+        let mut buffer = [0; 256];
         while !stopped.load(std::sync::atomic::Ordering::Relaxed) {
             let Ok((len, source)) = socket.recv_from(&mut buffer) else {
                 continue;
@@ -363,10 +363,8 @@ fn failed_parallel_attempt_must_not_remove_live_connection() {
             if ignored == Some(source) {
                 continue;
             }
-            if len == 0 {
-                socket.send_to(&[], source).unwrap();
-            } else if buffer[..len] == [2] {
-                socket.send_to(&[2], source).unwrap();
+            if let Some(answer) = crate::protocols::udp::test_answer(&buffer[..len]) {
+                socket.send_to(&answer, source).unwrap();
             }
         }
     });
@@ -439,7 +437,7 @@ fn retained_connection_must_reject_send_after_disconnect() {
 
 #[cfg(feature = "protocol_udp")]
 #[test]
-fn retained_connection_transmits_after_disconnection_event() {
+fn retained_connection_cannot_transmit_after_disconnection_event() {
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let address = socket.local_addr().unwrap();
     socket
@@ -449,17 +447,15 @@ fn retained_connection_transmits_after_disconnection_event() {
     let stopped = Arc::clone(&stop);
     let (data_tx, data_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
-        let mut buffer = [0; 64];
+        let mut buffer = [0; 256];
         while !stopped.load(std::sync::atomic::Ordering::Relaxed) {
             let Ok((len, source)) = socket.recv_from(&mut buffer) else {
                 continue;
             };
-            if len == 0 {
-                socket.send_to(&[], source).unwrap();
-            } else if buffer[0] == 1 {
+            if let Some(answer) = crate::protocols::udp::test_answer(&buffer[..len]) {
+                socket.send_to(&answer, source).unwrap();
+            } else if buffer[..len].starts_with(b"SLN2\x01") {
                 data_tx.send(buffer[..len].to_vec()).unwrap();
-            } else if buffer[..len] == [2] {
-                socket.send_to(&[2], source).unwrap();
             }
         }
     });

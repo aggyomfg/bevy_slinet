@@ -34,7 +34,8 @@ byteorder = "1"
 serde = { version = "1", features = ["derive"], optional = true }
 bincode = { version = "2.0", optional = true }
 bitcode = { version = "0.6", optional = true }
-dashmap = { version = "6", optional = true }
+blake3 = { version = "1", optional = true }
+getrandom = { version = "0.3", optional = true }
 tokio = { version = "1", features = [
     "io-util",
     "rt-multi-thread",
@@ -54,7 +55,7 @@ serializer_bitcode_serde = ["bitcode", "bitcode/serde", "serde"]
 serializer_bincode = ["bincode"]
 serializer_bincode_serde = ["bincode", "bincode/serde", "serde"]
 protocol_tcp = ["tokio/net"]
-protocol_udp = ["tokio/net", "tokio/time", "dashmap"]
+protocol_udp = ["tokio/net", "tokio/time", "dep:blake3", "dep:getrandom"]
 client = []
 server = []
 

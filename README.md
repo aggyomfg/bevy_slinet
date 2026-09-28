@@ -9,7 +9,7 @@ A simple networking plugin for bevy.
 ## Features
 
 - You can choose TCP or UDP protocol. Adding your own protocols is as easy as implementing a few traits.
-  UDP sends one packet per datagram: delivery is unreliable and unordered. A one-byte data tag allows empty payloads; the serialized payload limit is 65506 bytes, and packets the OS refuses to send are dropped. Serializers must decode packets independently, including after malformed input. Clients connect only after the server answers their probe. UDP peers exchange keep-alives, close connections that stay silent for `UdpIdleTimeout` (10 s by default), and notify each other on disconnect. This wire format is incompatible with older UDP framing; update both peers together. Server keep-alives and disconnect notifications share a response budget; without credit, closure is detected by timeout. Large datagrams may be fragmented or rejected by the OS. The current protocol has no session identifiers or address validation, so delayed packets can affect a new connection reusing the same address. Per-peer UDP queue limits do not bound the downstream ECS queues or total connection count.
+  UDP preserves packet boundaries and supports empty payloads. Delivery is unreliable and unordered; serializers must decode packets independently. A cookie handshake validates return addresses before allocating connections, and session identifiers isolate reconnects. See [UDP configuration](#udp-configuration) for limits and heartbeat settings.
 - Multiple clients/servers with different configs (specifies a protocol, packet types, serializer, etc.)
 - De/serialization. You choose a serialization format, packet type (you probably want it to be `enum`), and receive events with deserialized packets.
 
@@ -49,3 +49,39 @@ UDP drops newly received packets when the ECS queue is full. TCP waits for space
 `EcsConnection::send` returns `TrySendError::Full(packet)` on outgoing overflow and
 `TrySendError::Closed(packet)` after disconnection. Connection requests also have
 a bounded queue; excess requests are rejected with a log message.
+
+
+## UDP configuration
+
+`UdpProtocol` uses these defaults: 1024 peers per listener, 256 handshake packets
+per second, 1200 bytes per outgoing data datagram (including a 37-byte header),
+and a one-second heartbeat interval with up to 100 ms of jitter. Recent outgoing
+application traffic suppresses heartbeats. Server heartbeats and disconnects
+share a response budget. A peer that misses close notifications detects closure
+through `UdpIdleTimeout` (10 seconds by default).
+
+To customize settings, implement `protocols::udp::UdpConfig` with an `OPTIONS`
+constant and select `ConfiguredUdpProtocol<YourConfig>` as the client/server
+protocol. See [the UDP example](examples/hello_world_udp.rs). Allow several
+heartbeat intervals, including jitter, when choosing `UdpIdleTimeout`. Timeout
+updates wake pending reads and apply to the time of the last valid datagram.
+
+The 1200-byte default leaves 1163 bytes for the serialized payload; it is a
+configurable starting point, not path-MTU discovery. Oversized packets and
+socket send failures are dropped and logged. The low-level `UdpWriteHalf` exposes
+`dropped_oversized_packets()` and `dropped_send_errors()` counters. `MaxPacketSize`
+limits received payloads, excluding the session header. The transport ceiling is
+65507 bytes including the header; large datagrams may fragment or fail to send.
+
+The SLN2 wire format replaces the previous empty-probe/tag-only format. Upgrade
+both endpoints together. The handshake exchanges a padded HELLO, an address-bound
+BLAKE3 cookie, a CONFIRM, and an ACCEPT. Challenges are stateless and cookies expire
+within 60 seconds. Peer limits also count accepted and superseded streams until
+their read side is released. Control replies use nonblocking sends; retries recover
+lost handshake replies. All data, heartbeat and disconnect packets carry a session
+identifier. Older confirmations cannot replace a newer active session.
+
+Cookies validate reachability; they do not authenticate users or encrypt payloads.
+An on-path observer can still see and forge session traffic. The protocol does not
+provide application packet retransmission, ordering, or congestion control; applications
+must limit their send rate to what the network can sustain.

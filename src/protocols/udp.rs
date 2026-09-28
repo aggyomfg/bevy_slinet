@@ -1,81 +1,126 @@
-//! UDP protocol implementation based on [`tokio::net`]. You can enable it by adding `protocol_udp` feature.
+//! UDP transport with one application packet per versioned, session-tagged datagram.
 //!
-//! Every packet is sent as exactly one datagram, without a length prefix. Data datagrams contain
-//! a `1` byte followed by the serialized payload, which may be empty. The payload must fit in
-//! [`MAX_DATAGRAM_SIZE`] minus one byte (65,506 bytes); larger packets are dropped, as are
-//! packets the OS refuses to send. `MaxPacketSize` limits the payload, excluding the tag.
-//! The config's `LengthSerializer` is not used. Datagrams larger than the path MTU (about
-//! 1,472 bytes of payload on typical networks) may be fragmented or rejected by the OS.
-//! Losing any fragment loses the whole packet; prefer small application packets.
+//! Delivery is unreliable and unordered. Serializers must decode packets independently,
+//! including after malformed input. `LengthSerializer` is unused; empty payloads are supported.
+//! The SLN2 handshake validates the return address with a short-lived stateless cookie before
+//! allocating a peer. Cookies do not authenticate users or encrypt traffic. All data and control
+//! packets carry a session identifier, so delayed packets cannot affect a replacement session.
+//! Both peers must use the same wire version; older UDP framing is incompatible.
 //!
-//! Delivery is unreliable and unordered: packets may be lost, duplicated or reordered.
-//! A lost or malformed datagram does not affect the framing of other packets. Serializers
-//! must decode each datagram independently and remain usable after a decoding error.
-//! Serializers that depend on previous packets, such as the example `CustomCryptEngine`
-//! stream cipher, are not suitable for UDP.
-//!
-//! An empty datagram is a connection probe. The server answers every probe with an empty
-//! datagram, and [`UdpClientStream::connect`] resends its probe every [`PROBE_INTERVAL`] until
-//! it gets an answer or [`CONNECT_TIMEOUT`] passes. Only probes open server connections; other
-//! datagrams from unknown peers are answered with a disconnect.
-//!
-//! Clients send a `2` keep-alive datagram every [`KEEPALIVE_INTERVAL`]. The server sends one per
-//! interval only if the client sent something in that interval. Server keep-alives and
-//! disconnects share a bounded response budget, so service traffic is not amplified.
-//! Both sides close the connection after [`UdpIdleTimeout`] without any datagrams from
-//! the other side. A closing peer sends several `3` disconnect datagrams,
-//! subject to that response budget on the server. If no notification arrives, the peer
-//! detects closure through its idle timeout. There is no session identifier or address
-//! validation: delayed packets can cross reconnects that reuse the same address.
+//! [`UdpProtocol`] uses default options. Use [`ConfiguredUdpProtocol`] and [`UdpConfig`] for
+//! per-plugin limits. [`UdpIdleTimeout`] controls liveness in each Bevy app. Control replies
+//! never wait for socket writability; lost replies are recovered by retries or idle timeouts.
 
-use std::fmt::Debug;
-use std::io;
-use std::io::ErrorKind;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
-use std::time::Duration;
-
-use async_trait::async_trait;
-use bevy::log;
-use bevy::platform::time::Instant;
-use bevy::prelude::Resource;
-use dashmap::DashMap;
-use tokio::net::UdpSocket;
-use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{mpsc, oneshot, watch};
-use tokio::time::MissedTickBehavior;
-
+mod wire;
 use crate::connection::MAX_PACKET_SIZE;
 use crate::protocol::{
     ClientStream, Listener, NetworkStream, ReadStream, ReceiveError, ServerStream, WriteStream,
 };
 use crate::serializer::Serializer;
 use crate::{PacketLengthSerializer, Protocol};
+use async_trait::async_trait;
+use bevy::{log, platform::time::Instant, prelude::Resource};
+use std::collections::HashMap;
+use std::fmt::Debug;
+use std::io::{self, ErrorKind};
+use std::marker::PhantomData;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
+use tokio::net::UdpSocket;
+use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
+use tokio::time::{Instant as Clock, MissedTickBehavior};
+use tokio_util::sync::CancellationToken;
+use wire::*;
 
 const BUFFER_SIZE: usize = u16::MAX as usize;
-/// The largest UDP payload that can be sent over IPv4.
+/// Absolute UDP datagram ceiling supported on both IPv4 and IPv6.
 pub const MAX_DATAGRAM_SIZE: usize = 65_507;
-const DATA_DATAGRAM: u8 = 1;
-const KEEPALIVE_DATAGRAM: u8 = 2;
-const DISCONNECT_DATAGRAM: u8 = 3;
-/// Disconnect datagrams are repeated because any of them may be lost.
-const DISCONNECT_REPEATS: usize = 3;
-/// How often each peer sends a keep-alive datagram.
+/// Default heartbeat interval.
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
-/// How often [`UdpClientStream::connect`] resends its probe until the server answers.
+/// Retry interval for both handshake legs.
 pub const PROBE_INTERVAL: Duration = Duration::from_millis(250);
-/// How long [`UdpClientStream::connect`] waits for the server to answer.
+/// Total timeout for the cookie handshake.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// Datagrams received from a peer beyond this many unread ones are dropped.
+const DISCONNECT_REPEATS: usize = 3;
 const MAX_QUEUED_DATAGRAMS: usize = 1024;
-/// Datagrams that would push a peer's unread bytes above this limit are dropped.
 const MAX_QUEUED_BYTES: usize = 1 << 20;
 
+/// UDP admission, outgoing packet size and heartbeat settings.
+#[derive(Clone, Copy, Debug)]
+pub struct UdpOptions {
+    /// Maximum registered peers, including accepted streams waiting to be split.
+    pub max_peers: usize,
+    /// Maximum HELLO/CONFIRM packets handled per second, shared by all addresses.
+    pub max_handshake_packets_per_second: usize,
+    /// Maximum outgoing data datagram size, including the 37-byte session header.
+    /// Defaults to 1200 bytes. Configure this for the path MTU; it is not PMTU discovery.
+    pub max_datagram_size: usize,
+    /// Heartbeat interval while no application data is being sent.
+    pub heartbeat_interval: Duration,
+    /// Additional random delay in [0, heartbeat_jitter] for each heartbeat tick.
+    pub heartbeat_jitter: Duration,
+}
+impl UdpOptions {
+    /// Default UDP settings.
+    pub const DEFAULT: Self = Self {
+        max_peers: 1024,
+        max_handshake_packets_per_second: 256,
+        max_datagram_size: 1200,
+        heartbeat_interval: KEEPALIVE_INTERVAL,
+        heartbeat_jitter: Duration::from_millis(100),
+    };
+    fn validate(self) -> io::Result<Self> {
+        let delay = self.heartbeat_interval.checked_add(self.heartbeat_jitter);
+        if !(HEADER..=MAX_DATAGRAM_SIZE).contains(&self.max_datagram_size)
+            || self.max_peers > Semaphore::MAX_PERMITS
+            || self.heartbeat_interval.is_zero()
+            || delay
+                .and_then(|value| Clock::now().checked_add(value))
+                .is_none()
+        {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "invalid UDP size or heartbeat settings",
+            ));
+        }
+        Ok(self)
+    }
+}
+impl Default for UdpOptions {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// Supplies UDP options for one protocol/plugin configuration.
+pub trait UdpConfig: Send + Sync + 'static {
+    /// Options used when binding or connecting.
+    const OPTIONS: UdpOptions = UdpOptions::DEFAULT;
+}
+/// Default UDP configuration.
+pub struct DefaultUdpConfig;
+impl UdpConfig for DefaultUdpConfig {}
+/// UDP protocol with custom settings.
+pub struct ConfiguredUdpProtocol<C: UdpConfig>(PhantomData<C>);
+/// UDP protocol with the default settings.
+pub type UdpProtocol = ConfiguredUdpProtocol<DefaultUdpConfig>;
+
+#[async_trait]
+impl<C: UdpConfig> Protocol for ConfiguredUdpProtocol<C> {
+    type Listener = UdpNetworkListener;
+    type ServerStream = UdpServerStream;
+    type ClientStream = ConfiguredUdpClientStream<C>;
+    const DATAGRAM: bool = true;
+    async fn bind(addr: SocketAddr) -> io::Result<Self::Listener> {
+        UdpNetworkListener::bind(addr, C::OPTIONS).await
+    }
+}
 /// Closes a UDP connection when no datagrams arrive from the peer for this long.
-/// Must be longer than [`KEEPALIVE_INTERVAL`]; `Duration::MAX` disables it. Defaults to 10 seconds.
-/// Applies only to connections in this Bevy app. Changes take effect on the next receive,
-/// including after a keep-alive. Removing the resource restores the default.
+/// Allow several heartbeat intervals (including jitter); `Duration::MAX` disables it.
+/// Defaults to 10 seconds. Applies only to this Bevy app. Changes wake pending reads;
+/// the deadline is measured from the last valid datagram. Removing the resource restores the default.
 #[derive(Clone, Copy, Debug, Resource)]
 pub struct UdpIdleTimeout(pub Duration);
 
@@ -119,235 +164,255 @@ pub(crate) fn set_idle_timeout_system(
         if *current == timeout {
             return false;
         }
-        if timeout <= KEEPALIVE_INTERVAL {
-            log::warn!(
-                "UdpIdleTimeout ({timeout:?}) must be longer than the keep-alive interval ({KEEPALIVE_INTERVAL:?}), otherwise idle connections close"
-            );
+        if timeout.is_zero() {
+            log::warn!("UdpIdleTimeout is zero; connections expire immediately");
         }
         *current = timeout;
         true
     });
 }
 
-fn idle_error<E, LS>() -> ReceiveError<E, LS>
-where
-    E: std::error::Error + Send + Sync,
-    LS: PacketLengthSerializer,
-{
-    ReceiveError::Io(io::Error::new(
-        ErrorKind::TimedOut,
-        "no datagrams from the UDP peer",
-    ))
-}
-
-async fn send_datagram(
-    socket: &UdpSocket,
-    peer_addr: Option<SocketAddr>,
-    datagram: &[u8],
-) -> io::Result<usize> {
-    match peer_addr {
-        Some(addr) => socket.send_to(datagram, addr).await,
-        None => socket.send(datagram).await,
-    }
-}
-
-/// Sends keep-alive datagrams until the returned sender is dropped, then disconnect datagrams.
-/// With `peer`, a keep-alive is sent only if a datagram arrived from it since the previous one,
-/// so spoofed probes are not amplified.
-fn spawn_keepalive(
-    socket: Arc<UdpSocket>,
-    peer_addr: Option<SocketAddr>,
-    peer: Option<Arc<PeerState>>,
-) -> oneshot::Sender<()> {
-    let (stop, mut stopped) = oneshot::channel();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(KEEPALIVE_INTERVAL);
-        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        loop {
-            tokio::select! {
-                biased;
-                _ = &mut stopped => break,
-                _ = interval.tick() => {
-                    if peer.as_ref().is_some_and(|peer| {
-                        !peer.seen.swap(false, Ordering::Relaxed) || !peer.take_response_credit()
-                    }) {
-                        continue;
-                    }
-                    // Errors are reported to the read half or end in an idle timeout.
-                    let _ = send_datagram(&socket, peer_addr, &[KEEPALIVE_DATAGRAM]).await;
-                }
-            }
-        }
-        for _ in 0..DISCONNECT_REPEATS {
-            if peer
-                .as_ref()
-                .is_some_and(|peer| !peer.take_response_credit())
-            {
-                break;
-            }
-            let _ = send_datagram(&socket, peer_addr, &[DISCONNECT_DATAGRAM]).await;
-        }
-    });
-    stop
-}
-
-/// UDP protocol.
-pub struct UdpProtocol;
-
-#[async_trait]
-impl Protocol for UdpProtocol {
-    type Listener = UdpNetworkListener;
-    type ServerStream = UdpServerStream;
-    type ClientStream = UdpClientStream;
-
-    const DATAGRAM: bool = true;
-
-    async fn bind(addr: SocketAddr) -> std::io::Result<Self::Listener> {
-        Ok(UdpNetworkListener {
-            socket: Arc::new(UdpSocket::bind(addr).await?),
-            tasks: Arc::new(DashMap::new()),
-        })
-    }
-}
-
 type Queued = (Box<[u8]>, Instant);
+type Peers = Mutex<HashMap<SocketAddr, Peer>>;
 
-#[derive(Default)]
-struct PeerState {
+struct SessionState {
+    id: Session,
+    generation: u64,
+    options: UdpOptions,
     queued_bytes: AtomicUsize,
-    /// Set for every valid non-probe datagram, cleared by each keep-alive tick.
     seen: AtomicBool,
     response_credits: AtomicUsize,
+    last_received: Mutex<Clock>,
+    last_sent: Mutex<Clock>,
+    dropped_oversized: AtomicUsize,
+    dropped_send_errors: AtomicUsize,
+    closed: CancellationToken,
 }
-
-impl PeerState {
-    fn take_response_credit(&self) -> bool {
+impl SessionState {
+    fn new(cookie: Cookie, options: UdpOptions) -> Arc<Self> {
+        Arc::new(Self {
+            id: cookie.mac,
+            generation: cookie.generation,
+            options,
+            queued_bytes: AtomicUsize::new(0),
+            seen: AtomicBool::new(false),
+            response_credits: AtomicUsize::new(0),
+            last_received: Mutex::new(Clock::now()),
+            last_sent: Mutex::new(Clock::now()),
+            dropped_oversized: AtomicUsize::new(0),
+            dropped_send_errors: AtomicUsize::new(0),
+            closed: CancellationToken::new(),
+        })
+    }
+    fn received(&self) {
+        *self.last_received.lock().unwrap() = Clock::now();
+        self.seen.store(true, Ordering::Relaxed);
+        let _ =
+            self.response_credits
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |credit| {
+                    Some((credit + 1).min(DISCONNECT_REPEATS + 1))
+                });
+    }
+    fn take_credit(&self) -> bool {
         self.response_credits
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |credits| {
-                credits.checked_sub(1)
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |credit| {
+                credit.checked_sub(1)
             })
             .is_ok()
     }
 }
 
-// Cleanup belongs to this particular queue, never just to a reused socket address.
-struct PeerRegistration {
-    tasks: Weak<DashMap<SocketAddr, Peer>>,
-    address: SocketAddr,
-    state: Arc<PeerState>,
-}
-
-impl Drop for PeerRegistration {
-    fn drop(&mut self) {
-        if let Some(tasks) = self.tasks.upgrade() {
-            tasks.remove_if(&self.address, |_, peer| {
-                Arc::ptr_eq(&peer.state, &self.state)
-            });
-        }
-    }
-}
-
-/// The listener's end of a server connection's datagram queue.
 struct Peer {
     queue: mpsc::Sender<Queued>,
-    state: Arc<PeerState>,
+    state: Arc<SessionState>,
 }
-
 impl Peer {
-    fn new() -> (Self, mpsc::Receiver<Queued>) {
-        let (queue, incoming) = mpsc::channel(MAX_QUEUED_DATAGRAMS);
-        let peer = Peer {
-            queue,
-            state: Arc::default(),
-        };
-        (peer, incoming)
-    }
-
-    /// Returns `false` if the connection's read half is gone.
-    fn push(&self, datagram: &[u8], received_at: Instant) -> bool {
-        let len = datagram.len();
-        if !valid_datagram(datagram) {
-            return !self.queue.is_closed();
+    fn push(&self, bytes: &[u8], received_at: Instant) {
+        if self.state.queued_bytes.load(Ordering::Relaxed) + bytes.len() > MAX_QUEUED_BYTES {
+            return;
         }
-        let delivered = if self.state.queued_bytes.load(Ordering::Relaxed) + len > MAX_QUEUED_BYTES
-        {
-            !self.queue.is_closed()
-        } else {
-            match self.queue.try_reserve() {
-                Ok(permit) => {
-                    self.state.queued_bytes.fetch_add(len, Ordering::Relaxed);
-                    permit.send((datagram.into(), received_at));
-                    true
-                }
-                Err(err) => matches!(err, TrySendError::Full(_)),
-            }
-        };
-        if delivered {
-            // A closed queue is answered by the listener; do not also credit its old task.
-            let _ = self.state.response_credits.fetch_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |credits| Some((credits + 1).min(DISCONNECT_REPEATS + 1)),
-            );
-            self.state.seen.store(true, Ordering::Relaxed);
-        }
-        delivered
-    }
-}
-
-enum Incoming {
-    Queue {
-        queue: mpsc::Receiver<Queued>,
-        state: Arc<PeerState>,
-        current: Box<[u8]>,
-        _registration: Option<PeerRegistration>,
-    },
-    Socket {
-        socket: Arc<UdpSocket>,
-        buffer: Box<[u8]>,
-    },
-}
-
-impl Incoming {
-    async fn next(&mut self) -> io::Result<(&[u8], Instant)> {
-        match self {
-            Incoming::Queue {
-                queue,
-                state,
-                current,
-                ..
-            } => {
-                let (datagram, received_at) = queue.recv().await.ok_or_else(disconnected_error)?;
-                state
-                    .queued_bytes
-                    .fetch_sub(datagram.len(), Ordering::Relaxed);
-                *current = datagram;
-                Ok((current, received_at))
-            }
-            Incoming::Socket { socket, buffer } => {
-                let len = socket.recv(buffer).await?;
-                Ok((&buffer[..len], Instant::now()))
-            }
+        if let Ok(permit) = self.queue.try_reserve() {
+            self.state
+                .queued_bytes
+                .fetch_add(bytes.len(), Ordering::Relaxed);
+            permit.send((bytes.into(), received_at));
         }
     }
 }
 
-/// A UDP listener.
+struct PeerRegistration {
+    _slot: OwnedSemaphorePermit,
+    peers: Weak<Peers>,
+    address: SocketAddr,
+    state: Arc<SessionState>,
+}
+impl Drop for PeerRegistration {
+    fn drop(&mut self) {
+        if let Some(peers) = self.peers.upgrade() {
+            let mut peers = peers.lock().unwrap();
+            if peers
+                .get(&self.address)
+                .is_some_and(|peer| Arc::ptr_eq(&peer.state, &self.state))
+            {
+                peers.remove(&self.address);
+            }
+        }
+        self.state.closed.cancel();
+    }
+}
+
+struct Admission {
+    started: Clock,
+    used: usize,
+}
+impl Admission {
+    fn take(&mut self, limit: usize) -> bool {
+        if self.started.elapsed() >= Duration::from_secs(1) {
+            self.started = Clock::now();
+            self.used = 0;
+        }
+        if self.used >= limit {
+            return false;
+        }
+        self.used += 1;
+        true
+    }
+}
+
+/// A shared UDP socket that routes packets to validated sessions.
 pub struct UdpNetworkListener {
     socket: Arc<UdpSocket>,
-    tasks: Arc<DashMap<SocketAddr, Peer>>,
+    peers: Arc<Peers>,
+    cookies: CookieJar,
+    options: UdpOptions,
+    admission: Mutex<Admission>,
+    slots: Arc<Semaphore>,
 }
+impl UdpNetworkListener {
+    async fn bind(address: SocketAddr, options: UdpOptions) -> io::Result<Self> {
+        let options = options.validate()?;
+        Ok(Self {
+            slots: Arc::new(Semaphore::new(options.max_peers)),
+            socket: Arc::new(UdpSocket::bind(address).await?),
+            peers: Arc::default(),
+            cookies: CookieJar::new()?,
+            options,
+            admission: Mutex::new(Admission {
+                started: Clock::now(),
+                used: 0,
+            }),
+        })
+    }
 
+    // Synchronous dispatch keeps all control sends out of the socket receive wait path.
+    fn dispatch(
+        &self,
+        bytes: &[u8],
+        address: SocketAddr,
+        received_at: Instant,
+    ) -> Option<UdpServerStream> {
+        if let Some((tag, cookie)) = Cookie::parse(bytes) {
+            if !matches!(tag, HELLO | CONFIRM)
+                || !self
+                    .admission
+                    .lock()
+                    .unwrap()
+                    .take(self.options.max_handshake_packets_per_second)
+            {
+                return None;
+            }
+            if tag == HELLO {
+                let challenge = self.cookies.issue(address, cookie.nonce).encode(CHALLENGE);
+                let _ = self.socket.try_send_to(&challenge, address);
+                return None;
+            }
+            let mut peers = self.peers.lock().unwrap();
+            if let Some(peer) = peers.get(&address) {
+                if peer.state.id == cookie.mac {
+                    let reply = if peer.state.closed.is_cancelled() {
+                        DISCONNECT
+                    } else {
+                        ACCEPT
+                    };
+                    let _ = self
+                        .socket
+                        .try_send_to(&control(reply, &cookie.mac), address);
+                    return None;
+                }
+                // A delayed confirmation must not replace a newer session.
+                if cookie.generation <= peer.state.generation {
+                    return None;
+                }
+            }
+            if !self.cookies.verify(address, &cookie) {
+                return None;
+            }
+            let Ok(slot) = Arc::clone(&self.slots).try_acquire_owned() else {
+                let _ = self
+                    .socket
+                    .try_send_to(&control(DISCONNECT, &cookie.mac), address);
+                return None;
+            };
+            let state = SessionState::new(cookie, self.options);
+            let (queue, incoming) = mpsc::channel(MAX_QUEUED_DATAGRAMS);
+            if let Some(old) = peers.insert(
+                address,
+                Peer {
+                    queue,
+                    state: Arc::clone(&state),
+                },
+            ) {
+                old.state.closed.cancel();
+            }
+            let _ = self
+                .socket
+                .try_send_to(&control(ACCEPT, &state.id), address);
+            return Some(UdpServerStream {
+                registration: PeerRegistration {
+                    _slot: slot,
+                    peers: Arc::downgrade(&self.peers),
+                    address,
+                    state: Arc::clone(&state),
+                },
+                incoming,
+                state,
+                peer_addr: address,
+                socket: Arc::clone(&self.socket),
+            });
+        }
+        if let Some((tag, session, _)) = parse_frame(bytes) {
+            if tag == ACCEPT {
+                return None;
+            }
+            let peers = self.peers.lock().unwrap();
+            match peers.get(&address).filter(|peer| peer.state.id == session) {
+                Some(peer) => {
+                    peer.state.received();
+                    match tag {
+                        DISCONNECT => peer.state.closed.cancel(),
+                        DATA => peer.push(bytes, received_at),
+                        _ => {}
+                    }
+                }
+                None if tag != DISCONNECT => {
+                    let _ = self
+                        .socket
+                        .try_send_to(&control(DISCONNECT, &session), address);
+                }
+                None => {}
+            }
+        }
+        None
+    }
+}
 #[async_trait]
 impl Listener for UdpNetworkListener {
     type Stream = UdpServerStream;
-
-    async fn accept(&self) -> std::io::Result<UdpServerStream> {
-        let mut buf = [0; BUFFER_SIZE];
+    async fn accept(&self) -> io::Result<Self::Stream> {
+        let mut buffer = vec![0; BUFFER_SIZE];
         loop {
-            let (len, address) = match self.socket.recv_from(&mut buf).await {
-                Ok(received) => received,
-                // Windows reports ICMP "port unreachable" for an earlier `send_to` here.
+            let (len, address) = match self.socket.recv_from(&mut buffer).await {
+                Ok(value) => value,
                 Err(err)
                     if matches!(
                         err.kind(),
@@ -358,1229 +423,445 @@ impl Listener for UdpNetworkListener {
                 }
                 Err(err) => return Err(err),
             };
-            let received_at = Instant::now();
-            let datagram = &buf[..len];
-            let delivered = self
-                .tasks
-                .get(&address)
-                .map(|peer| peer.push(datagram, received_at));
-            if delivered == Some(false) {
-                self.tasks
-                    .remove_if(&address, |_, peer| peer.queue.is_closed());
-            }
-            if datagram.is_empty() {
-                // Answered before the connection exists, so a cancelled `accept` loses only the probe.
-                let _ = self.socket.send_to(&[], address).await;
-                if delivered != Some(true) {
-                    let (peer, incoming) = Peer::new();
-                    let state = Arc::clone(&peer.state);
-                    self.tasks.insert(address, peer);
-                    return Ok(UdpServerStream {
-                        incoming,
-                        registration: PeerRegistration {
-                            tasks: Arc::downgrade(&self.tasks),
-                            address,
-                            state: Arc::clone(&state),
-                        },
-                        state,
-                        peer_addr: address,
-                        socket: Arc::clone(&self.socket),
-                    });
-                }
-            } else if delivered != Some(true) && datagram[0] != DISCONNECT_DATAGRAM {
-                // Tells peers of closed connections to stop. The answer is never larger.
-                let _ = self.socket.send_to(&[DISCONNECT_DATAGRAM], address).await;
+            if let Some(stream) = self.dispatch(&buffer[..len], address, Instant::now()) {
+                return Ok(stream);
             }
         }
     }
-
     fn address(&self) -> SocketAddr {
         self.socket.local_addr().unwrap()
     }
-
-    // The address-only callback cannot distinguish successive connections.
-    // PeerRegistration removes the exact entry when its read half is dropped.
 }
 
-/// A server-side UDP connection that reads the datagrams queued by [`UdpNetworkListener`].
+enum Incoming {
+    Queue {
+        queue: mpsc::Receiver<Queued>,
+        current: Box<[u8]>,
+        _registration: PeerRegistration,
+    },
+    Socket {
+        socket: Arc<UdpSocket>,
+        buffer: Box<[u8]>,
+    },
+}
+impl Incoming {
+    async fn next(&mut self, state: &SessionState) -> io::Result<(&[u8], Instant)> {
+        match self {
+            Self::Queue { queue, current, .. } => {
+                let (bytes, received_at) = queue.recv().await.ok_or_else(disconnected_error)?;
+                state.queued_bytes.fetch_sub(bytes.len(), Ordering::Relaxed);
+                *current = bytes;
+                Ok((current, received_at))
+            }
+            Self::Socket { socket, buffer } => {
+                let len = socket.recv(buffer).await?;
+                Ok((&buffer[..len], Instant::now()))
+            }
+        }
+    }
+}
+
+fn try_control(socket: &UdpSocket, address: Option<SocketAddr>, tag: u8, state: &SessionState) {
+    let bytes = control(tag, &state.id);
+    let result = match address {
+        Some(addr) => socket.try_send_to(&bytes, addr),
+        None => socket.try_send(&bytes),
+    };
+    if result.is_ok() {
+        *state.last_sent.lock().unwrap() = Clock::now();
+    }
+}
+
+fn heartbeat_delay(options: UdpOptions, random: &mut u64) -> Duration {
+    // Timing jitter only; handshake secrets always come from the OS RNG.
+    *random ^= *random << 13;
+    *random ^= *random >> 7;
+    *random ^= *random << 17;
+    options.heartbeat_interval
+        + options
+            .heartbeat_jitter
+            .mul_f64((*random >> 11) as f64 / (1u64 << 53) as f64)
+}
+
+fn spawn_keepalive(socket: Arc<UdpSocket>, address: Option<SocketAddr>, state: Arc<SessionState>) {
+    tokio::spawn(async move {
+        let mut random = u64::from_le_bytes(state.id[..8].try_into().unwrap()) | 1;
+        loop {
+            let delay = heartbeat_delay(state.options, &mut random);
+            tokio::select! {
+                biased;
+                _ = state.closed.cancelled() => break,
+                _ = tokio::time::sleep(delay) => {
+                    if state.last_sent.lock().unwrap().elapsed() < state.options.heartbeat_interval { continue; }
+                    if address.is_some() && (!state.seen.swap(false, Ordering::Relaxed) || !state.take_credit()) { continue; }
+                    try_control(&socket, address, KEEPALIVE, &state);
+                }
+            }
+        }
+        for _ in 0..DISCONNECT_REPEATS {
+            if address.is_some() && !state.take_credit() {
+                break;
+            }
+            try_control(&socket, address, DISCONNECT, &state);
+        }
+    });
+}
+
+/// Accepted UDP session.
 pub struct UdpServerStream {
     registration: PeerRegistration,
     incoming: mpsc::Receiver<Queued>,
-    state: Arc<PeerState>,
+    state: Arc<SessionState>,
     peer_addr: SocketAddr,
     socket: Arc<UdpSocket>,
 }
-
 #[async_trait]
 impl NetworkStream for UdpServerStream {
     type ReadHalf = UdpServerReadHalf;
     type WriteHalf = UdpServerWriteHalf;
-
     async fn into_split(self) -> io::Result<(Self::ReadHalf, Self::WriteHalf)> {
-        let peer_addr = Some(self.peer_addr);
-        let keepalive = spawn_keepalive(
-            Arc::clone(&self.socket),
-            peer_addr,
-            Some(Arc::clone(&self.state)),
-        );
         let incoming = Incoming::Queue {
             queue: self.incoming,
-            state: self.state,
             current: Box::default(),
-            _registration: Some(self.registration),
+            _registration: self.registration,
         };
-        Ok((
-            UdpReadHalf::new(incoming, keepalive),
-            UdpWriteHalf {
-                socket: self.socket,
-                peer_addr,
-            },
+        Ok(split(
+            incoming,
+            self.socket,
+            Some(self.peer_addr),
+            self.state,
         ))
     }
-
     fn peer_addr(&self) -> SocketAddr {
         self.peer_addr
     }
-
     fn local_addr(&self) -> SocketAddr {
         self.socket.local_addr().unwrap()
     }
 }
-
-/// The read half of a UDP connection.
-pub struct UdpReadHalf {
-    incoming: Incoming,
-    idle_timeout: watch::Receiver<Duration>,
-    _keepalive: oneshot::Sender<()>,
-}
-
-/// The read half of [`UdpServerStream`].
-pub type UdpServerReadHalf = UdpReadHalf;
-/// The read half of [`UdpClientStream`].
-pub type UdpClientReadHalf = UdpReadHalf;
-
-impl UdpReadHalf {
-    fn new(incoming: Incoming, keepalive: oneshot::Sender<()>) -> Self {
-        UdpReadHalf {
-            incoming,
-            idle_timeout: watch::channel(UdpIdleTimeout::default().0).1,
-            _keepalive: keepalive,
-        }
-    }
-}
-
-#[async_trait]
-impl ReadStream for UdpReadHalf {
-    fn set_idle_timeout(&mut self, timeout: watch::Receiver<Duration>) {
-        self.idle_timeout = timeout;
-    }
-
-    async fn read_exact(&mut self, _buffer: &mut [u8]) -> io::Result<()> {
-        Err(datagram_only_error())
-    }
-
-    async fn receive<ReceivingPacket, SendingPacket, S, LS>(
-        &mut self,
-        serializer: Arc<S>,
-        length_serializer: &LS,
-    ) -> Result<ReceivingPacket, ReceiveError<S::DecodeError, LS>>
-    where
-        ReceivingPacket: Send + Sync + Debug + 'static,
-        SendingPacket: Send + Sync + Debug + 'static,
-        S: Serializer<ReceivingPacket, SendingPacket> + ?Sized,
-        LS: PacketLengthSerializer,
-    {
-        self.receive_with_timestamp(serializer, length_serializer)
-            .await
-            .map(|(packet, _)| packet)
-    }
-
-    async fn receive_with_timestamp<ReceivingPacket, SendingPacket, S, LS>(
-        &mut self,
-        serializer: Arc<S>,
-        _length_serializer: &LS,
-    ) -> Result<(ReceivingPacket, Instant), ReceiveError<S::DecodeError, LS>>
-    where
-        ReceivingPacket: Send + Sync + Debug + 'static,
-        SendingPacket: Send + Sync + Debug + 'static,
-        S: Serializer<ReceivingPacket, SendingPacket> + ?Sized,
-        LS: PacketLengthSerializer,
-    {
-        loop {
-            let idle_timeout = *self.idle_timeout.borrow();
-            let (datagram, received_at) = tokio::time::timeout(idle_timeout, self.incoming.next())
-                .await
-                .map_err(|_| idle_error())?
-                .map_err(ReceiveError::Io)?;
-            if let Some(packet) = decode_datagram(
-                datagram,
-                &*serializer,
-                MAX_PACKET_SIZE.load(Ordering::Relaxed),
-            )
-            .map_err(ReceiveError::Io)?
-            {
-                return Ok((packet, received_at));
-            }
-        }
-    }
-}
-
-/// The write half of a UDP connection.
-pub struct UdpWriteHalf {
-    socket: Arc<UdpSocket>,
-    /// `None` for connected client sockets.
-    peer_addr: Option<SocketAddr>,
-}
-
-/// The write half of [`UdpServerStream`].
-pub type UdpServerWriteHalf = UdpWriteHalf;
-/// The write half of [`UdpClientStream`].
-pub type UdpClientWriteHalf = UdpWriteHalf;
-
-#[async_trait]
-impl WriteStream for UdpWriteHalf {
-    async fn write_all(&mut self, buffer: &[u8]) -> std::io::Result<()> {
-        send_datagram(&self.socket, self.peer_addr, buffer)
-            .await
-            .and_then(|i| assert_all(i, buffer))
-    }
-
-    async fn send<ReceivingPacket, SendingPacket, S, LS>(
-        &mut self,
-        packet: SendingPacket,
-        serializer: Arc<S>,
-        _length_serializer: &LS,
-    ) -> io::Result<()>
-    where
-        ReceivingPacket: Send + Sync + Debug + 'static,
-        SendingPacket: Send + Sync + Debug + 'static,
-        S: Serializer<ReceivingPacket, SendingPacket> + ?Sized,
-        LS: PacketLengthSerializer,
-    {
-        match encode_datagram(packet, &*serializer) {
-            Some(datagram) => drop_on_error(self.write_all(&datagram).await, &datagram),
-            None => Ok(()),
-        }
-    }
-}
-
 impl ServerStream for UdpServerStream {}
 
-/// A UDP client stream.
-pub struct UdpClientStream {
+/// Connected UDP session.
+pub struct ConfiguredUdpClientStream<C: UdpConfig> {
+    _config: PhantomData<C>,
     socket: Arc<UdpSocket>,
-    peer_addr: SocketAddr,
+    state: Arc<SessionState>,
 }
+/// Client stream with default UDP settings.
+pub type UdpClientStream = ConfiguredUdpClientStream<DefaultUdpConfig>;
 
+impl<C: UdpConfig> ConfiguredUdpClientStream<C> {
+    async fn connect_with_options(address: SocketAddr, options: UdpOptions) -> io::Result<Self> {
+        let options = options.validate()?;
+        let local: SocketAddr = match address {
+            SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
+            SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
+        };
+        let socket = Arc::new(UdpSocket::bind(local).await?);
+        socket.connect(address).await?;
+        let cookie = tokio::time::timeout(CONNECT_TIMEOUT, handshake(&socket))
+            .await
+            .map_err(|_| io::Error::new(ErrorKind::TimedOut, "UDP handshake timed out"))??;
+        Ok(Self {
+            _config: PhantomData,
+            socket,
+            state: SessionState::new(cookie, options),
+        })
+    }
+}
 #[async_trait]
-impl NetworkStream for UdpClientStream {
+impl<C: UdpConfig> ClientStream for ConfiguredUdpClientStream<C> {
+    async fn connect(addr: SocketAddr) -> io::Result<Self> {
+        Self::connect_with_options(addr, C::OPTIONS).await
+    }
+}
+#[async_trait]
+impl<C: UdpConfig> NetworkStream for ConfiguredUdpClientStream<C> {
     type ReadHalf = UdpClientReadHalf;
     type WriteHalf = UdpClientWriteHalf;
-
     async fn into_split(self) -> io::Result<(Self::ReadHalf, Self::WriteHalf)> {
         let incoming = Incoming::Socket {
             socket: Arc::clone(&self.socket),
             buffer: vec![0; BUFFER_SIZE].into_boxed_slice(),
         };
-        let keepalive = spawn_keepalive(Arc::clone(&self.socket), None, None);
-        let write = UdpWriteHalf {
-            socket: self.socket,
-            peer_addr: None,
-        };
-        Ok((UdpReadHalf::new(incoming, keepalive), write))
+        Ok(split(incoming, self.socket, None, self.state))
     }
-
     fn peer_addr(&self) -> SocketAddr {
-        self.peer_addr
+        self.socket.peer_addr().unwrap()
     }
-
     fn local_addr(&self) -> SocketAddr {
         self.socket.local_addr().unwrap()
     }
 }
 
-#[async_trait]
-impl ClientStream for UdpClientStream {
-    async fn connect(addr: SocketAddr) -> std::io::Result<Self>
-    where
-        Self: Sized,
-    {
-        let local_addr: SocketAddr = match addr {
-            SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
-            SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
-        };
-        let socket = UdpSocket::bind(local_addr).await?;
-        socket.connect(addr).await?;
-        let peer_addr = socket.peer_addr()?;
-        tokio::time::timeout(CONNECT_TIMEOUT, handshake(&socket))
-            .await
-            .map_err(|_| io::Error::new(ErrorKind::TimedOut, "the UDP server did not answer"))??;
-        Ok(UdpClientStream {
-            socket: Arc::new(socket),
-            peer_addr,
-        })
-    }
-}
-
-/// Accepts an empty acknowledgement or a framed early data packet. Data is left
-/// in the socket for the read half; invalid answers are consumed without re-probing.
-async fn handshake(socket: &UdpSocket) -> io::Result<()> {
+async fn handshake(socket: &UdpSocket) -> io::Result<Cookie> {
+    let nonce = random()?;
+    let hello = Cookie::hello(nonce).encode(HELLO);
+    let mut selected: Option<Cookie> = None;
     let mut buffer = vec![0; BUFFER_SIZE];
-    let mut probes = tokio::time::interval(PROBE_INTERVAL);
-    probes.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut retry = tokio::time::interval(PROBE_INTERVAL);
+    retry.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         tokio::select! {
-            _ = probes.tick() => { socket.send(&[]).await?; }
-            answer = socket.peek(&mut buffer) => {
-                let len = answer?;
-                match &buffer[..len] {
-                    [] => {
-                        socket.recv(&mut buffer).await?;
-                        return Ok(());
+            _ = retry.tick() => {
+                let request = selected.map(|cookie| cookie.encode(CONFIRM)).unwrap_or(hello);
+                socket.send(&request).await?;
+            }
+            result = socket.peek(&mut buffer) => {
+                let len = result?;
+                if let Some((tag, cookie)) = Cookie::parse(&buffer[..len]) {
+                    socket.recv(&mut buffer).await?;
+                    if tag == CHALLENGE && cookie.nonce == nonce && selected.is_none_or(|old| cookie.generation > old.generation) {
+                        selected = Some(cookie);
+                        socket.send(&cookie.encode(CONFIRM)).await?;
                     }
-                    [DISCONNECT_DATAGRAM] => {
-                        return Err(io::Error::new(ErrorKind::ConnectionRefused, "the UDP server refused the connection"));
-                    }
-                    [DATA_DATAGRAM, ..] if len <= MAX_DATAGRAM_SIZE => return Ok(()),
-                    _ => { socket.recv(&mut buffer).await?; }
+                    continue;
                 }
+                if let (Some(cookie), Some((tag, session, _))) = (selected, parse_frame(&buffer[..len])) {
+                    if session == cookie.mac {
+                        match tag {
+                            ACCEPT => { socket.recv(&mut buffer).await?; return Ok(cookie); }
+                            DATA => return Ok(cookie), // Preserve early application data for the read half.
+                            DISCONNECT => return Err(io::Error::new(ErrorKind::ConnectionRefused, "UDP connection refused")),
+                            _ => {},
+                        }
+                    }
+                }
+                socket.recv(&mut buffer).await?;
             }
         }
     }
 }
 
-fn valid_datagram(datagram: &[u8]) -> bool {
-    matches!(datagram, [KEEPALIVE_DATAGRAM] | [DISCONNECT_DATAGRAM])
-        || matches!(datagram, [DATA_DATAGRAM, ..] if datagram.len() <= MAX_DATAGRAM_SIZE)
-}
-
-/// UDP send errors (`EMSGSIZE`, `ENOBUFS`, ICMP errors) affect one packet, not the connection.
-fn drop_on_error(result: io::Result<()>, datagram: &[u8]) -> io::Result<()> {
-    if let Err(err) = result {
-        log::warn!("Dropping a {}-byte UDP packet: {err}", datagram.len());
-    }
-    Ok(())
-}
-
-fn assert_all(i: usize, buf: &[u8]) -> io::Result<()> {
-    if i == buf.len() {
-        Ok(())
-    } else {
-        Err(io::Error::from(ErrorKind::BrokenPipe))
-    }
-}
-
-fn datagram_only_error() -> io::Error {
-    io::Error::new(
-        ErrorKind::Unsupported,
-        "UDP streams are datagram-based, use `ReadStream::receive`",
+fn split(
+    incoming: Incoming,
+    socket: Arc<UdpSocket>,
+    address: Option<SocketAddr>,
+    state: Arc<SessionState>,
+) -> (UdpReadHalf, UdpWriteHalf) {
+    spawn_keepalive(Arc::clone(&socket), address, Arc::clone(&state));
+    (
+        UdpReadHalf {
+            incoming,
+            state: Arc::clone(&state),
+            idle_timeout: watch::channel(UdpIdleTimeout::default().0).1,
+            timeout_updates_open: true,
+        },
+        UdpWriteHalf {
+            socket,
+            address,
+            state,
+        },
     )
 }
 
-fn disconnected_error() -> io::Error {
-    io::Error::new(ErrorKind::ConnectionAborted, "the UDP peer disconnected")
+/// Read half of a UDP session; dropping it closes the session and stops heartbeats.
+pub struct UdpReadHalf {
+    incoming: Incoming,
+    state: Arc<SessionState>,
+    idle_timeout: watch::Receiver<Duration>,
+    timeout_updates_open: bool,
+}
+/// Server read half.
+pub type UdpServerReadHalf = UdpReadHalf;
+/// Client read half.
+pub type UdpClientReadHalf = UdpReadHalf;
+impl Drop for UdpReadHalf {
+    fn drop(&mut self) {
+        self.state.closed.cancel();
+    }
 }
 
-/// Returns `Ok(None)` for datagrams that should be dropped without closing the connection.
-fn decode_datagram<ReceivingPacket, SendingPacket, S>(
-    datagram: &[u8],
-    serializer: &S,
-    max_packet_size: usize,
-) -> io::Result<Option<ReceivingPacket>>
-where
-    ReceivingPacket: Send + Sync + Debug + 'static,
-    SendingPacket: Send + Sync + Debug + 'static,
-    S: Serializer<ReceivingPacket, SendingPacket> + ?Sized,
-{
-    let Some((&tag, payload)) = datagram.split_first() else {
-        return Ok(None);
-    };
-    if datagram == [DISCONNECT_DATAGRAM] {
-        return Err(disconnected_error());
+#[async_trait]
+impl ReadStream for UdpReadHalf {
+    fn close(&mut self) {
+        self.state.closed.cancel();
     }
-    if tag != DATA_DATAGRAM || datagram.len() > MAX_DATAGRAM_SIZE {
-        return Ok(None);
+
+    fn set_idle_timeout(&mut self, timeout: watch::Receiver<Duration>) {
+        self.idle_timeout = timeout;
+        self.timeout_updates_open = true;
     }
-    if payload.len() > max_packet_size {
-        log::debug!(
-            "Dropping a {}-byte payload larger than MaxPacketSize",
-            payload.len()
-        );
-        return Ok(None);
+    async fn read_exact(&mut self, _: &mut [u8]) -> io::Result<()> {
+        Err(io::Error::new(
+            ErrorKind::Unsupported,
+            "use ReadStream::receive for UDP",
+        ))
     }
-    match serializer.deserialize(payload) {
-        Ok(packet) => Ok(Some(packet)),
-        Err(err) => {
-            log::debug!("Dropping a malformed datagram: {err}");
-            Ok(None)
+    async fn receive<R, S, Ser, LS>(
+        &mut self,
+        serializer: Arc<Ser>,
+        length: &LS,
+    ) -> Result<R, ReceiveError<Ser::DecodeError, LS>>
+    where
+        R: Send + Sync + Debug + 'static,
+        S: Send + Sync + Debug + 'static,
+        Ser: Serializer<R, S> + ?Sized,
+        LS: PacketLengthSerializer,
+    {
+        self.receive_with_timestamp(serializer, length)
+            .await
+            .map(|(packet, _)| packet)
+    }
+    async fn receive_with_timestamp<R, S, Ser, LS>(
+        &mut self,
+        serializer: Arc<Ser>,
+        _: &LS,
+    ) -> Result<(R, Instant), ReceiveError<Ser::DecodeError, LS>>
+    where
+        R: Send + Sync + Debug + 'static,
+        S: Send + Sync + Debug + 'static,
+        Ser: Serializer<R, S> + ?Sized,
+        LS: PacketLengthSerializer,
+    {
+        loop {
+            let timeout = *self.idle_timeout.borrow();
+            let last = *self.state.last_received.lock().unwrap();
+            let deadline = async {
+                match last.checked_add(timeout) {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            let from_socket = matches!(self.incoming, Incoming::Socket { .. });
+            let (bytes, received_at) = tokio::select! {
+                biased;
+                _ = self.state.closed.cancelled() => return Err(ReceiveError::Io(disconnected_error())),
+                _ = deadline => {
+                    // The listener may have received keepalives while this read waited on its queue.
+                    if *self.state.last_received.lock().unwrap() != last { continue; }
+                    self.state.closed.cancel();
+                    return Err(ReceiveError::Io(io::Error::new(ErrorKind::TimedOut, "no datagrams from the UDP peer")));
+                }
+                changed = self.idle_timeout.changed(), if self.timeout_updates_open => {
+                    self.timeout_updates_open = changed.is_ok(); continue;
+                }
+                result = self.incoming.next(&self.state) => result.map_err(|err| {
+                    self.state.closed.cancel();
+                    ReceiveError::Io(err)
+                })?,
+            };
+            let Some((tag, session, payload)) = parse_frame(bytes) else {
+                continue;
+            };
+            if session != self.state.id || tag == ACCEPT {
+                continue;
+            }
+            if from_socket {
+                self.state.received();
+            }
+            if tag == DISCONNECT {
+                self.state.closed.cancel();
+                return Err(ReceiveError::Io(disconnected_error()));
+            }
+            if tag != DATA || payload.len() > MAX_PACKET_SIZE.load(Ordering::Relaxed) {
+                continue;
+            }
+            match serializer.deserialize(payload) {
+                Ok(packet) => return Ok((packet, received_at)),
+                Err(err) => log::debug!("Dropping malformed UDP payload: {err}"),
+            }
         }
     }
 }
 
-fn encode_datagram<ReceivingPacket, SendingPacket, S>(
-    packet: SendingPacket,
-    serializer: &S,
-) -> Option<Vec<u8>>
-where
-    ReceivingPacket: Send + Sync + Debug + 'static,
-    SendingPacket: Send + Sync + Debug + 'static,
-    S: Serializer<ReceivingPacket, SendingPacket> + ?Sized,
-{
-    let payload = serializer
-        .serialize(packet)
-        .expect("Error serializing packet");
-    if payload.len() >= MAX_DATAGRAM_SIZE {
-        log::warn!(
-            "Dropping a {}-byte packet: UDP payloads must be smaller than {MAX_DATAGRAM_SIZE} bytes",
-            payload.len()
-        );
-        return None;
+/// Write half of a UDP session.
+pub struct UdpWriteHalf {
+    socket: Arc<UdpSocket>,
+    address: Option<SocketAddr>,
+    state: Arc<SessionState>,
+}
+impl UdpWriteHalf {
+    /// Number of application packets dropped because they exceeded the configured datagram size.
+    pub fn dropped_oversized_packets(&self) -> usize {
+        self.state.dropped_oversized.load(Ordering::Relaxed)
     }
-    let mut datagram = Vec::with_capacity(payload.len() + 1);
-    datagram.push(DATA_DATAGRAM);
-    datagram.extend_from_slice(&payload);
-    Some(datagram)
+    /// Number of application packets dropped after a socket send error.
+    pub fn dropped_send_errors(&self) -> usize {
+        self.state.dropped_send_errors.load(Ordering::Relaxed)
+    }
+}
+
+/// Server write half.
+pub type UdpServerWriteHalf = UdpWriteHalf;
+/// Client write half.
+pub type UdpClientWriteHalf = UdpWriteHalf;
+#[async_trait]
+impl WriteStream for UdpWriteHalf {
+    /// Sends raw wire bytes. Prefer `send`, which adds the session header.
+    async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if self.state.closed.is_cancelled() {
+            return Err(disconnected_error());
+        }
+        let sent = match self.address {
+            Some(addr) => self.socket.send_to(bytes, addr).await?,
+            None => self.socket.send(bytes).await?,
+        };
+        if sent != bytes.len() {
+            return Err(io::Error::from(ErrorKind::WriteZero));
+        }
+        *self.state.last_sent.lock().unwrap() = Clock::now();
+        Ok(())
+    }
+    async fn send<R, S, Ser, LS>(
+        &mut self,
+        packet: S,
+        serializer: Arc<Ser>,
+        _: &LS,
+    ) -> io::Result<()>
+    where
+        R: Send + Sync + Debug + 'static,
+        S: Send + Sync + Debug + 'static,
+        Ser: Serializer<R, S> + ?Sized,
+        LS: PacketLengthSerializer,
+    {
+        let payload = serializer
+            .serialize(packet)
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        if payload.len() > self.state.options.max_datagram_size - HEADER {
+            self.state.dropped_oversized.fetch_add(1, Ordering::Relaxed);
+            log::warn!("Dropping oversized UDP payload ({} bytes)", payload.len());
+            return Ok(());
+        }
+        if let Err(err) = self.write_all(&frame(DATA, &self.state.id, &payload)).await {
+            if self.state.closed.is_cancelled() {
+                return Err(err);
+            }
+            self.state
+                .dropped_send_errors
+                .fetch_add(1, Ordering::Relaxed);
+            log::warn!("Dropping UDP packet: {err}");
+        }
+        Ok(())
+    }
+}
+fn disconnected_error() -> io::Error {
+    io::Error::new(ErrorKind::ConnectionAborted, "UDP session closed")
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::packet_length_serializer::LittleEndian;
-    use std::future::Future;
-    use std::time::Duration;
+mod tests;
 
-    /// Passes bytes through as-is; payloads starting with `0xFF` are treated as malformed.
-    struct RawSerializer;
-
-    impl Serializer<Vec<u8>, Vec<u8>> for RawSerializer {
-        type EncodeError = io::Error;
-        type DecodeError = io::Error;
-
-        fn serialize(&self, packet: Vec<u8>) -> io::Result<Vec<u8>> {
-            Ok(packet)
-        }
-
-        fn deserialize(&self, data: &[u8]) -> io::Result<Vec<u8>> {
-            match data.first() {
-                Some(0xFF) => Err(ErrorKind::InvalidData.into()),
-                _ => Ok(data.to_vec()),
-            }
-        }
-    }
-
-    type Ls = LittleEndian<u32>;
-
-    async fn with_timeout<T>(future: impl Future<Output = T>) -> T {
-        tokio::time::timeout(Duration::from_secs(5), future)
-            .await
-            .expect("UDP test timed out")
-    }
-
-    async fn connected() -> (
-        Arc<UdpNetworkListener>,
-        UdpClientReadHalf,
-        UdpClientWriteHalf,
-        UdpServerReadHalf,
-        UdpServerWriteHalf,
-    ) {
-        let listener = Arc::new(UdpProtocol::bind(([127, 0, 0, 1], 0).into()).await.unwrap());
-        let (client, server) = tokio::join!(
-            UdpProtocol::connect_to_server(listener.address()),
-            listener.accept()
-        );
-        let (client, server) = (client.unwrap(), server.unwrap());
-        assert_eq!(server.peer_addr(), client.local_addr());
-        let pump = Arc::clone(&listener);
-        tokio::spawn(async move { while pump.accept().await.is_ok() {} });
-
-        let (client_read, client_write) = client.into_split().await.unwrap();
-        let (server_read, server_write) = server.into_split().await.unwrap();
-        (
-            listener,
-            client_read,
-            client_write,
-            server_read,
-            server_write,
-        )
-    }
-
-    async fn connected_pair() -> (
-        UdpClientReadHalf,
-        UdpClientWriteHalf,
-        UdpServerReadHalf,
-        UdpServerWriteHalf,
-    ) {
-        let (_, client_read, client_write, server_read, server_write) = connected().await;
-        (client_read, client_write, server_read, server_write)
-    }
-
-    /// Connects a client to a raw socket that answers the first probe with `answer`.
-    async fn connect_to_raw(server: &UdpSocket, answer: &[u8]) -> UdpClientStream {
-        let (client, ()) = tokio::join!(
-            UdpClientStream::connect(server.local_addr().unwrap()),
-            async {
-                let (_, client) = server.recv_from(&mut [0; 16]).await.unwrap();
-                server.send_to(answer, client).await.unwrap();
-            }
-        );
-        client.unwrap()
-    }
-
-    fn assert_disconnected(err: ReceiveError<io::Error, Ls>) {
-        assert!(
-            matches!(err, ReceiveError::Io(ref err) if err.kind() == ErrorKind::ConnectionAborted),
-            "{err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn each_datagram_is_one_packet() {
-        with_timeout(async {
-            let serializer = Arc::new(RawSerializer);
-            let ls = Ls::default();
-            let (mut client_read, mut client_write, mut server_read, mut server_write) =
-                connected_pair().await;
-
-            // The oversized packet is dropped on send, the 0xFF one on receive.
-            for packet in [vec![1], vec![], vec![0; MAX_DATAGRAM_SIZE], vec![2, 3]] {
-                client_write
-                    .send::<Vec<u8>, _, _, _>(packet, Arc::clone(&serializer), &ls)
-                    .await
-                    .unwrap();
-            }
-            client_write
-                .write_all(&[DATA_DATAGRAM, 0xFF, 9])
-                .await
-                .unwrap();
-            client_write
-                .send::<Vec<u8>, _, _, _>(vec![4], Arc::clone(&serializer), &ls)
-                .await
-                .unwrap();
-
-            for expected in [vec![1], vec![], vec![2, 3], vec![4]] {
-                let packet = server_read
-                    .receive::<_, Vec<u8>, _, _>(Arc::clone(&serializer), &ls)
-                    .await
-                    .unwrap();
-                assert_eq!(packet, expected);
-            }
-
-            for expected in [vec![], vec![5]] {
-                server_write
-                    .send::<Vec<u8>, _, _, _>(expected.clone(), Arc::clone(&serializer), &ls)
-                    .await
-                    .unwrap();
-                let packet = client_read
-                    .receive::<_, Vec<u8>, _, _>(Arc::clone(&serializer), &ls)
-                    .await
-                    .unwrap();
-                assert_eq!(packet, expected);
-            }
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn unknown_peers_are_told_to_disconnect() {
-        with_timeout(async {
-            let listener = UdpProtocol::bind(([127, 0, 0, 1], 0).into()).await.unwrap();
-            let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            peer.send_to(&[DATA_DATAGRAM, 7], listener.address())
-                .await
-                .unwrap();
-            peer.send_to(&[], listener.address()).await.unwrap();
-
-            let stream = listener.accept().await.unwrap();
-            assert_eq!(stream.peer_addr(), peer.local_addr().unwrap());
-            let mut buf = [0; 16];
-            for expected in [&[DISCONNECT_DATAGRAM][..], &[]] {
-                let (len, _) = peer.recv_from(&mut buf).await.unwrap();
-                assert_eq!(&buf[..len], expected);
-            }
-            let (mut read, _) = stream.into_split().await.unwrap();
-            drop(listener);
-            let err = read.incoming.next().await.unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::ConnectionAborted);
-        })
-        .await;
-    }
-
-    fn queued_read_half() -> (Peer, UdpReadHalf) {
-        let (peer, queue) = Peer::new();
-        let incoming = Incoming::Queue {
-            queue,
-            state: Arc::clone(&peer.state),
-            current: Box::default(),
-            _registration: None,
+// Raw-peer fixture shared with the ECS integration regressions. Production peers use CookieJar.
+#[cfg(test)]
+pub(crate) fn test_answer(bytes: &[u8]) -> Option<Vec<u8>> {
+    if let Some((tag, cookie)) = Cookie::parse(bytes) {
+        return match tag {
+            HELLO => Some(
+                Cookie {
+                    mac: *blake3::hash(&cookie.nonce).as_bytes(),
+                    generation: 1,
+                    ..cookie
+                }
+                .encode(CHALLENGE)
+                .to_vec(),
+            ),
+            CONFIRM => Some(control(ACCEPT, &cookie.mac).to_vec()),
+            _ => None,
         };
-        (peer, UdpReadHalf::new(incoming, oneshot::channel().0))
     }
-
-    async fn next_queued(read: &mut UdpReadHalf) -> Vec<u8> {
-        read.incoming.next().await.unwrap().0.to_vec()
-    }
-
-    #[tokio::test]
-    async fn queued_packets_preserve_their_timestamps() {
-        let (peer, mut read) = queued_read_half();
-        peer.push(&[KEEPALIVE_DATAGRAM], Instant::now());
-        peer.push(&[DATA_DATAGRAM, 0xFF], Instant::now());
-        let first = Instant::now();
-        peer.push(&[DATA_DATAGRAM, 7], first);
-        let second = Instant::now();
-        peer.push(&[DATA_DATAGRAM], second);
-        for expected in [(vec![7], first), (vec![], second)] {
-            let received = read
-                .receive_with_timestamp::<_, Vec<u8>, _, _>(Arc::new(RawSerializer), &Ls::default())
-                .await
-                .unwrap();
-            assert_eq!(received, expected);
-        }
-    }
-
-    #[tokio::test]
-    async fn unknown_datagrams_do_not_open_connections() {
-        with_timeout(async {
-            let listener = UdpProtocol::bind(([127, 0, 0, 1], 0).into()).await.unwrap();
-            let garbage = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            for datagram in [
-                &[0][..],
-                &[0xAB, 7],
-                &[KEEPALIVE_DATAGRAM],
-                &[DATA_DATAGRAM, 7],
-                &[DISCONNECT_DATAGRAM],
-            ] {
-                garbage.send_to(datagram, listener.address()).await.unwrap();
-            }
-            peer.send_to(&[], listener.address()).await.unwrap();
-
-            let stream = listener.accept().await.unwrap();
-            assert_eq!(stream.peer_addr(), peer.local_addr().unwrap());
-            assert!(!listener.tasks.contains_key(&garbage.local_addr().unwrap()));
-        })
-        .await;
-    }
-
-    fn decode(datagram: &[u8], max_packet_size: usize) -> Option<Vec<u8>> {
-        decode_datagram(datagram, &RawSerializer, max_packet_size).unwrap()
-    }
-
-    #[test]
-    fn datagram_size_limits() {
-        let payload = vec![7; MAX_DATAGRAM_SIZE - 1];
-        let datagram = encode_datagram(payload.clone(), &RawSerializer).unwrap();
-        assert_eq!(datagram.len(), MAX_DATAGRAM_SIZE);
-        assert_eq!(datagram[0], DATA_DATAGRAM);
-        assert_eq!(decode(&datagram, payload.len()), Some(payload.clone()));
-        assert_eq!(decode(&datagram, payload.len() - 1), None);
-        assert!(encode_datagram(vec![7; MAX_DATAGRAM_SIZE], &RawSerializer).is_none());
-        assert_eq!(
-            decode(&vec![DATA_DATAGRAM; MAX_DATAGRAM_SIZE + 1], usize::MAX),
-            None
-        );
-        assert_eq!(
-            encode_datagram(vec![], &RawSerializer),
-            Some(vec![DATA_DATAGRAM])
-        );
-        assert_eq!(decode(&[DATA_DATAGRAM], 0), Some(vec![]));
-        assert_eq!(decode(&[DATA_DATAGRAM, 7], 0), None);
-        assert_eq!(decode(&[], 0), None);
-        assert_eq!(decode(&[KEEPALIVE_DATAGRAM], usize::MAX), None);
-        assert_eq!(decode(&[0xAB, 7], usize::MAX), None);
-        let err = decode_datagram(&[DISCONNECT_DATAGRAM], &RawSerializer, usize::MAX).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::ConnectionAborted);
-    }
-
-    #[tokio::test]
-    async fn send_errors_drop_only_the_packet() {
-        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let mut write = UdpWriteHalf {
-            socket,
-            peer_addr: Some((Ipv6Addr::LOCALHOST, 1).into()),
-        };
-        assert!(write.write_all(&[DATA_DATAGRAM]).await.is_err());
-        write
-            .send::<Vec<u8>, _, _, _>(vec![7], Arc::new(RawSerializer), &Ls::default())
-            .await
-            .unwrap();
-    }
-
-    #[test]
-    fn packet_size_limit_drops_only_oversized_payloads() {
-        let datagrams = [
-            vec![DATA_DATAGRAM, 1],
-            vec![DATA_DATAGRAM, 2, 3, 4],
-            vec![DATA_DATAGRAM],
-            vec![DATA_DATAGRAM, 5, 6],
-        ];
-        let received: Vec<_> = datagrams
-            .iter()
-            .filter_map(|datagram| decode(datagram, 2))
-            .collect();
-        assert_eq!(received, [vec![1], vec![], vec![5, 6]]);
-    }
-
-    #[tokio::test]
-    async fn invalid_datagrams_do_not_affect_following_packets() {
-        async fn check(read: &mut impl ReadStream, write: &mut impl WriteStream) {
-            for invalid in [
-                vec![],
-                vec![0],
-                vec![KEEPALIVE_DATAGRAM],
-                vec![0xAB, 7],
-                vec![DISCONNECT_DATAGRAM, 99, 42],
-                vec![KEEPALIVE_DATAGRAM, 99],
-                vec![DATA_DATAGRAM, 0xFF, 9],
-            ] {
-                write.write_all(&invalid).await.unwrap();
-            }
-            write
-                .send::<Vec<u8>, _, _, _>(vec![7], Arc::new(RawSerializer), &Ls::default())
-                .await
-                .unwrap();
-            let received = read
-                .receive::<_, Vec<u8>, _, _>(Arc::new(RawSerializer), &Ls::default())
-                .await
-                .unwrap();
-            assert_eq!(received, vec![7]);
-        }
-
-        with_timeout(async {
-            let (mut client_read, mut client_write, mut server_read, mut server_write) =
-                connected_pair().await;
-            check(&mut server_read, &mut client_write).await;
-            check(&mut client_read, &mut server_write).await;
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn loss_reordering_and_duplicates_do_not_affect_decoding() {
-        async fn check(read: &mut impl ReadStream, write: &mut impl WriteStream) {
-            for sequence in [3, 1, 3, 5] {
-                let packet = vec![sequence; usize::from(sequence)];
-                write
-                    .send::<Vec<u8>, _, _, _>(
-                        packet.clone(),
-                        Arc::new(RawSerializer),
-                        &Ls::default(),
-                    )
-                    .await
-                    .unwrap();
-                let received = read
-                    .receive::<_, Vec<u8>, _, _>(Arc::new(RawSerializer), &Ls::default())
-                    .await
-                    .unwrap();
-                assert_eq!(received, packet);
-            }
-        }
-
-        with_timeout(async {
-            let (mut client_read, mut client_write, mut server_read, mut server_write) =
-                connected_pair().await;
-            check(&mut server_read, &mut client_write).await;
-            check(&mut client_read, &mut server_write).await;
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn queue_overflow_drops_only_excess_datagrams() {
-        with_timeout(async {
-            let (peer, mut read) = queued_read_half();
-            assert!(peer.push(&[], Instant::now()));
-            assert_eq!(peer.queue.capacity(), MAX_QUEUED_DATAGRAMS);
-            for _ in 0..MAX_QUEUED_DATAGRAMS {
-                assert!(peer.push(&[DATA_DATAGRAM, 7], Instant::now()));
-            }
-            assert!(peer.push(&[DATA_DATAGRAM, 8], Instant::now()));
-            assert_eq!(peer.queue.capacity(), 0);
-            assert_eq!(next_queued(&mut read).await, [DATA_DATAGRAM, 7]);
-            peer.push(&[DATA_DATAGRAM, 9], Instant::now());
-            for _ in 1..MAX_QUEUED_DATAGRAMS {
-                assert_eq!(next_queued(&mut read).await, [DATA_DATAGRAM, 7]);
-            }
-            assert_eq!(next_queued(&mut read).await, [DATA_DATAGRAM, 9]);
-            assert_eq!(peer.state.queued_bytes.load(Ordering::Relaxed), 0);
-            let mut pending = Box::pin(next_queued(&mut read));
-            assert!(futures::poll!(pending.as_mut()).is_pending());
-            peer.push(&[DATA_DATAGRAM], Instant::now());
-            assert_eq!(pending.await, [DATA_DATAGRAM]);
-            drop(read);
-            assert!(!peer.push(&[DATA_DATAGRAM], Instant::now()));
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn queue_byte_budget_drops_only_excess_datagrams() {
-        with_timeout(async {
-            let (peer, mut read) = queued_read_half();
-            let queued_bytes = || peer.state.queued_bytes.load(Ordering::Relaxed);
-            let big = vec![DATA_DATAGRAM; MAX_DATAGRAM_SIZE];
-            let fits = MAX_QUEUED_BYTES / MAX_DATAGRAM_SIZE;
-            for _ in 0..fits + 1 {
-                peer.push(&big, Instant::now());
-            }
-            let small_fits = MAX_QUEUED_BYTES - fits * MAX_DATAGRAM_SIZE;
-            peer.push(&vec![DATA_DATAGRAM; small_fits], Instant::now());
-            peer.push(&[DATA_DATAGRAM], Instant::now());
-            assert_eq!(MAX_QUEUED_DATAGRAMS - peer.queue.capacity(), fits + 1);
-            assert_eq!(queued_bytes(), MAX_QUEUED_BYTES);
-            assert_eq!(next_queued(&mut read).await.len(), MAX_DATAGRAM_SIZE);
-            peer.push(&big, Instant::now());
-            assert_eq!(queued_bytes(), MAX_QUEUED_BYTES);
-        })
-        .await;
-    }
-
-    async fn next_non_probe(socket: &UdpSocket) -> Vec<u8> {
-        let mut buf = [0; 16];
-        loop {
-            let (len, _) = socket.recv_from(&mut buf).await.unwrap();
-            if len > 0 {
-                return buf[..len].to_vec();
-            }
-        }
-    }
-
-    fn assert_idle(err: ReceiveError<io::Error, Ls>) {
-        assert!(matches!(err, ReceiveError::Io(err) if err.kind() == ErrorKind::TimedOut));
-    }
-
-    #[tokio::test]
-    async fn both_sides_send_keepalives() {
-        with_timeout(async {
-            let listener = Arc::new(UdpProtocol::bind(([127, 0, 0, 1], 0).into()).await.unwrap());
-            let client_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            client_peer.send_to(&[], listener.address()).await.unwrap();
-            let _server = listener.accept().await.unwrap().into_split().await.unwrap();
-            let pump = Arc::clone(&listener);
-            tokio::spawn(async move { while pump.accept().await.is_ok() {} });
-            client_peer
-                .send_to(&[KEEPALIVE_DATAGRAM], listener.address())
-                .await
-                .unwrap();
-            assert_eq!(next_non_probe(&client_peer).await, [KEEPALIVE_DATAGRAM]);
-
-            let server_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            let client = connect_to_raw(&server_peer, &[]).await;
-            let _client = client.into_split().await.unwrap();
-            assert_eq!(next_non_probe(&server_peer).await, [KEEPALIVE_DATAGRAM]);
-        })
-        .await;
-    }
-
-    fn drain(socket: &UdpSocket) -> Vec<Vec<u8>> {
-        let mut buf = [0; 16];
-        let mut received = Vec::new();
-        while let Ok((len, _)) = socket.try_recv_from(&mut buf) {
-            received.push(buf[..len].to_vec());
-        }
-        received
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn server_keepalives_only_answer_client_traffic() {
-        let listener = Arc::new(UdpProtocol::bind(([127, 0, 0, 1], 0).into()).await.unwrap());
-        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        peer.send_to(&[], listener.address()).await.unwrap();
-        let _server = listener.accept().await.unwrap().into_split().await.unwrap();
-        let pump = Arc::clone(&listener);
-        tokio::spawn(async move { while pump.accept().await.is_ok() {} });
-        tokio::time::sleep(KEEPALIVE_INTERVAL * 5).await;
-        assert_eq!(drain(&peer), [Vec::<u8>::new()]);
-
-        peer.send_to(&[KEEPALIVE_DATAGRAM], listener.address())
-            .await
-            .unwrap();
-        tokio::time::sleep(KEEPALIVE_INTERVAL * 5).await;
-        assert_eq!(drain(&peer), [vec![KEEPALIVE_DATAGRAM]]);
-        drop(_server);
-        tokio::time::sleep(KEEPALIVE_INTERVAL).await;
-        assert!(
-            drain(&peer).is_empty(),
-            "the keepalive already spent this peer's credit"
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn keepalives_stop_with_the_read_half() {
-        let listener = UdpProtocol::bind(([127, 0, 0, 1], 0).into()).await.unwrap();
-        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        peer.send_to(&[], listener.address()).await.unwrap();
-        let (read, _write) = listener.accept().await.unwrap().into_split().await.unwrap();
-        drop(read);
-        tokio::time::sleep(KEEPALIVE_INTERVAL * 5).await;
-        let received = drain(&peer);
-        assert_eq!(received, [Vec::<u8>::new()]);
-        assert!(listener.tasks.is_empty());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn idle_peers_time_out() {
-        let serializer = Arc::new(RawSerializer);
-        let listener = UdpProtocol::bind(([127, 0, 0, 1], 0).into()).await.unwrap();
-        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        peer.send_to(&[], listener.address()).await.unwrap();
-        let (mut server_read, _server_write) =
-            listener.accept().await.unwrap().into_split().await.unwrap();
-        let err = server_read
-            .receive::<Vec<u8>, Vec<u8>, _, _>(Arc::clone(&serializer), &Ls::default())
-            .await
-            .unwrap_err();
-        assert_idle(err);
-
-        let server_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let client = connect_to_raw(&server_peer, &[]).await;
-        let (mut client_read, _client_write) = client.into_split().await.unwrap();
-        let err = client_read
-            .receive::<Vec<u8>, Vec<u8>, _, _>(serializer, &Ls::default())
-            .await
-            .unwrap_err();
-        assert_idle(err);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn idle_timeouts_are_per_connection() {
-        let listener = UdpProtocol::bind(([127, 0, 0, 1], 0).into()).await.unwrap();
-        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        peer.send_to(&[], listener.address()).await.unwrap();
-        let (mut server_read, _server_write) =
-            listener.accept().await.unwrap().into_split().await.unwrap();
-        let server_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let client = connect_to_raw(&server_peer, &[]).await;
-        let (mut client_read, _client_write) = client.into_split().await.unwrap();
-        server_read.set_idle_timeout(tokio::sync::watch::channel(Duration::from_secs(2)).1);
-        client_read.set_idle_timeout(tokio::sync::watch::channel(Duration::from_secs(4)).1);
-
-        let started = tokio::time::Instant::now();
-        let (server_elapsed, client_elapsed) = tokio::join!(
-            async {
-                assert_idle(
-                    server_read
-                        .receive::<Vec<u8>, Vec<u8>, _, _>(Arc::new(RawSerializer), &Ls::default())
-                        .await
-                        .unwrap_err(),
-                );
-                started.elapsed()
-            },
-            async {
-                assert_idle(
-                    client_read
-                        .receive::<Vec<u8>, Vec<u8>, _, _>(Arc::new(RawSerializer), &Ls::default())
-                        .await
-                        .unwrap_err(),
-                );
-                started.elapsed()
-            }
-        );
-        assert_eq!(server_elapsed, Duration::from_secs(2));
-        assert_eq!(client_elapsed, Duration::from_secs(4));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn idle_timeout_updates_after_keepalive() {
-        let (peer, mut read) = queued_read_half();
-        let (settings, timeout) = watch::channel(Duration::MAX);
-        read.set_idle_timeout(timeout);
-        let mut receive = Box::pin(async move {
-            read.receive::<Vec<u8>, Vec<u8>, _, _>(Arc::new(RawSerializer), &Ls::default())
-                .await
-        });
-        assert!(futures::poll!(receive.as_mut()).is_pending());
-        tokio::time::advance(UdpIdleTimeout::default().0 * 2).await;
-        assert!(futures::poll!(receive.as_mut()).is_pending());
-
-        settings.send_replace(Duration::from_secs(2));
-        peer.push(&[KEEPALIVE_DATAGRAM], Instant::now());
-        assert!(futures::poll!(receive.as_mut()).is_pending());
-        tokio::time::advance(Duration::from_secs(2)).await;
-        assert_idle(receive.await.unwrap_err());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn keepalives_prevent_idle_timeout() {
-        let (mut client_read, _client_write, mut server_read, mut server_write) =
-            connected_pair().await;
-        let serializer = Arc::new(RawSerializer);
-        let idle = tokio::spawn(async move {
-            server_read
-                .receive::<Vec<u8>, Vec<u8>, _, _>(Arc::new(RawSerializer), &Ls::default())
-                .await
-        });
-        tokio::time::sleep(UdpIdleTimeout::default().0 * 3).await;
-        server_write
-            .send::<Vec<u8>, _, _, _>(vec![7], Arc::clone(&serializer), &Ls::default())
-            .await
-            .unwrap();
-        let packet = client_read
-            .receive::<_, Vec<u8>, _, _>(serializer, &Ls::default())
-            .await
-            .unwrap();
-        assert_eq!(packet, vec![7]);
-        assert!(!idle.is_finished());
-    }
-
-    #[tokio::test]
-    async fn closing_either_side_disconnects_the_peer() {
-        with_timeout(async {
-            let (client_read, _client_write, mut server_read, _server_write) =
-                connected_pair().await;
-            drop(client_read);
-            assert_disconnected(
-                server_read
-                    .receive::<Vec<u8>, Vec<u8>, _, _>(Arc::new(RawSerializer), &Ls::default())
-                    .await
-                    .unwrap_err(),
-            );
-
-            let (mut client_read, mut client_write, mut server_read, _server_write) =
-                connected_pair().await;
-            // Supply actual client traffic for the server's close-notification budget.
-            for _ in 0..DISCONNECT_REPEATS + 1 {
-                client_write.write_all(&[DATA_DATAGRAM, 7]).await.unwrap();
-                server_read
-                    .receive::<Vec<u8>, Vec<u8>, _, _>(Arc::new(RawSerializer), &Ls::default())
-                    .await
-                    .unwrap();
-            }
-            drop(server_read);
-            assert_disconnected(
-                client_read
-                    .receive::<Vec<u8>, Vec<u8>, _, _>(Arc::new(RawSerializer), &Ls::default())
-                    .await
-                    .unwrap_err(),
-            );
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn disconnected_peers_do_not_reopen_connections() {
-        with_timeout(async {
-            let (listener, mut client_read, mut client_write, server_read, _server_write) =
-                connected().await;
-            let client_addr = *listener.tasks.iter().next().unwrap().key();
-            drop(server_read);
-            listener.handle_disconnection(client_addr);
-            client_write
-                .send::<Vec<u8>, _, _, _>(vec![7], Arc::new(RawSerializer), &Ls::default())
-                .await
-                .unwrap();
-            assert_disconnected(
-                client_read
-                    .receive::<Vec<u8>, Vec<u8>, _, _>(Arc::new(RawSerializer), &Ls::default())
-                    .await
-                    .unwrap_err(),
-            );
-            assert!(listener.tasks.is_empty());
-        })
-        .await;
-    }
-
-    #[test]
-    fn closed_queues_do_not_earn_response_credit() {
-        let (peer, incoming) = Peer::new();
-        drop(incoming);
-        assert!(!peer.push(&[DATA_DATAGRAM, 7], Instant::now()));
-        assert!(!peer.state.take_response_credit());
-    }
-
-    #[tokio::test]
-    async fn stale_cleanup_preserves_replacement_peer() {
-        let listener = UdpProtocol::bind(([127, 0, 0, 1], 0).into()).await.unwrap();
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let address = socket.local_addr().unwrap();
-        socket.send_to(&[], listener.address()).await.unwrap();
-        let old = listener.accept().await.unwrap();
-        let (replacement, mut incoming) = Peer::new();
-        listener.tasks.insert(address, replacement);
-        drop(old);
-        listener.handle_disconnection(address);
-        assert!(listener
-            .tasks
-            .get(&address)
-            .unwrap()
-            .push(&[DATA_DATAGRAM, 7], Instant::now()));
-        assert_eq!(&*incoming.recv().await.unwrap().0, &[DATA_DATAGRAM, 7]);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn idle_probe_does_not_amplify_disconnects() {
-        let listener = UdpProtocol::bind(([127, 0, 0, 1], 0).into()).await.unwrap();
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        socket.send_to(&[], listener.address()).await.unwrap();
-        let (mut read, _write) = listener.accept().await.unwrap().into_split().await.unwrap();
-        assert_idle(
-            read.receive::<Vec<u8>, Vec<u8>, _, _>(Arc::new(RawSerializer), &Ls::default())
-                .await
-                .unwrap_err(),
-        );
-        drop(read);
-        tokio::time::sleep(KEEPALIVE_INTERVAL).await;
-        assert_eq!(drain(&socket), [Vec::<u8>::new()]);
-    }
-
-    #[tokio::test]
-    async fn connect_rejects_refusal() {
-        with_timeout(async {
-            let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            let (result, ()) = tokio::join!(
-                UdpClientStream::connect(server.local_addr().unwrap()),
-                async {
-                    let (_, address) = server.recv_from(&mut [0; 16]).await.unwrap();
-                    server
-                        .send_to(&[DISCONNECT_DATAGRAM], address)
-                        .await
-                        .unwrap();
-                }
-            );
-            assert_eq!(result.err().unwrap().kind(), ErrorKind::ConnectionRefused);
-        })
-        .await;
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn connect_does_not_accept_invalid_answers() {
-        for answer in [
-            vec![99],
-            vec![DISCONNECT_DATAGRAM, 99, 42],
-            vec![KEEPALIVE_DATAGRAM],
-        ] {
-            let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            let (result, ()) = tokio::join!(
-                UdpClientStream::connect(server.local_addr().unwrap()),
-                async {
-                    let (_, address) = server.recv_from(&mut [0; 16]).await.unwrap();
-                    server.send_to(&answer, address).await.unwrap();
-                }
-            );
-            assert_eq!(result.err().unwrap().kind(), ErrorKind::TimedOut);
-        }
-    }
-
-    #[tokio::test]
-    async fn connect_resends_lost_probes() {
-        with_timeout(async {
-            let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            let (client, ()) = tokio::join!(
-                UdpClientStream::connect(server.local_addr().unwrap()),
-                async {
-                    let mut buf = [0; 16];
-                    server.recv_from(&mut buf).await.unwrap();
-                    let (len, client) = server.recv_from(&mut buf).await.unwrap();
-                    assert_eq!(len, 0);
-                    server.send_to(&[], client).await.unwrap();
-                }
-            );
-            client.unwrap();
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn connect_keeps_non_probe_answers() {
-        with_timeout(async {
-            let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            let client = connect_to_raw(&server, &[DATA_DATAGRAM, 7]).await;
-            let (mut read, _write) = client.into_split().await.unwrap();
-            let packet = read
-                .receive::<_, Vec<u8>, _, _>(Arc::new(RawSerializer), &Ls::default())
-                .await
-                .unwrap();
-            assert_eq!(packet, vec![7]);
-        })
-        .await;
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn connect_times_out_without_an_answer() {
-        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let started = tokio::time::Instant::now();
-        let err = UdpClientStream::connect(server.local_addr().unwrap())
-            .await
-            .err()
-            .unwrap();
-        assert_eq!(err.kind(), ErrorKind::TimedOut);
-        assert_eq!(started.elapsed(), CONNECT_TIMEOUT);
-    }
-
-    #[cfg(any(feature = "client", feature = "server"))]
-    #[test]
-    fn idle_timeout_settings_are_per_app() {
-        use bevy::prelude::App;
-
-        let mut first = App::new();
-        first.insert_resource(UdpIdleTimeout(Duration::MAX));
-        let first_timeout = idle_timeout_receiver(&mut first);
-        first.update();
-        assert_eq!(*first_timeout.borrow(), Duration::MAX);
-
-        let mut second = App::new();
-        let second_timeout = idle_timeout_receiver(&mut second);
-        second.update();
-        assert_eq!(*second_timeout.borrow(), UdpIdleTimeout::default().0);
-
-        second.insert_resource(UdpIdleTimeout(Duration::from_secs(3)));
-        second.update();
-        first.update();
-        assert_eq!(*first_timeout.borrow(), Duration::MAX);
-        assert_eq!(*second_timeout.borrow(), Duration::from_secs(3));
-
-        second.world_mut().remove_resource::<UdpIdleTimeout>();
-        second.update();
-        assert_eq!(*second_timeout.borrow(), UdpIdleTimeout::default().0);
-        drop(first);
-        assert_eq!(*second_timeout.borrow(), UdpIdleTimeout::default().0);
-    }
-
-    #[cfg(feature = "serializer_bitcode")]
-    #[tokio::test]
-    async fn bitcode_packets_include_empty_payloads() {
-        use crate::serializer::SerializerAdapter;
-        use crate::serializers::bitcode::BitcodeSerializer;
-
-        async fn roundtrip<Packet>(packet: Packet)
-        where
-            Packet: bitcode::Encode
-                + bitcode::DecodeOwned
-                + Clone
-                + Debug
-                + PartialEq
-                + Send
-                + Sync
-                + 'static,
-        {
-            let serializer = Arc::new(SerializerAdapter::ReadOnly(Arc::new(BitcodeSerializer)));
-            let (mut client_read, mut client_write, mut server_read, mut server_write) =
-                connected_pair().await;
-            client_write
-                .send::<Packet, _, _, _>(packet.clone(), Arc::clone(&serializer), &Ls::default())
-                .await
-                .unwrap();
-            let received = server_read
-                .receive::<_, Packet, _, _>(Arc::clone(&serializer), &Ls::default())
-                .await
-                .unwrap();
-            assert_eq!(received, packet);
-            server_write
-                .send::<Packet, _, _, _>(received, Arc::clone(&serializer), &Ls::default())
-                .await
-                .unwrap();
-            let received = client_read
-                .receive::<_, Packet, _, _>(serializer, &Ls::default())
-                .await
-                .unwrap();
-            assert_eq!(received, packet);
-        }
-
-        with_timeout(async {
-            assert!(bitcode::encode(&()).is_empty());
-            roundtrip(()).await;
-            roundtrip((42_u32, "hello".to_owned())).await;
-        })
-        .await;
+    match parse_frame(bytes) {
+        Some((KEEPALIVE, session, _)) => Some(control(KEEPALIVE, &session).to_vec()),
+        _ => None,
     }
 }

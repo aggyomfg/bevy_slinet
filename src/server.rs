@@ -208,6 +208,7 @@ fn create_setup_system<Config: ServerConfig>(
                                 }
                             };
                             disconnect_task.cancel();
+                            read.close();
                             if let Err(err) = disc_tx_2.send((error, ecs_conn.clone())).await {
                                 log::debug!("({id:?}) Disconnection receiver closed: {err:?}");
                             }

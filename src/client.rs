@@ -332,6 +332,7 @@ fn setup_system<Config: ClientConfig>(
                     }
                 };
                 disconnect_task.cancel();
+                read.close();
                 if let Err(err) = disc_tx2.send((error, peer_addr, Some(id))).await {
                     log::debug!("({id:?}) Disconnection receiver closed: {err:?}");
                 }
