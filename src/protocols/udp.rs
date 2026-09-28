@@ -17,14 +17,12 @@
 //! Both peers send a `2` keep-alive datagram every [`KEEPALIVE_INTERVAL`] and close the
 //! connection after [`UdpIdleTimeout`] without any datagrams from the other side.
 
-use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::io;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
-use std::task::Poll;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -32,10 +30,9 @@ use bevy::log;
 use bevy::platform::time::Instant;
 use bevy::prelude::Resource;
 use dashmap::DashMap;
-use futures::future::poll_fn;
-use futures::task::AtomicWaker;
 use tokio::net::UdpSocket;
-use tokio::sync::oneshot;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::MissedTickBehavior;
 
 use crate::connection::MAX_PACKET_SIZE;
@@ -123,6 +120,17 @@ where
     ))
 }
 
+async fn send_datagram(
+    socket: &UdpSocket,
+    peer_addr: Option<SocketAddr>,
+    datagram: &[u8],
+) -> io::Result<usize> {
+    match peer_addr {
+        Some(addr) => socket.send_to(datagram, addr).await,
+        None => socket.send(datagram).await,
+    }
+}
+
 /// Sends keep-alive datagrams until the returned sender is dropped.
 fn spawn_keepalive(socket: Arc<UdpSocket>, peer_addr: Option<SocketAddr>) -> oneshot::Sender<()> {
     let (stop, mut stopped) = oneshot::channel();
@@ -135,10 +143,7 @@ fn spawn_keepalive(socket: Arc<UdpSocket>, peer_addr: Option<SocketAddr>) -> one
                 _ = &mut stopped => break,
                 _ = interval.tick() => {
                     // Errors are reported to the read half or end in an idle timeout.
-                    let _ = match peer_addr {
-                        Some(addr) => socket.send_to(&[KEEPALIVE_DATAGRAM], addr).await,
-                        None => socket.send(&[KEEPALIVE_DATAGRAM]).await,
-                    };
+                    let _ = send_datagram(&socket, peer_addr, &[KEEPALIVE_DATAGRAM]).await;
                 }
             }
         }
@@ -165,60 +170,86 @@ impl Protocol for UdpProtocol {
     }
 }
 
-#[derive(Default)]
-struct Inner {
-    waker: AtomicWaker,
-    queue: Mutex<Queue>,
-}
+type Queued = (Box<[u8]>, Instant);
 
 #[derive(Default)]
-struct Queue {
-    datagrams: VecDeque<(Box<[u8]>, Instant)>,
-    bytes: usize,
+struct PeerState {
+    queued_bytes: AtomicUsize,
 }
 
-#[derive(Clone, Default)]
-struct UdpRead(Arc<Inner>);
+/// The listener's end of a server connection's datagram queue.
+struct Peer {
+    queue: mpsc::Sender<Queued>,
+    state: Arc<PeerState>,
+}
 
-impl UdpRead {
-    fn push(&self, datagram: &[u8], received_at: Instant) {
-        // Empty datagrams are connection probes sent by `UdpClientStream::connect`.
-        if datagram.is_empty() {
-            return;
-        }
-        {
-            let mut queue = self.0.queue.lock().unwrap();
-            if queue.datagrams.len() >= MAX_QUEUED_DATAGRAMS
-                || queue.bytes + datagram.len() > MAX_QUEUED_BYTES
-            {
-                return;
-            }
-            queue.bytes += datagram.len();
-            queue.datagrams.push_back((datagram.into(), received_at));
-        }
-        self.0.waker.wake();
+impl Peer {
+    fn new() -> (Self, mpsc::Receiver<Queued>) {
+        let (queue, incoming) = mpsc::channel(MAX_QUEUED_DATAGRAMS);
+        let peer = Peer {
+            queue,
+            state: Arc::default(),
+        };
+        (peer, incoming)
     }
 
-    async fn pop(&self) -> (Box<[u8]>, Instant) {
-        poll_fn(|cx| {
-            self.0.waker.register(cx.waker());
-            let mut queue = self.0.queue.lock().unwrap();
-            match queue.datagrams.pop_front() {
-                Some(datagram) => {
-                    queue.bytes -= datagram.0.len();
-                    Poll::Ready(datagram)
-                }
-                None => Poll::Pending,
+    /// Returns `false` if the connection's read half is gone.
+    fn push(&self, datagram: &[u8], received_at: Instant) -> bool {
+        // Empty datagrams are connection probes sent by `UdpClientStream::connect`.
+        let len = datagram.len();
+        if len == 0 || self.state.queued_bytes.load(Ordering::Relaxed) + len > MAX_QUEUED_BYTES {
+            return !self.queue.is_closed();
+        }
+        self.state.queued_bytes.fetch_add(len, Ordering::Relaxed);
+        match self.queue.try_send((datagram.into(), received_at)) {
+            Ok(()) => true,
+            Err(err) => {
+                self.state.queued_bytes.fetch_sub(len, Ordering::Relaxed);
+                matches!(err, TrySendError::Full(_))
             }
-        })
-        .await
+        }
+    }
+}
+
+enum Incoming {
+    Queue {
+        queue: mpsc::Receiver<Queued>,
+        state: Arc<PeerState>,
+        current: Box<[u8]>,
+    },
+    Socket {
+        socket: Arc<UdpSocket>,
+        buffer: Box<[u8]>,
+    },
+}
+
+impl Incoming {
+    async fn next(&mut self) -> io::Result<(&[u8], Instant)> {
+        match self {
+            Incoming::Queue {
+                queue,
+                state,
+                current,
+            } => {
+                let (datagram, received_at) = queue.recv().await.ok_or_else(disconnected_error)?;
+                state
+                    .queued_bytes
+                    .fetch_sub(datagram.len(), Ordering::Relaxed);
+                *current = datagram;
+                Ok((current, received_at))
+            }
+            Incoming::Socket { socket, buffer } => {
+                let len = socket.recv(buffer).await?;
+                Ok((&buffer[..len], Instant::now()))
+            }
+        }
     }
 }
 
 /// A UDP listener.
 pub struct UdpNetworkListener {
     socket: Arc<UdpSocket>,
-    tasks: DashMap<SocketAddr, UdpRead>,
+    tasks: DashMap<SocketAddr, Peer>,
 }
 
 #[async_trait]
@@ -243,14 +274,21 @@ impl Listener for UdpNetworkListener {
             };
             let received_at = Instant::now();
             let datagram = &buf[..len];
-            if let Some(task) = self.tasks.get(&address) {
-                task.push(datagram, received_at);
-            } else if matches!(datagram.first(), None | Some(&DATA_DATAGRAM)) {
-                let new_task = UdpRead::default();
-                new_task.push(datagram, received_at);
-                self.tasks.insert(address, new_task.clone());
+            let delivered = self
+                .tasks
+                .get(&address)
+                .map(|peer| peer.push(datagram, received_at));
+            if delivered == Some(false) {
+                self.tasks.remove(&address);
+            }
+            if delivered != Some(true) && matches!(datagram.first(), None | Some(&DATA_DATAGRAM)) {
+                let (peer, incoming) = Peer::new();
+                peer.push(datagram, received_at);
+                let state = Arc::clone(&peer.state);
+                self.tasks.insert(address, peer);
                 return Ok(UdpServerStream {
-                    task: new_task,
+                    incoming,
+                    state,
                     peer_addr: address,
                     socket: Arc::clone(&self.socket),
                 });
@@ -267,9 +305,10 @@ impl Listener for UdpNetworkListener {
     }
 }
 
-/// A UDP server stream that contains cached bytes and a task waker.
+/// A server-side UDP connection that reads the datagrams queued by [`UdpNetworkListener`].
 pub struct UdpServerStream {
-    task: UdpRead,
+    incoming: mpsc::Receiver<Queued>,
+    state: Arc<PeerState>,
     peer_addr: SocketAddr,
     socket: Arc<UdpSocket>,
 }
@@ -280,16 +319,20 @@ impl NetworkStream for UdpServerStream {
     type WriteHalf = UdpServerWriteHalf;
 
     async fn into_split(self) -> io::Result<(Self::ReadHalf, Self::WriteHalf)> {
-        let peer_addr = self.peer_addr();
+        let peer_addr = Some(self.peer_addr);
+        let incoming = Incoming::Queue {
+            queue: self.incoming,
+            state: self.state,
+            current: Box::default(),
+        };
         Ok((
-            UdpServerReadHalf {
-                task: self.task.clone(),
-                idle_timeout: tokio::sync::watch::channel(UdpIdleTimeout::default().0).1,
-                _keepalive: spawn_keepalive(Arc::clone(&self.socket), Some(peer_addr)),
-            },
-            UdpServerWriteHalf {
-                peer_addr,
+            UdpReadHalf::new(
+                incoming,
+                spawn_keepalive(Arc::clone(&self.socket), peer_addr),
+            ),
+            UdpWriteHalf {
                 socket: self.socket,
+                peer_addr,
             },
         ))
     }
@@ -303,16 +346,31 @@ impl NetworkStream for UdpServerStream {
     }
 }
 
-/// The read half of [`UdpServerStream`].
-pub struct UdpServerReadHalf {
-    task: UdpRead,
-    idle_timeout: tokio::sync::watch::Receiver<Duration>,
+/// The read half of a UDP connection.
+pub struct UdpReadHalf {
+    incoming: Incoming,
+    idle_timeout: watch::Receiver<Duration>,
     _keepalive: oneshot::Sender<()>,
 }
 
+/// The read half of [`UdpServerStream`].
+pub type UdpServerReadHalf = UdpReadHalf;
+/// The read half of [`UdpClientStream`].
+pub type UdpClientReadHalf = UdpReadHalf;
+
+impl UdpReadHalf {
+    fn new(incoming: Incoming, keepalive: oneshot::Sender<()>) -> Self {
+        UdpReadHalf {
+            incoming,
+            idle_timeout: watch::channel(UdpIdleTimeout::default().0).1,
+            _keepalive: keepalive,
+        }
+    }
+}
+
 #[async_trait]
-impl ReadStream for UdpServerReadHalf {
-    fn set_idle_timeout(&mut self, timeout: tokio::sync::watch::Receiver<Duration>) {
+impl ReadStream for UdpReadHalf {
+    fn set_idle_timeout(&mut self, timeout: watch::Receiver<Duration>) {
         self.idle_timeout = timeout;
     }
 
@@ -323,7 +381,7 @@ impl ReadStream for UdpServerReadHalf {
     async fn receive<ReceivingPacket, SendingPacket, S, LS>(
         &mut self,
         serializer: Arc<S>,
-        _length_serializer: &LS,
+        length_serializer: &LS,
     ) -> Result<ReceivingPacket, ReceiveError<S::DecodeError, LS>>
     where
         ReceivingPacket: Send + Sync + Debug + 'static,
@@ -331,7 +389,7 @@ impl ReadStream for UdpServerReadHalf {
         S: Serializer<ReceivingPacket, SendingPacket> + ?Sized,
         LS: PacketLengthSerializer,
     {
-        self.receive_with_timestamp(serializer, _length_serializer)
+        self.receive_with_timestamp(serializer, length_serializer)
             .await
             .map(|(packet, _)| packet)
     }
@@ -349,11 +407,12 @@ impl ReadStream for UdpServerReadHalf {
     {
         loop {
             let idle_timeout = *self.idle_timeout.borrow();
-            let (datagram, received_at) = tokio::time::timeout(idle_timeout, self.task.pop())
+            let (datagram, received_at) = tokio::time::timeout(idle_timeout, self.incoming.next())
                 .await
-                .map_err(|_| idle_error())?;
+                .map_err(|_| idle_error())?
+                .map_err(ReceiveError::Io)?;
             if let Some(packet) = decode_datagram(
-                &datagram,
+                datagram,
                 &*serializer,
                 MAX_PACKET_SIZE.load(Ordering::Relaxed),
             ) {
@@ -363,17 +422,22 @@ impl ReadStream for UdpServerReadHalf {
     }
 }
 
-/// A write half of [`UdpServerStream`];
-pub struct UdpServerWriteHalf {
-    peer_addr: SocketAddr,
+/// The write half of a UDP connection.
+pub struct UdpWriteHalf {
     socket: Arc<UdpSocket>,
+    /// `None` for connected client sockets.
+    peer_addr: Option<SocketAddr>,
 }
 
+/// The write half of [`UdpServerStream`].
+pub type UdpServerWriteHalf = UdpWriteHalf;
+/// The write half of [`UdpClientStream`].
+pub type UdpClientWriteHalf = UdpWriteHalf;
+
 #[async_trait]
-impl WriteStream for UdpServerWriteHalf {
+impl WriteStream for UdpWriteHalf {
     async fn write_all(&mut self, buffer: &[u8]) -> std::io::Result<()> {
-        self.socket
-            .send_to(buffer, self.peer_addr)
+        send_datagram(&self.socket, self.peer_addr, buffer)
             .await
             .and_then(|i| assert_all(i, buffer))
     }
@@ -401,7 +465,7 @@ impl ServerStream for UdpServerStream {}
 
 /// A UDP client stream.
 pub struct UdpClientStream {
-    socket: UdpSocket,
+    socket: Arc<UdpSocket>,
     peer_addr: SocketAddr,
 }
 
@@ -410,26 +474,21 @@ impl NetworkStream for UdpClientStream {
     type ReadHalf = UdpClientReadHalf;
     type WriteHalf = UdpClientWriteHalf;
 
-    async fn into_split(mut self) -> io::Result<(Self::ReadHalf, Self::WriteHalf)> {
-        let std_socket = self.socket.into_std()?;
-        let std_socket2 = std_socket.try_clone()?;
-        let keepalive_socket = Arc::new(UdpSocket::from_std(std_socket.try_clone()?)?);
-        let read_socket = UdpSocket::from_std(std_socket)?;
-        let write_socket = UdpSocket::from_std(std_socket2)?;
-        let write = UdpClientWriteHalf {
-            socket: write_socket,
-        };
-        let read = UdpClientReadHalf {
-            socket: read_socket,
+    async fn into_split(self) -> io::Result<(Self::ReadHalf, Self::WriteHalf)> {
+        let incoming = Incoming::Socket {
+            socket: Arc::clone(&self.socket),
             buffer: vec![0; BUFFER_SIZE].into_boxed_slice(),
-            idle_timeout: tokio::sync::watch::channel(UdpIdleTimeout::default().0).1,
-            _keepalive: spawn_keepalive(keepalive_socket, None),
         };
-        Ok((read, write))
+        let keepalive = spawn_keepalive(Arc::clone(&self.socket), None);
+        let write = UdpWriteHalf {
+            socket: self.socket,
+            peer_addr: None,
+        };
+        Ok((UdpReadHalf::new(incoming, keepalive), write))
     }
 
     fn peer_addr(&self) -> SocketAddr {
-        self.peer_addr // self.0.peer_addr().unwrap(). Tokio added it in https://github.com/tokio-rs/tokio/pull/4362 and then reverted in https://github.com/tokio-rs/tokio/pull/4392
+        self.peer_addr
     }
 
     fn local_addr(&self) -> SocketAddr {
@@ -449,112 +508,15 @@ impl ClientStream for UdpClientStream {
         };
         let socket = UdpSocket::bind(local_addr).await?;
         socket.connect(addr).await?;
-
-        // TODO remove this
-        let std_socket = socket.into_std().unwrap();
-        let peer_addr = std_socket.peer_addr().unwrap();
-        let socket = UdpSocket::from_std(std_socket).unwrap();
+        let peer_addr = socket.peer_addr()?;
 
         // socket.connect and socket.send is not enough to handle ConnectionRefused, but 2 sends is
         socket.send(&[]).await?;
         socket.send(&[]).await?;
-        Ok(UdpClientStream { socket, peer_addr })
-    }
-}
-
-/// A read half of [`UdpClientStream`].
-pub struct UdpClientReadHalf {
-    socket: UdpSocket,
-    buffer: Box<[u8]>,
-    idle_timeout: tokio::sync::watch::Receiver<Duration>,
-    _keepalive: oneshot::Sender<()>,
-}
-
-#[async_trait]
-impl ReadStream for UdpClientReadHalf {
-    fn set_idle_timeout(&mut self, timeout: tokio::sync::watch::Receiver<Duration>) {
-        self.idle_timeout = timeout;
-    }
-
-    async fn read_exact(&mut self, _buffer: &mut [u8]) -> io::Result<()> {
-        Err(datagram_only_error())
-    }
-
-    async fn receive<ReceivingPacket, SendingPacket, S, LS>(
-        &mut self,
-        serializer: Arc<S>,
-        _length_serializer: &LS,
-    ) -> Result<ReceivingPacket, ReceiveError<S::DecodeError, LS>>
-    where
-        ReceivingPacket: Send + Sync + Debug + 'static,
-        SendingPacket: Send + Sync + Debug + 'static,
-        S: Serializer<ReceivingPacket, SendingPacket> + ?Sized,
-        LS: PacketLengthSerializer,
-    {
-        self.receive_with_timestamp(serializer, _length_serializer)
-            .await
-            .map(|(packet, _)| packet)
-    }
-
-    async fn receive_with_timestamp<ReceivingPacket, SendingPacket, S, LS>(
-        &mut self,
-        serializer: Arc<S>,
-        _length_serializer: &LS,
-    ) -> Result<(ReceivingPacket, Instant), ReceiveError<S::DecodeError, LS>>
-    where
-        ReceivingPacket: Send + Sync + Debug + 'static,
-        SendingPacket: Send + Sync + Debug + 'static,
-        S: Serializer<ReceivingPacket, SendingPacket> + ?Sized,
-        LS: PacketLengthSerializer,
-    {
-        loop {
-            let idle_timeout = *self.idle_timeout.borrow();
-            let len = tokio::time::timeout(idle_timeout, self.socket.recv(&mut self.buffer))
-                .await
-                .map_err(|_| idle_error())?
-                .map_err(ReceiveError::Io)?;
-            let received_at = Instant::now();
-            if let Some(packet) = decode_datagram(
-                &self.buffer[..len],
-                &*serializer,
-                MAX_PACKET_SIZE.load(Ordering::Relaxed),
-            ) {
-                return Ok((packet, received_at));
-            }
-        }
-    }
-}
-
-/// A write half of [`UdpClientStream`].
-pub struct UdpClientWriteHalf {
-    socket: UdpSocket,
-}
-
-#[async_trait]
-impl WriteStream for UdpClientWriteHalf {
-    async fn write_all(&mut self, buffer: &[u8]) -> std::io::Result<()> {
-        self.socket
-            .send(buffer)
-            .await
-            .and_then(|i| assert_all(i, buffer))
-    }
-
-    async fn send<ReceivingPacket, SendingPacket, S, LS>(
-        &mut self,
-        packet: SendingPacket,
-        serializer: Arc<S>,
-        _length_serializer: &LS,
-    ) -> io::Result<()>
-    where
-        ReceivingPacket: Send + Sync + Debug + 'static,
-        SendingPacket: Send + Sync + Debug + 'static,
-        S: Serializer<ReceivingPacket, SendingPacket> + ?Sized,
-        LS: PacketLengthSerializer,
-    {
-        match encode_datagram(packet, &*serializer) {
-            Some(datagram) => drop_on_error(self.write_all(&datagram).await, &datagram),
-            None => Ok(()),
-        }
+        Ok(UdpClientStream {
+            socket: Arc::new(socket),
+            peer_addr,
+        })
     }
 }
 
@@ -579,6 +541,10 @@ fn datagram_only_error() -> io::Error {
         ErrorKind::Unsupported,
         "UDP streams are datagram-based, use `ReadStream::receive`",
     )
+}
+
+fn disconnected_error() -> io::Error {
+    io::Error::new(ErrorKind::ConnectionAborted, "the UDP peer disconnected")
 }
 
 /// Returns `None` for datagrams that should be dropped without closing the connection.
@@ -762,20 +728,29 @@ mod tests {
         .await;
     }
 
+    fn queued_read_half() -> (Peer, UdpReadHalf) {
+        let (peer, queue) = Peer::new();
+        let incoming = Incoming::Queue {
+            queue,
+            state: Arc::clone(&peer.state),
+            current: Box::default(),
+        };
+        (peer, UdpReadHalf::new(incoming, oneshot::channel().0))
+    }
+
+    async fn next_queued(read: &mut UdpReadHalf) -> Vec<u8> {
+        read.incoming.next().await.unwrap().0.to_vec()
+    }
+
     #[tokio::test]
     async fn queued_packets_preserve_their_timestamps() {
-        let task = UdpRead::default();
-        task.push(&[KEEPALIVE_DATAGRAM], Instant::now());
-        task.push(&[DATA_DATAGRAM, 0xFF], Instant::now());
+        let (peer, mut read) = queued_read_half();
+        peer.push(&[KEEPALIVE_DATAGRAM], Instant::now());
+        peer.push(&[DATA_DATAGRAM, 0xFF], Instant::now());
         let first = Instant::now();
-        task.push(&[DATA_DATAGRAM, 7], first);
+        peer.push(&[DATA_DATAGRAM, 7], first);
         let second = Instant::now();
-        task.push(&[DATA_DATAGRAM], second);
-        let mut read = UdpServerReadHalf {
-            task,
-            idle_timeout: tokio::sync::watch::channel(UdpIdleTimeout::default().0).1,
-            _keepalive: oneshot::channel().0,
-        };
+        peer.push(&[DATA_DATAGRAM], second);
         for expected in [(vec![7], first), (vec![], second)] {
             let received = read
                 .receive_with_timestamp::<_, Vec<u8>, _, _>(Arc::new(RawSerializer), &Ls::default())
@@ -852,9 +827,9 @@ mod tests {
     #[tokio::test]
     async fn send_errors_drop_only_the_packet() {
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let mut write = UdpServerWriteHalf {
-            peer_addr: (Ipv6Addr::LOCALHOST, 1).into(),
+        let mut write = UdpWriteHalf {
             socket,
+            peer_addr: Some((Ipv6Addr::LOCALHOST, 1).into()),
         };
         assert!(write.write_all(&[DATA_DATAGRAM]).await.is_err());
         write
@@ -943,28 +918,27 @@ mod tests {
     #[tokio::test]
     async fn queue_overflow_drops_only_excess_datagrams() {
         with_timeout(async {
-            let queue = UdpRead::default();
-            queue.push(&[], Instant::now());
-            assert!(queue.0.queue.lock().unwrap().datagrams.is_empty());
+            let (peer, mut read) = queued_read_half();
+            assert!(peer.push(&[], Instant::now()));
+            assert_eq!(peer.queue.capacity(), MAX_QUEUED_DATAGRAMS);
             for _ in 0..MAX_QUEUED_DATAGRAMS {
-                queue.push(&[DATA_DATAGRAM, 7], Instant::now());
+                assert!(peer.push(&[DATA_DATAGRAM, 7], Instant::now()));
             }
-            queue.push(&[DATA_DATAGRAM, 8], Instant::now());
-            assert_eq!(
-                queue.0.queue.lock().unwrap().datagrams.len(),
-                MAX_QUEUED_DATAGRAMS
-            );
-            assert_eq!(&*queue.pop().await.0, &[DATA_DATAGRAM, 7]);
-            queue.push(&[DATA_DATAGRAM, 9], Instant::now());
+            assert!(peer.push(&[DATA_DATAGRAM, 8], Instant::now()));
+            assert_eq!(peer.queue.capacity(), 0);
+            assert_eq!(next_queued(&mut read).await, [DATA_DATAGRAM, 7]);
+            peer.push(&[DATA_DATAGRAM, 9], Instant::now());
             for _ in 1..MAX_QUEUED_DATAGRAMS {
-                assert_eq!(&*queue.pop().await.0, &[DATA_DATAGRAM, 7]);
+                assert_eq!(next_queued(&mut read).await, [DATA_DATAGRAM, 7]);
             }
-            assert_eq!(&*queue.pop().await.0, &[DATA_DATAGRAM, 9]);
-            assert_eq!(queue.0.queue.lock().unwrap().bytes, 0);
-            let mut pending = Box::pin(queue.pop());
+            assert_eq!(next_queued(&mut read).await, [DATA_DATAGRAM, 9]);
+            assert_eq!(peer.state.queued_bytes.load(Ordering::Relaxed), 0);
+            let mut pending = Box::pin(next_queued(&mut read));
             assert!(futures::poll!(pending.as_mut()).is_pending());
-            queue.push(&[DATA_DATAGRAM], Instant::now());
-            assert_eq!(&*pending.await.0, &[DATA_DATAGRAM]);
+            peer.push(&[DATA_DATAGRAM], Instant::now());
+            assert_eq!(pending.await, [DATA_DATAGRAM]);
+            drop(read);
+            assert!(!peer.push(&[DATA_DATAGRAM], Instant::now()));
         })
         .await;
     }
@@ -972,23 +946,21 @@ mod tests {
     #[tokio::test]
     async fn queue_byte_budget_drops_only_excess_datagrams() {
         with_timeout(async {
-            let queue = UdpRead::default();
+            let (peer, mut read) = queued_read_half();
+            let queued_bytes = || peer.state.queued_bytes.load(Ordering::Relaxed);
             let big = vec![DATA_DATAGRAM; MAX_DATAGRAM_SIZE];
             let fits = MAX_QUEUED_BYTES / MAX_DATAGRAM_SIZE;
             for _ in 0..fits + 1 {
-                queue.push(&big, Instant::now());
+                peer.push(&big, Instant::now());
             }
             let small_fits = MAX_QUEUED_BYTES - fits * MAX_DATAGRAM_SIZE;
-            queue.push(&vec![DATA_DATAGRAM; small_fits], Instant::now());
-            queue.push(&[DATA_DATAGRAM], Instant::now());
-            {
-                let queued = queue.0.queue.lock().unwrap();
-                assert_eq!(queued.datagrams.len(), fits + 1);
-                assert_eq!(queued.bytes, MAX_QUEUED_BYTES);
-            }
-            assert_eq!(queue.pop().await.0.len(), MAX_DATAGRAM_SIZE);
-            queue.push(&big, Instant::now());
-            assert_eq!(queue.0.queue.lock().unwrap().bytes, MAX_QUEUED_BYTES);
+            peer.push(&vec![DATA_DATAGRAM; small_fits], Instant::now());
+            peer.push(&[DATA_DATAGRAM], Instant::now());
+            assert_eq!(MAX_QUEUED_DATAGRAMS - peer.queue.capacity(), fits + 1);
+            assert_eq!(queued_bytes(), MAX_QUEUED_BYTES);
+            assert_eq!(next_queued(&mut read).await.len(), MAX_DATAGRAM_SIZE);
+            peer.push(&big, Instant::now());
+            assert_eq!(queued_bytes(), MAX_QUEUED_BYTES);
         })
         .await;
     }
@@ -1105,13 +1077,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn idle_timeout_updates_after_keepalive() {
-        let task = UdpRead::default();
-        let (settings, timeout) = tokio::sync::watch::channel(Duration::MAX);
-        let mut read = UdpServerReadHalf {
-            task: task.clone(),
-            idle_timeout: timeout,
-            _keepalive: oneshot::channel().0,
-        };
+        let (peer, mut read) = queued_read_half();
+        let (settings, timeout) = watch::channel(Duration::MAX);
+        read.set_idle_timeout(timeout);
         let mut receive = Box::pin(async move {
             read.receive::<Vec<u8>, Vec<u8>, _, _>(Arc::new(RawSerializer), &Ls::default())
                 .await
@@ -1121,7 +1089,7 @@ mod tests {
         assert!(futures::poll!(receive.as_mut()).is_pending());
 
         settings.send_replace(Duration::from_secs(2));
-        task.push(&[KEEPALIVE_DATAGRAM], Instant::now());
+        peer.push(&[KEEPALIVE_DATAGRAM], Instant::now());
         assert!(futures::poll!(receive.as_mut()).is_pending());
         tokio::time::advance(Duration::from_secs(2)).await;
         assert_idle(receive.await.unwrap_err());
