@@ -24,13 +24,42 @@ pub(super) struct QueuedDatagram {
 }
 pub(super) type Peers = Mutex<HashMap<SocketAddr, Peer>>;
 
+#[derive(Default)]
+struct ResponseBudget {
+    received_since_heartbeat: AtomicBool,
+    credits: AtomicUsize,
+}
+impl ResponseBudget {
+    const CAPACITY: usize = DISCONNECT_REPEATS + 1;
+
+    fn received(&self) {
+        self.received_since_heartbeat.store(true, Ordering::Relaxed);
+        let _ = self
+            .credits
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |credit| {
+                Some((credit + 1).min(Self::CAPACITY))
+            });
+    }
+
+    fn take(&self) -> bool {
+        self.credits
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |credit| {
+                credit.checked_sub(1)
+            })
+            .is_ok()
+    }
+
+    fn take_heartbeat(&self) -> bool {
+        self.received_since_heartbeat.swap(false, Ordering::Relaxed) && self.take()
+    }
+}
+
 pub(super) struct SessionState {
     id: Session,
     generation: u64,
     options: ValidatedOptions,
     queued_bytes: AtomicUsize,
-    seen: AtomicBool,
-    response_credits: AtomicUsize,
+    responses: ResponseBudget,
     last_received: Mutex<Clock>,
     last_sent: Mutex<Clock>,
     dropped_oversized: AtomicUsize,
@@ -41,8 +70,8 @@ impl SessionState {
     pub(super) fn id(&self) -> Session {
         self.id
     }
-    pub(super) fn generation(&self) -> u64 {
-        self.generation
+    pub(super) fn can_be_replaced_by(&self, cookie: Cookie) -> bool {
+        cookie.generation > self.generation
     }
     pub(super) fn options(&self) -> ValidatedOptions {
         self.options
@@ -87,8 +116,7 @@ impl SessionState {
             generation: cookie.generation,
             options,
             queued_bytes: AtomicUsize::new(0),
-            seen: AtomicBool::new(false),
-            response_credits: AtomicUsize::new(0),
+            responses: ResponseBudget::default(),
             last_received: Mutex::new(Clock::now()),
             last_sent: Mutex::new(Clock::now()),
             dropped_oversized: AtomicUsize::new(0),
@@ -98,19 +126,10 @@ impl SessionState {
     }
     pub(super) fn received(&self) {
         *self.last_received.lock().unwrap() = Clock::now();
-        self.seen.store(true, Ordering::Relaxed);
-        let _ =
-            self.response_credits
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |credit| {
-                    Some((credit + 1).min(DISCONNECT_REPEATS + 1))
-                });
+        self.responses.received();
     }
-    pub(super) fn take_credit(&self) -> bool {
-        self.response_credits
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |credit| {
-                credit.checked_sub(1)
-            })
-            .is_ok()
+    fn heartbeat_due(&self) -> bool {
+        self.last_sent.lock().unwrap().elapsed() >= self.options.heartbeat_interval()
     }
 }
 
@@ -202,46 +221,38 @@ impl Heartbeat {
             None => self.socket.try_send(&bytes),
         };
         if result.is_ok() {
-            *self.state.last_sent.lock().unwrap() = Clock::now();
+            self.state.sent();
         }
     }
 
     pub(super) fn spawn(self) {
-        let Self {
-            socket,
-            address,
-            state,
-        } = self;
-        tokio::spawn(async move {
-            let mut timing = HeartbeatTiming::new(
-                state.options,
-                u64::from_le_bytes(state.id.as_bytes()[..8].try_into().unwrap()),
-            );
-            let heartbeat = Self {
-                socket,
-                address,
-                state,
-            };
-            let state = &heartbeat.state;
-            loop {
-                let delay = timing.next_delay();
-                tokio::select! {
-                    biased;
-                    _ = state.closed.cancelled() => break,
-                    _ = tokio::time::sleep(delay) => {
-                        if state.last_sent.lock().unwrap().elapsed() < state.options.heartbeat_interval() { continue; }
-                        if address.is_some() && (!state.seen.swap(false, Ordering::Relaxed) || !state.take_credit()) { continue; }
-                        heartbeat.send_control(Control::Keepalive);
-                    }
+        tokio::spawn(self.run());
+    }
+
+    async fn run(self) {
+        let state = &self.state;
+        let mut timing = HeartbeatTiming::new(
+            state.options,
+            u64::from_le_bytes(state.id.as_bytes()[..8].try_into().unwrap()),
+        );
+        loop {
+            let delay = timing.next_delay();
+            tokio::select! {
+                biased;
+                _ = state.cancelled() => break,
+                _ = tokio::time::sleep(delay) => {
+                    if !state.heartbeat_due() { continue; }
+                    if self.address.is_some() && !state.responses.take_heartbeat() { continue; }
+                    self.send_control(Control::Keepalive);
                 }
             }
-            for _ in 0..DISCONNECT_REPEATS {
-                if address.is_some() && !state.take_credit() {
-                    break;
-                }
-                heartbeat.send_control(Control::Disconnect);
+        }
+        for _ in 0..DISCONNECT_REPEATS {
+            if self.address.is_some() && !state.responses.take() {
+                break;
             }
-        });
+            self.send_control(Control::Disconnect);
+        }
     }
 }
 /// Non-cryptographic timing jitter; handshake secrets use the OS RNG.

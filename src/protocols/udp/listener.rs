@@ -17,17 +17,26 @@ use tokio::{
     time::Instant as Clock,
 };
 
-struct Admission {
+struct HandshakeAdmission {
+    packets_per_second: usize,
     started: Clock,
     used: usize,
 }
-impl Admission {
-    fn take(&mut self, limit: usize) -> bool {
+impl HandshakeAdmission {
+    fn new(packets_per_second: usize) -> Self {
+        Self {
+            packets_per_second,
+            started: Clock::now(),
+            used: 0,
+        }
+    }
+
+    fn take(&mut self) -> bool {
         if self.started.elapsed() >= Duration::from_secs(1) {
             self.started = Clock::now();
             self.used = 0;
         }
-        if self.used >= limit {
+        if self.used >= self.packets_per_second {
             return false;
         }
         self.used += 1;
@@ -41,7 +50,7 @@ pub struct UdpNetworkListener {
     peers: Arc<Peers>,
     cookies: CookieJar,
     options: ValidatedOptions,
-    admission: Mutex<Admission>,
+    admission: Mutex<HandshakeAdmission>,
     slots: Arc<Semaphore>,
 }
 impl UdpNetworkListener {
@@ -53,10 +62,9 @@ impl UdpNetworkListener {
             peers: Arc::default(),
             cookies: CookieJar::new()?,
             options,
-            admission: Mutex::new(Admission {
-                started: Clock::now(),
-                used: 0,
-            }),
+            admission: Mutex::new(HandshakeAdmission::new(
+                options.max_handshake_packets_per_second(),
+            )),
         })
     }
 
@@ -69,11 +77,7 @@ impl UdpNetworkListener {
     ) -> Option<UdpServerStream> {
         if let Some(HandshakeFrame { kind, cookie }) = HandshakeFrame::parse(bytes) {
             if !matches!(kind, HandshakeKind::Hello | HandshakeKind::Confirm)
-                || !self
-                    .admission
-                    .lock()
-                    .unwrap()
-                    .take(self.options.max_handshake_packets_per_second())
+                || !self.admission.lock().unwrap().take()
             {
                 return None;
             }
@@ -94,8 +98,7 @@ impl UdpNetworkListener {
                     let _ = self.socket.try_send_to(&reply.encode(cookie.mac), address);
                     return None;
                 }
-                // A delayed confirmation must not replace a newer session.
-                if cookie.generation <= peer.state().generation() {
+                if !peer.state().can_be_replaced_by(cookie) {
                     return None;
                 }
             }

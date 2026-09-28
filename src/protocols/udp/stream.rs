@@ -4,7 +4,7 @@ use super::settings::{
     DefaultUdpConfig, UdpConfig, UdpIdleTimeout, UdpOptions, ValidatedOptions, BUFFER_SIZE,
     CONNECT_TIMEOUT,
 };
-use super::wire::{Control, Frame, Payload, HEADER};
+use super::wire::{Control, Frame, Payload};
 use crate::{
     connection::MAX_PACKET_SIZE,
     protocol::{ClientStream, NetworkStream, ReadStream, ReceiveError, ServerStream, WriteStream},
@@ -219,9 +219,9 @@ pub struct UdpReadHalf {
     idle_timeout: watch::Receiver<Duration>,
     timeout_updates_open: bool,
 }
-/// Server read half.
+/// Reads datagrams routed by the listener for an accepted session.
 pub type UdpServerReadHalf = UdpReadHalf;
-/// Client read half.
+/// Reads datagrams directly from a connected client socket.
 pub type UdpClientReadHalf = UdpReadHalf;
 impl Drop for UdpReadHalf {
     fn drop(&mut self) {
@@ -342,9 +342,9 @@ impl UdpWriteHalf {
     }
 }
 
-/// Server write half.
+/// Sends datagrams to an accepted peer through the listener's shared socket.
 pub type UdpServerWriteHalf = UdpWriteHalf;
-/// Client write half.
+/// Sends datagrams through a connected client socket.
 pub type UdpClientWriteHalf = UdpWriteHalf;
 #[async_trait]
 impl WriteStream for UdpWriteHalf {
@@ -378,7 +378,7 @@ impl WriteStream for UdpWriteHalf {
         let payload = serializer
             .serialize(packet)
             .map_err(|err| io::Error::other(err.to_string()))?;
-        if payload.len() > self.state.options().max_datagram_size() - HEADER {
+        if payload.len() > self.state.options().max_payload_size() {
             self.state.drop_oversized();
             log::warn!("Dropping oversized UDP payload ({} bytes)", payload.len());
             return Ok(());

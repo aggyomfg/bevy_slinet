@@ -32,14 +32,17 @@ impl Serializer<Vec<u8>, Vec<u8>> for Raw {
         }
     }
 }
-async fn receive(read: &mut UdpReadHalf) -> Result<Vec<u8>, ReceiveError<io::Error, Ls>> {
-    read.receive(Arc::new(Raw), &Ls::default()).await
+impl UdpReadHalf {
+    async fn receive_raw(&mut self) -> Result<Vec<u8>, ReceiveError<io::Error, Ls>> {
+        self.receive(Arc::new(Raw), &Ls::default()).await
+    }
 }
-async fn send(write: &mut UdpWriteHalf, packet: Vec<u8>) {
-    write
-        .send::<Vec<u8>, _, _, _>(packet, Arc::new(Raw), &Ls::default())
-        .await
-        .unwrap();
+impl UdpWriteHalf {
+    async fn send_raw(&mut self, packet: Vec<u8>) {
+        self.send::<Vec<u8>, _, _, _>(packet, Arc::new(Raw), &Ls::default())
+            .await
+            .unwrap();
+    }
 }
 struct ConnectedPair {
     client_read: UdpReadHalf,
@@ -109,13 +112,13 @@ async fn each_datagram_is_independent_including_empty_payloads() {
             server_write: mut sw,
         } = ConnectedPair::new().await;
         for packet in [vec![1], vec![], vec![255], vec![2, 3], vec![1]] {
-            send(&mut cw, packet).await;
+            cw.send_raw(packet).await;
         }
         for expected in [vec![1], vec![], vec![2, 3], vec![1]] {
-            assert_eq!(receive(&mut sr).await.unwrap(), expected);
+            assert_eq!(sr.receive_raw().await.unwrap(), expected);
         }
-        send(&mut sw, vec![]).await;
-        assert_eq!(receive(&mut cr).await.unwrap(), Vec::<u8>::new());
+        sw.send_raw(vec![]).await;
+        assert_eq!(cr.receive_raw().await.unwrap(), Vec::<u8>::new());
     })
     .await
     .unwrap();
@@ -309,7 +312,7 @@ async fn queue_limits_and_control_packets_under_overload() {
         read.session().queued_bytes(),
         (HEADER + 1) * MAX_QUEUED_DATAGRAMS
     );
-    assert_eq!(receive(&mut read).await.unwrap(), [7]);
+    assert_eq!(read.receive_raw().await.unwrap(), [7]);
     // Disconnect bypasses the saturated application queue.
     listener.dispatch(
         &Control::Disconnect.encode(cookie.mac),
@@ -317,7 +320,7 @@ async fn queue_limits_and_control_packets_under_overload() {
         Instant::now(),
     );
     assert!(
-        matches!(receive(&mut read).await, Err(ReceiveError::Io(err)) if err.kind() == ErrorKind::ConnectionAborted)
+        matches!(read.receive_raw().await, Err(ReceiveError::Io(err)) if err.kind() == ErrorKind::ConnectionAborted)
     );
 }
 
@@ -337,7 +340,7 @@ async fn queue_byte_budget_is_bounded() {
     let (mut read, _write) = stream.into_split().await.unwrap();
     let expected = MAX_QUEUED_BYTES / bytes.len() * bytes.len();
     assert_eq!(read.session().queued_bytes(), expected);
-    receive(&mut read).await.unwrap();
+    read.receive_raw().await.unwrap();
     assert_eq!(read.session().queued_bytes(), expected - bytes.len());
 }
 
@@ -353,7 +356,7 @@ async fn idle_deadline_tracks_reception_and_setting_changes() {
     let (mut read, _write) = stream.into_split().await.unwrap();
     let (settings, timeout) = watch::channel(Duration::MAX);
     read.set_idle_timeout(timeout);
-    let mut waiting = Box::pin(receive(&mut read));
+    let mut waiting = Box::pin(read.receive_raw());
     assert!(futures::poll!(waiting.as_mut()).is_pending());
     tokio::time::advance(Duration::from_secs(20)).await;
     listener.dispatch(
@@ -379,7 +382,7 @@ async fn invalid_or_stale_packets_do_not_extend_idle_timeout() {
     } = AcceptedPeer::new(UdpOptions::DEFAULT).await;
     let address = peer.local_addr().unwrap();
     let (mut read, _write) = stream.into_split().await.unwrap();
-    let mut waiting = Box::pin(receive(&mut read));
+    let mut waiting = Box::pin(read.receive_raw());
     assert!(futures::poll!(waiting.as_mut()).is_pending());
     tokio::time::advance(Duration::from_secs(9)).await;
     listener.dispatch(
@@ -399,7 +402,7 @@ async fn dropping_read_half_closes_writer_and_remote() {
         let ConnectedPair { client_read: cr, client_write: mut cw, server_read: mut sr, server_write: _sw } = ConnectedPair::new().await;
         drop(cr);
         assert!(cw.send::<Vec<u8>, _, _, _>(vec![1], Arc::new(Raw), &Ls::default()).await.is_err());
-        assert!(matches!(receive(&mut sr).await, Err(ReceiveError::Io(err)) if err.kind() == ErrorKind::ConnectionAborted));
+        assert!(matches!(sr.receive_raw().await, Err(ReceiveError::Io(err)) if err.kind() == ErrorKind::ConnectionAborted));
     }).await.unwrap();
 }
 
@@ -450,7 +453,7 @@ async fn handshake_retries_both_legs_and_preserves_early_data() {
             assert!(hellos >= 2 && confirms >= 2);
         });
         let (mut read, _write) = result.unwrap().into_split().await.unwrap();
-        assert_eq!(receive(&mut read).await.unwrap(), [7]);
+        assert_eq!(read.receive_raw().await.unwrap(), [7]);
     })
     .await
     .unwrap();
@@ -510,12 +513,12 @@ async fn outgoing_size_budget_drops_only_oversized_packets() {
         server_write: _sw,
     } = ConnectedPair::new().await;
     let payload_limit = UdpOptions::DEFAULT.max_datagram_size - HEADER;
-    send(&mut cw, vec![7; payload_limit + 1]).await;
+    cw.send_raw(vec![7; payload_limit + 1]).await;
     assert_eq!(cw.dropped_oversized_packets(), 1);
-    send(&mut cw, vec![7; payload_limit]).await;
-    assert_eq!(receive(&mut sr).await.unwrap(), vec![7; payload_limit]);
-    send(&mut cw, vec![]).await;
-    assert!(receive(&mut sr).await.unwrap().is_empty());
+    cw.send_raw(vec![7; payload_limit]).await;
+    assert_eq!(sr.receive_raw().await.unwrap(), vec![7; payload_limit]);
+    cw.send_raw(vec![]).await;
+    assert!(sr.receive_raw().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -540,12 +543,12 @@ async fn configured_protocol_applies_options_on_both_ends() {
     let (mut sr, mut sw) = server.unwrap().into_split().await.unwrap();
     tokio::spawn(async move { while listener.accept().await.is_ok() {} });
     for write in [&mut cw, &mut sw] {
-        send(write, vec![7; 3]).await;
+        write.send_raw(vec![7; 3]).await;
         assert_eq!(write.dropped_oversized_packets(), 1);
-        send(write, vec![8; 2]).await;
+        write.send_raw(vec![8; 2]).await;
     }
-    assert_eq!(receive(&mut cr).await.unwrap(), [8, 8]);
-    assert_eq!(receive(&mut sr).await.unwrap(), [8, 8]);
+    assert_eq!(cr.receive_raw().await.unwrap(), [8, 8]);
+    assert_eq!(sr.receive_raw().await.unwrap(), [8, 8]);
 }
 
 #[test]
@@ -625,7 +628,7 @@ async fn application_traffic_suppresses_heartbeats_and_idle_resumes_them() {
     let mut buffer = [0; 256];
     for _ in 0..8 {
         tokio::time::advance(Duration::from_millis(500)).await;
-        send(&mut write, vec![7]).await;
+        write.send_raw(vec![7]).await;
         let len = server.recv(&mut buffer).await.unwrap();
         assert_eq!(
             Frame::parse(&buffer[..len]).unwrap().payload,
@@ -650,12 +653,12 @@ async fn idle_sessions_stay_alive_with_heartbeats() {
         server_read: mut sr,
         server_write: mut sw,
     } = ConnectedPair::new().await;
-    let server = tokio::spawn(async move { receive(&mut sr).await });
-    let client = tokio::spawn(async move { receive(&mut cr).await });
+    let server = tokio::spawn(async move { sr.receive_raw().await });
+    let client = tokio::spawn(async move { cr.receive_raw().await });
     tokio::time::sleep(Duration::from_secs(30)).await;
     assert!(!server.is_finished());
     assert!(!client.is_finished());
-    send(&mut sw, vec![7]).await;
+    sw.send_raw(vec![7]).await;
     assert_eq!(client.await.unwrap().unwrap(), [7]);
     server.abort();
 }
@@ -683,7 +686,7 @@ async fn client_ignores_stale_disconnect_and_malformed_frames() {
     ] {
         server.send_to(&bytes, address).await.unwrap();
     }
-    assert_eq!(receive(&mut read).await.unwrap(), [7]);
+    assert_eq!(read.receive_raw().await.unwrap(), [7]);
 }
 
 #[tokio::test]
@@ -772,7 +775,7 @@ async fn receiving_disconnect_closes_a_retained_read_half_and_writer() {
         .await
         .unwrap();
     assert!(
-        matches!(receive(&mut read).await, Err(ReceiveError::Io(err)) if err.kind() == ErrorKind::ConnectionAborted)
+        matches!(read.receive_raw().await, Err(ReceiveError::Io(err)) if err.kind() == ErrorKind::ConnectionAborted)
     );
     assert!(write
         .send::<Vec<u8>, _, _, _>(vec![7], Arc::new(Raw), &Ls::default())

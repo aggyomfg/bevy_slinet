@@ -2,9 +2,9 @@ use super::wire::HEADER;
 use super::{ConfiguredUdpClientStream, UdpNetworkListener, UdpServerStream};
 use crate::Protocol;
 use async_trait::async_trait;
-#[cfg(any(feature = "client", feature = "server"))]
-use bevy::log;
 use bevy::prelude::Resource;
+#[cfg(any(feature = "client", feature = "server"))]
+use bevy::{ecs::system::SystemParam, log, prelude::Res};
 use std::{
     io::{self, ErrorKind},
     marker::PhantomData,
@@ -36,7 +36,7 @@ pub struct UdpOptions {
     /// Maximum HELLO/CONFIRM packets handled per second, shared by all addresses.
     pub max_handshake_packets_per_second: usize,
     /// Maximum outgoing data datagram size, including the 37-byte session header.
-    /// Defaults to 1200 bytes. Configure this for the path MTU; it is not PMTU discovery.
+    /// Configure this for the path MTU; it does not perform PMTU discovery.
     pub max_datagram_size: usize,
     /// Heartbeat interval while no application data is being sent.
     pub heartbeat_interval: Duration,
@@ -44,7 +44,7 @@ pub struct UdpOptions {
     pub heartbeat_jitter: Duration,
 }
 impl UdpOptions {
-    /// Default UDP settings.
+    /// Provides a starting point for compile-time overrides in [`UdpConfig::OPTIONS`].
     pub const DEFAULT: Self = Self {
         max_peers: 1024,
         max_handshake_packets_per_second: 256,
@@ -82,10 +82,9 @@ impl<C: UdpConfig> Protocol for ConfiguredUdpProtocol<C> {
         UdpNetworkListener::bind(addr, C::OPTIONS).await
     }
 }
-/// Closes a UDP connection when no datagrams arrive from the peer for this long.
-/// Allow several heartbeat intervals (including jitter); `Duration::MAX` disables it.
-/// Defaults to 10 seconds. Applies only to this Bevy app. Changes wake pending reads;
-/// the deadline is measured from the last valid datagram. Removing the resource restores the default.
+/// Closes app-local sessions after this much time without a valid peer datagram.
+/// Changes wake pending reads; removing this resource restores the default timeout.
+/// `Duration::MAX` disables expiry. Allow several heartbeat intervals, including jitter.
 #[derive(Clone, Copy, Debug, Resource)]
 pub struct UdpIdleTimeout(pub Duration);
 
@@ -106,9 +105,9 @@ impl Default for IdleTimeoutSettings {
     }
 }
 
-/// Adds the systems that forward [`UdpIdleTimeout`] to this app's connections.
 #[cfg(any(feature = "client", feature = "server"))]
 impl IdleTimeoutSettings {
+    /// Forwards [`UdpIdleTimeout`] changes to this app's connections.
     pub(crate) fn install(app: &mut bevy::prelude::App) -> watch::Receiver<Duration> {
         use bevy::prelude::{Startup, Update};
 
@@ -122,21 +121,33 @@ impl IdleTimeoutSettings {
 }
 
 #[cfg(any(feature = "client", feature = "server"))]
-pub(crate) fn set_idle_timeout_system(
-    timeout: Option<bevy::prelude::Res<UdpIdleTimeout>>,
-    settings: bevy::prelude::Res<IdleTimeoutSettings>,
-) {
-    let timeout = timeout.map(|timeout| *timeout).unwrap_or_default().0;
-    settings.0.send_if_modified(|current| {
-        if *current == timeout {
-            return false;
-        }
-        if timeout.is_zero() {
-            log::warn!("UdpIdleTimeout is zero; connections expire immediately");
-        }
-        *current = timeout;
-        true
-    });
+/// Reads the app's timeout override and publishes it to active connections.
+#[derive(SystemParam)]
+struct IdleTimeouts<'w> {
+    timeout: Option<Res<'w, UdpIdleTimeout>>,
+    settings: Res<'w, IdleTimeoutSettings>,
+}
+
+#[cfg(any(feature = "client", feature = "server"))]
+impl IdleTimeouts<'_> {
+    fn synchronize(&self) {
+        let timeout = self.timeout.as_deref().copied().unwrap_or_default().0;
+        self.settings.0.send_if_modified(|current| {
+            if *current == timeout {
+                return false;
+            }
+            if timeout.is_zero() {
+                log::warn!("UdpIdleTimeout is zero; connections expire immediately");
+            }
+            *current = timeout;
+            true
+        });
+    }
+}
+
+#[cfg(any(feature = "client", feature = "server"))]
+fn set_idle_timeout_system(timeouts: IdleTimeouts) {
+    timeouts.synchronize();
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -166,8 +177,8 @@ impl ValidatedOptions {
     pub(super) fn max_handshake_packets_per_second(self) -> usize {
         self.0.max_handshake_packets_per_second
     }
-    pub(super) fn max_datagram_size(self) -> usize {
-        self.0.max_datagram_size
+    pub(super) fn max_payload_size(self) -> usize {
+        self.0.max_datagram_size - HEADER
     }
     pub(super) fn heartbeat_interval(self) -> Duration {
         self.0.heartbeat_interval
