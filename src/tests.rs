@@ -198,6 +198,45 @@ fn udp_packets_and_disconnection() {
         .is_empty());
 }
 
+#[cfg(feature = "protocol_udp")]
+#[test]
+fn silent_udp_endpoint_does_not_block_other_connections() {
+    // Keep the socket open without answering, so the first handshake waits for its timeout.
+    let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut server = App::new();
+    server.add_plugins(ServerPlugin::<UdpConfig>::bind("127.0.0.1:0"));
+    server.update();
+    let address = server
+        .world()
+        .resource::<ServerAddress<UdpConfig>>()
+        .address();
+    let mut client = App::new();
+    client.add_plugins(ClientPlugin::<UdpConfig>::new());
+    client.update();
+    client
+        .world_mut()
+        .trigger(client::ConnectionRequestEvent::<UdpConfig>::new(
+            silent.local_addr().unwrap(),
+        ));
+    client
+        .world_mut()
+        .trigger(client::ConnectionRequestEvent::<UdpConfig>::new(address));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        client.update();
+        server.update();
+        if let Some(connection) = client.world().get_resource::<ClientConnection<UdpConfig>>() {
+            assert_eq!(connection.peer_addr(), address);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "live endpoint was blocked by a silent handshake"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn exchange_packets<C: TestConfig>() -> (App, App) {
     let client_to_server_packet = Packet(42);
     let server_to_client_packet = Packet(24);

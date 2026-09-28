@@ -10,6 +10,7 @@ use std::sync::Arc;
 use bevy::log;
 use bevy::platform::time::Instant;
 use bevy::prelude::*;
+use futures::StreamExt;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::connection::{
@@ -210,7 +211,7 @@ fn setup_system<Config: ClientConfig>(
     mut commands: Commands,
     idle_timeout: tokio::sync::watch::Receiver<std::time::Duration>,
 ) {
-    let (req_tx, mut req_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (req_tx, req_rx) = tokio::sync::mpsc::unbounded_channel();
     commands.insert_resource(ConnectionRequestSender::<Config>(req_tx, PhantomData));
 
     let (conn_tx, conn_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -226,21 +227,33 @@ fn setup_system<Config: ClientConfig>(
     let disc_tx2 = disc_tx.clone();
     run_async(async move {
         let mut warned = false;
-        while let Some(address) = req_rx.recv().await {
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            let serializer = Config::build_serializer();
-            warn_if_stateful_over_datagrams::<Config::Protocol, _, _, _, _>(
-                &serializer,
-                &mut warned,
-            );
-            match create_connection::<Config>(
-                address,
-                Arc::new(serializer),
-                Config::LengthSerializer::default(),
-                rx,
-            )
-            .await
-            {
+        // Bound in-flight handshakes while allowing other endpoints to connect.
+        let requests = futures::stream::unfold(req_rx, |mut requests| async move {
+            requests.recv().await.map(|address| (address, requests))
+        });
+        let connections = requests
+            .map(|address| {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                let serializer = Config::build_serializer();
+                warn_if_stateful_over_datagrams::<Config::Protocol, _, _, _, _>(
+                    &serializer,
+                    &mut warned,
+                );
+                async move {
+                    let result = create_connection::<Config>(
+                        address,
+                        Arc::new(serializer),
+                        Config::LengthSerializer::default(),
+                        rx,
+                    )
+                    .await;
+                    (address, tx, result)
+                }
+            })
+            .buffer_unordered(8);
+        futures::pin_mut!(connections);
+        while let Some((address, tx, result)) = connections.next().await {
+            match result {
                 Ok(connection) => {
                     let ecs_conn = EcsConnection {
                         disconnect_task: connection.disconnect_task.clone(),

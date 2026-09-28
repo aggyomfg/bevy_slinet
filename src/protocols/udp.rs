@@ -5,8 +5,8 @@
 //! [`MAX_DATAGRAM_SIZE`] minus one byte (65,506 bytes); larger packets are dropped, as are
 //! packets the OS refuses to send. `MaxPacketSize` limits the payload, excluding the tag.
 //! The config's `LengthSerializer` is not used. Datagrams larger than the path MTU (about
-//! 1,472 bytes of payload on typical networks) are fragmented, and losing any fragment
-//! loses the whole packet.
+//! 1,472 bytes of payload on typical networks) may be fragmented or rejected by the OS.
+//! Losing any fragment loses the whole packet; prefer small application packets.
 //!
 //! Delivery is unreliable and unordered: packets may be lost, duplicated or reordered.
 //! A lost or malformed datagram does not affect the framing of other packets. Serializers
@@ -20,17 +20,20 @@
 //! datagrams from unknown peers are answered with a disconnect.
 //!
 //! Clients send a `2` keep-alive datagram every [`KEEPALIVE_INTERVAL`]. The server sends one per
-//! interval only if the client sent something in that interval, so it never sends more
-//! datagrams than it receives. Both sides close the connection after [`UdpIdleTimeout`] without
-//! any datagrams from the other side. A closing peer sends several `3` disconnect datagrams,
-//! which close the connection on the other side.
+//! interval only if the client sent something in that interval. Server keep-alives and
+//! disconnects share a bounded response budget, so service traffic is not amplified.
+//! Both sides close the connection after [`UdpIdleTimeout`] without any datagrams from
+//! the other side. A closing peer sends several `3` disconnect datagrams,
+//! subject to that response budget on the server. If no notification arrives, the peer
+//! detects closure through its idle timeout. There is no session identifier or address
+//! validation: delayed packets can cross reconnects that reuse the same address.
 
 use std::fmt::Debug;
 use std::io;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -165,7 +168,9 @@ fn spawn_keepalive(
                 biased;
                 _ = &mut stopped => break,
                 _ = interval.tick() => {
-                    if peer.as_ref().is_some_and(|peer| !peer.seen.swap(false, Ordering::Relaxed)) {
+                    if peer.as_ref().is_some_and(|peer| {
+                        !peer.seen.swap(false, Ordering::Relaxed) || !peer.take_response_credit()
+                    }) {
                         continue;
                     }
                     // Errors are reported to the read half or end in an idle timeout.
@@ -174,6 +179,12 @@ fn spawn_keepalive(
             }
         }
         for _ in 0..DISCONNECT_REPEATS {
+            if peer
+                .as_ref()
+                .is_some_and(|peer| !peer.take_response_credit())
+            {
+                break;
+            }
             let _ = send_datagram(&socket, peer_addr, &[DISCONNECT_DATAGRAM]).await;
         }
     });
@@ -194,7 +205,7 @@ impl Protocol for UdpProtocol {
     async fn bind(addr: SocketAddr) -> std::io::Result<Self::Listener> {
         Ok(UdpNetworkListener {
             socket: Arc::new(UdpSocket::bind(addr).await?),
-            tasks: DashMap::new(),
+            tasks: Arc::new(DashMap::new()),
         })
     }
 }
@@ -204,8 +215,36 @@ type Queued = (Box<[u8]>, Instant);
 #[derive(Default)]
 struct PeerState {
     queued_bytes: AtomicUsize,
-    /// Set for every non-probe datagram, cleared by each keep-alive tick.
+    /// Set for every valid non-probe datagram, cleared by each keep-alive tick.
     seen: AtomicBool,
+    response_credits: AtomicUsize,
+}
+
+impl PeerState {
+    fn take_response_credit(&self) -> bool {
+        self.response_credits
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |credits| {
+                credits.checked_sub(1)
+            })
+            .is_ok()
+    }
+}
+
+// Cleanup belongs to this particular queue, never just to a reused socket address.
+struct PeerRegistration {
+    tasks: Weak<DashMap<SocketAddr, Peer>>,
+    address: SocketAddr,
+    state: Arc<PeerState>,
+}
+
+impl Drop for PeerRegistration {
+    fn drop(&mut self) {
+        if let Some(tasks) = self.tasks.upgrade() {
+            tasks.remove_if(&self.address, |_, peer| {
+                Arc::ptr_eq(&peer.state, &self.state)
+            });
+        }
+    }
 }
 
 /// The listener's end of a server connection's datagram queue.
@@ -226,22 +265,33 @@ impl Peer {
 
     /// Returns `false` if the connection's read half is gone.
     fn push(&self, datagram: &[u8], received_at: Instant) -> bool {
-        // Empty datagrams are connection probes sent by `UdpClientStream::connect`.
         let len = datagram.len();
-        if len > 0 {
-            self.state.seen.store(true, Ordering::Relaxed);
-        }
-        if len == 0 || self.state.queued_bytes.load(Ordering::Relaxed) + len > MAX_QUEUED_BYTES {
+        if !valid_datagram(datagram) {
             return !self.queue.is_closed();
         }
-        self.state.queued_bytes.fetch_add(len, Ordering::Relaxed);
-        match self.queue.try_send((datagram.into(), received_at)) {
-            Ok(()) => true,
-            Err(err) => {
-                self.state.queued_bytes.fetch_sub(len, Ordering::Relaxed);
-                matches!(err, TrySendError::Full(_))
+        let delivered = if self.state.queued_bytes.load(Ordering::Relaxed) + len > MAX_QUEUED_BYTES
+        {
+            !self.queue.is_closed()
+        } else {
+            match self.queue.try_reserve() {
+                Ok(permit) => {
+                    self.state.queued_bytes.fetch_add(len, Ordering::Relaxed);
+                    permit.send((datagram.into(), received_at));
+                    true
+                }
+                Err(err) => matches!(err, TrySendError::Full(_)),
             }
+        };
+        if delivered {
+            // A closed queue is answered by the listener; do not also credit its old task.
+            let _ = self.state.response_credits.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |credits| Some((credits + 1).min(DISCONNECT_REPEATS + 1)),
+            );
+            self.state.seen.store(true, Ordering::Relaxed);
         }
+        delivered
     }
 }
 
@@ -250,6 +300,7 @@ enum Incoming {
         queue: mpsc::Receiver<Queued>,
         state: Arc<PeerState>,
         current: Box<[u8]>,
+        _registration: Option<PeerRegistration>,
     },
     Socket {
         socket: Arc<UdpSocket>,
@@ -264,6 +315,7 @@ impl Incoming {
                 queue,
                 state,
                 current,
+                ..
             } => {
                 let (datagram, received_at) = queue.recv().await.ok_or_else(disconnected_error)?;
                 state
@@ -283,7 +335,7 @@ impl Incoming {
 /// A UDP listener.
 pub struct UdpNetworkListener {
     socket: Arc<UdpSocket>,
-    tasks: DashMap<SocketAddr, Peer>,
+    tasks: Arc<DashMap<SocketAddr, Peer>>,
 }
 
 #[async_trait]
@@ -313,7 +365,8 @@ impl Listener for UdpNetworkListener {
                 .get(&address)
                 .map(|peer| peer.push(datagram, received_at));
             if delivered == Some(false) {
-                self.tasks.remove(&address);
+                self.tasks
+                    .remove_if(&address, |_, peer| peer.queue.is_closed());
             }
             if datagram.is_empty() {
                 // Answered before the connection exists, so a cancelled `accept` loses only the probe.
@@ -324,6 +377,11 @@ impl Listener for UdpNetworkListener {
                     self.tasks.insert(address, peer);
                     return Ok(UdpServerStream {
                         incoming,
+                        registration: PeerRegistration {
+                            tasks: Arc::downgrade(&self.tasks),
+                            address,
+                            state: Arc::clone(&state),
+                        },
                         state,
                         peer_addr: address,
                         socket: Arc::clone(&self.socket),
@@ -340,13 +398,13 @@ impl Listener for UdpNetworkListener {
         self.socket.local_addr().unwrap()
     }
 
-    fn handle_disconnection(&self, peer_addr: SocketAddr) {
-        self.tasks.remove(&peer_addr);
-    }
+    // The address-only callback cannot distinguish successive connections.
+    // PeerRegistration removes the exact entry when its read half is dropped.
 }
 
 /// A server-side UDP connection that reads the datagrams queued by [`UdpNetworkListener`].
 pub struct UdpServerStream {
+    registration: PeerRegistration,
     incoming: mpsc::Receiver<Queued>,
     state: Arc<PeerState>,
     peer_addr: SocketAddr,
@@ -369,6 +427,7 @@ impl NetworkStream for UdpServerStream {
             queue: self.incoming,
             state: self.state,
             current: Box::default(),
+            _registration: Some(self.registration),
         };
         Ok((
             UdpReadHalf::new(incoming, keepalive),
@@ -563,19 +622,36 @@ impl ClientStream for UdpClientStream {
     }
 }
 
-/// Probes the server until it answers. Only a probe answer is consumed; any other datagram
-/// also proves the server knows this client and is left for the read half.
+/// Accepts an empty acknowledgement or a framed early data packet. Data is left
+/// in the socket for the read half; invalid answers are consumed without re-probing.
 async fn handshake(socket: &UdpSocket) -> io::Result<()> {
     let mut buffer = vec![0; BUFFER_SIZE];
+    let mut probes = tokio::time::interval(PROBE_INTERVAL);
+    probes.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
-        socket.send(&[]).await?;
-        if let Ok(answer) = tokio::time::timeout(PROBE_INTERVAL, socket.peek(&mut buffer)).await {
-            if answer? == 0 {
-                socket.recv(&mut buffer).await?;
+        tokio::select! {
+            _ = probes.tick() => { socket.send(&[]).await?; }
+            answer = socket.peek(&mut buffer) => {
+                let len = answer?;
+                match &buffer[..len] {
+                    [] => {
+                        socket.recv(&mut buffer).await?;
+                        return Ok(());
+                    }
+                    [DISCONNECT_DATAGRAM] => {
+                        return Err(io::Error::new(ErrorKind::ConnectionRefused, "the UDP server refused the connection"));
+                    }
+                    [DATA_DATAGRAM, ..] if len <= MAX_DATAGRAM_SIZE => return Ok(()),
+                    _ => { socket.recv(&mut buffer).await?; }
+                }
             }
-            return Ok(());
         }
     }
+}
+
+fn valid_datagram(datagram: &[u8]) -> bool {
+    matches!(datagram, [KEEPALIVE_DATAGRAM] | [DISCONNECT_DATAGRAM])
+        || matches!(datagram, [DATA_DATAGRAM, ..] if datagram.len() <= MAX_DATAGRAM_SIZE)
 }
 
 /// UDP send errors (`EMSGSIZE`, `ENOBUFS`, ICMP errors) affect one packet, not the connection.
@@ -619,7 +695,7 @@ where
     let Some((&tag, payload)) = datagram.split_first() else {
         return Ok(None);
     };
-    if tag == DISCONNECT_DATAGRAM {
+    if datagram == [DISCONNECT_DATAGRAM] {
         return Err(disconnected_error());
     }
     if tag != DATA_DATAGRAM || datagram.len() > MAX_DATAGRAM_SIZE {
@@ -835,6 +911,7 @@ mod tests {
             queue,
             state: Arc::clone(&peer.state),
             current: Box::default(),
+            _registration: None,
         };
         (peer, UdpReadHalf::new(incoming, oneshot::channel().0))
     }
@@ -952,6 +1029,8 @@ mod tests {
                 vec![0],
                 vec![KEEPALIVE_DATAGRAM],
                 vec![0xAB, 7],
+                vec![DISCONNECT_DATAGRAM, 99, 42],
+                vec![KEEPALIVE_DATAGRAM, 99],
                 vec![DATA_DATAGRAM, 0xFF, 9],
             ] {
                 write.write_all(&invalid).await.unwrap();
@@ -1118,6 +1197,12 @@ mod tests {
             .unwrap();
         tokio::time::sleep(KEEPALIVE_INTERVAL * 5).await;
         assert_eq!(drain(&peer), [vec![KEEPALIVE_DATAGRAM]]);
+        drop(_server);
+        tokio::time::sleep(KEEPALIVE_INTERVAL).await;
+        assert!(
+            drain(&peer).is_empty(),
+            "the keepalive already spent this peer's credit"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1129,10 +1214,8 @@ mod tests {
         drop(read);
         tokio::time::sleep(KEEPALIVE_INTERVAL * 5).await;
         let received = drain(&peer);
-        assert!(
-            received.ends_with(&vec![vec![DISCONNECT_DATAGRAM]; DISCONNECT_REPEATS]),
-            "{received:?}"
-        );
+        assert_eq!(received, [Vec::<u8>::new()]);
+        assert!(listener.tasks.is_empty());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1253,8 +1336,16 @@ mod tests {
                     .unwrap_err(),
             );
 
-            let (mut client_read, _client_write, server_read, _server_write) =
+            let (mut client_read, mut client_write, mut server_read, _server_write) =
                 connected_pair().await;
+            // Supply actual client traffic for the server's close-notification budget.
+            for _ in 0..DISCONNECT_REPEATS + 1 {
+                client_write.write_all(&[DATA_DATAGRAM, 7]).await.unwrap();
+                server_read
+                    .receive::<Vec<u8>, Vec<u8>, _, _>(Arc::new(RawSerializer), &Ls::default())
+                    .await
+                    .unwrap();
+            }
             drop(server_read);
             assert_disconnected(
                 client_read
@@ -1272,6 +1363,7 @@ mod tests {
             let (listener, mut client_read, mut client_write, server_read, _server_write) =
                 connected().await;
             let client_addr = *listener.tasks.iter().next().unwrap().key();
+            drop(server_read);
             listener.handle_disconnection(client_addr);
             client_write
                 .send::<Vec<u8>, _, _, _>(vec![7], Arc::new(RawSerializer), &Ls::default())
@@ -1284,9 +1376,89 @@ mod tests {
                     .unwrap_err(),
             );
             assert!(listener.tasks.is_empty());
-            drop(server_read);
         })
         .await;
+    }
+
+    #[test]
+    fn closed_queues_do_not_earn_response_credit() {
+        let (peer, incoming) = Peer::new();
+        drop(incoming);
+        assert!(!peer.push(&[DATA_DATAGRAM, 7], Instant::now()));
+        assert!(!peer.state.take_response_credit());
+    }
+
+    #[tokio::test]
+    async fn stale_cleanup_preserves_replacement_peer() {
+        let listener = UdpProtocol::bind(([127, 0, 0, 1], 0).into()).await.unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        socket.send_to(&[], listener.address()).await.unwrap();
+        let old = listener.accept().await.unwrap();
+        let (replacement, mut incoming) = Peer::new();
+        listener.tasks.insert(address, replacement);
+        drop(old);
+        listener.handle_disconnection(address);
+        assert!(listener
+            .tasks
+            .get(&address)
+            .unwrap()
+            .push(&[DATA_DATAGRAM, 7], Instant::now()));
+        assert_eq!(&*incoming.recv().await.unwrap().0, &[DATA_DATAGRAM, 7]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_probe_does_not_amplify_disconnects() {
+        let listener = UdpProtocol::bind(([127, 0, 0, 1], 0).into()).await.unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.send_to(&[], listener.address()).await.unwrap();
+        let (mut read, _write) = listener.accept().await.unwrap().into_split().await.unwrap();
+        assert_idle(
+            read.receive::<Vec<u8>, Vec<u8>, _, _>(Arc::new(RawSerializer), &Ls::default())
+                .await
+                .unwrap_err(),
+        );
+        drop(read);
+        tokio::time::sleep(KEEPALIVE_INTERVAL).await;
+        assert_eq!(drain(&socket), [Vec::<u8>::new()]);
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_refusal() {
+        with_timeout(async {
+            let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let (result, ()) = tokio::join!(
+                UdpClientStream::connect(server.local_addr().unwrap()),
+                async {
+                    let (_, address) = server.recv_from(&mut [0; 16]).await.unwrap();
+                    server
+                        .send_to(&[DISCONNECT_DATAGRAM], address)
+                        .await
+                        .unwrap();
+                }
+            );
+            assert_eq!(result.err().unwrap().kind(), ErrorKind::ConnectionRefused);
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_does_not_accept_invalid_answers() {
+        for answer in [
+            vec![99],
+            vec![DISCONNECT_DATAGRAM, 99, 42],
+            vec![KEEPALIVE_DATAGRAM],
+        ] {
+            let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let (result, ()) = tokio::join!(
+                UdpClientStream::connect(server.local_addr().unwrap()),
+                async {
+                    let (_, address) = server.recv_from(&mut [0; 16]).await.unwrap();
+                    server.send_to(&answer, address).await.unwrap();
+                }
+            );
+            assert_eq!(result.err().unwrap().kind(), ErrorKind::TimedOut);
+        }
     }
 
     #[tokio::test]
