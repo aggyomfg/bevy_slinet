@@ -9,7 +9,7 @@ A simple networking plugin for bevy.
 ## Features
 
 - You can choose TCP or UDP protocol. Adding your own protocols is as easy as implementing a few traits.
-  UDP sends one packet per datagram: delivery is unreliable and unordered. A one-byte data tag allows empty payloads; the serialized payload limit is 65506 bytes. Serializers must decode packets independently, including after malformed input. UDP peers exchange keep-alives and close connections that stay silent for `UdpIdleTimeout` (10 s by default). This wire format is incompatible with older UDP framing; update both peers together.
+  UDP sends one packet per datagram: delivery is unreliable and unordered. A one-byte data tag allows empty payloads; the serialized payload limit is 65506 bytes, and packets the OS refuses to send are dropped. Serializers must decode packets independently, including after malformed input. Clients connect only after the server answers their probe. UDP peers exchange keep-alives, close connections that stay silent for `UdpIdleTimeout` (10 s by default), and notify each other on disconnect. This wire format is incompatible with older UDP framing; update both peers together.
 - Multiple clients/servers with different configs (specifies a protocol, packet types, serializer, etc.)
 - De/serialization. You choose a serialization format, packet type (you probably want it to be `enum`), and receive events with deserialized packets.
 
