@@ -1,25 +1,38 @@
 //! UDP protocol implementation based on [`tokio::net`]. You can enable it by adding `protocol_udp` feature.
+//!
+//! Every packet is sent as exactly one datagram, without a length prefix, so delivery is
+//! unreliable and unordered: packets may be lost, duplicated or reordered, but a lost or
+//! malformed datagram never affects other packets. Serialized packets must be non-empty and
+//! fit into a single datagram ([`MAX_DATAGRAM_SIZE`] bytes); other packets are dropped.
 
-use std::future::Future;
+use std::collections::VecDeque;
+use std::fmt::Debug;
 use std::io;
 use std::io::ErrorKind;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
+use std::task::Poll;
 
 use async_trait::async_trait;
+use bevy::log;
 use dashmap::DashMap;
+use futures::future::poll_fn;
 use futures::task::AtomicWaker;
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
 
+use crate::connection::MAX_PACKET_SIZE;
 use crate::protocol::{
-    ClientStream, Listener, NetworkStream, ReadStream, ServerStream, WriteStream,
+    ClientStream, Listener, NetworkStream, ReadStream, ReceiveError, ServerStream, WriteStream,
 };
-use crate::Protocol;
+use crate::serializer::Serializer;
+use crate::{PacketLengthSerializer, Protocol};
 
 const BUFFER_SIZE: usize = u16::MAX as usize;
+/// The largest UDP payload that can be sent over IPv4.
+pub const MAX_DATAGRAM_SIZE: usize = 65_507;
+/// Datagrams received from a peer beyond this many unread ones are dropped.
+const MAX_QUEUED_DATAGRAMS: usize = 1024;
 
 /// UDP protocol.
 pub struct UdpProtocol;
@@ -38,13 +51,42 @@ impl Protocol for UdpProtocol {
     }
 }
 
+#[derive(Default)]
 struct Inner {
     waker: AtomicWaker,
-    bytes: Mutex<Vec<u8>>,
+    datagrams: Mutex<VecDeque<Box<[u8]>>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct UdpRead(Arc<Inner>);
+
+impl UdpRead {
+    fn push(&self, datagram: &[u8]) {
+        // Empty datagrams are connection probes sent by `UdpClientStream::connect`.
+        if datagram.is_empty() {
+            return;
+        }
+        {
+            let mut datagrams = self.0.datagrams.lock().unwrap();
+            if datagrams.len() >= MAX_QUEUED_DATAGRAMS {
+                return;
+            }
+            datagrams.push_back(datagram.into());
+        }
+        self.0.waker.wake();
+    }
+
+    async fn pop(&self) -> Box<[u8]> {
+        poll_fn(|cx| {
+            self.0.waker.register(cx.waker());
+            match self.0.datagrams.lock().unwrap().pop_front() {
+                Some(datagram) => Poll::Ready(datagram),
+                None => Poll::Pending,
+            }
+        })
+        .await
+    }
+}
 
 /// A UDP listener.
 pub struct UdpNetworkListener {
@@ -59,19 +101,13 @@ impl Listener for UdpNetworkListener {
     async fn accept(&self) -> std::io::Result<UdpServerStream> {
         let mut buf = [0; BUFFER_SIZE];
         loop {
-            let (bytes, address) = self.socket.recv_from(&mut buf).await?;
-            let bytes = &buf[..bytes];
+            let (len, address) = self.socket.recv_from(&mut buf).await?;
+            let datagram = &buf[..len];
             if let Some(task) = self.tasks.get(&address) {
-                {
-                    let mut task_bytes = task.0.bytes.lock().await;
-                    task_bytes.extend(bytes);
-                }
-                task.0.waker.wake();
+                task.push(datagram);
             } else {
-                let new_task = UdpRead(Arc::new(Inner {
-                    waker: AtomicWaker::new(),
-                    bytes: Mutex::new(Vec::new()),
-                }));
+                let new_task = UdpRead::default();
+                new_task.push(datagram);
                 self.tasks.insert(address, new_task.clone());
                 return Ok(UdpServerStream {
                     task: new_task,
@@ -128,47 +164,26 @@ pub struct UdpServerReadHalf(UdpRead);
 
 #[async_trait]
 impl ReadStream for UdpServerReadHalf {
-    fn read_exact<'life0, 'life1, 'async_trait>(
-        &'life0 mut self,
-        buffer: &'life1 mut [u8],
-    ) -> Pin<Box<dyn Future<Output = Result<(), std::io::Error>> + std::marker::Send + 'async_trait>>
-    where
-        'life0: 'async_trait,
-        'life1: 'async_trait,
-        Self: 'async_trait,
-    {
-        Box::pin(UdpReadTask {
-            read: self.0.clone(),
-            buffer,
-        })
+    async fn read_exact(&mut self, _buffer: &mut [u8]) -> io::Result<()> {
+        Err(datagram_only_error())
     }
-}
 
-/// A future that tries to read bytes from cache, and receives additional bytes if needed.
-/// [`UdpSocket::recv`] discards bytes that are not needed and there's no way to save them without buffering.
-pub struct UdpReadTask<'a> {
-    read: UdpRead,
-    buffer: &'a mut [u8],
-}
-
-impl Future for UdpReadTask<'_> {
-    type Output = io::Result<()>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let UdpReadTask { read, buffer } = &mut *self;
-
-        if let Ok(mut bytes) = read.0.bytes.try_lock() {
-            if bytes.len() >= buffer.len() {
-                buffer.copy_from_slice(&bytes[..buffer.len()]);
-                *bytes = bytes[buffer.len()..].to_vec();
-                Poll::Ready(Ok(()))
-            } else {
-                read.0.waker.register(cx.waker());
-                Poll::Pending
+    async fn receive<ReceivingPacket, SendingPacket, S, LS>(
+        &mut self,
+        serializer: Arc<S>,
+        _length_serializer: &LS,
+    ) -> Result<ReceivingPacket, ReceiveError<S::DecodeError, LS>>
+    where
+        ReceivingPacket: Send + Sync + Debug + 'static,
+        SendingPacket: Send + Sync + Debug + 'static,
+        S: Serializer<ReceivingPacket, SendingPacket> + ?Sized,
+        LS: PacketLengthSerializer,
+    {
+        loop {
+            let datagram = self.0.pop().await;
+            if let Some(packet) = decode_datagram(&datagram, &*serializer) {
+                return Ok(packet);
             }
-        } else {
-            read.0.waker.register(cx.waker());
-            Poll::Pending
         }
     }
 }
@@ -186,6 +201,24 @@ impl WriteStream for UdpServerWriteHalf {
             .send_to(buffer, self.peer_addr)
             .await
             .and_then(|i| assert_all(i, buffer))
+    }
+
+    async fn send<ReceivingPacket, SendingPacket, S, LS>(
+        &mut self,
+        packet: SendingPacket,
+        serializer: Arc<S>,
+        _length_serializer: &LS,
+    ) -> io::Result<()>
+    where
+        ReceivingPacket: Send + Sync + Debug + 'static,
+        SendingPacket: Send + Sync + Debug + 'static,
+        S: Serializer<ReceivingPacket, SendingPacket> + ?Sized,
+        LS: PacketLengthSerializer,
+    {
+        match encode_datagram(packet, &*serializer) {
+            Some(datagram) => self.write_all(&datagram).await,
+            None => Ok(()),
+        }
     }
 }
 
@@ -212,7 +245,7 @@ impl NetworkStream for UdpClientStream {
         };
         let read = UdpClientReadHalf {
             socket: read_socket,
-            buffer: Vec::new(),
+            buffer: vec![0; BUFFER_SIZE].into_boxed_slice(),
         };
         Ok((read, write))
     }
@@ -232,7 +265,11 @@ impl ClientStream for UdpClientStream {
     where
         Self: Sized,
     {
-        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let local_addr: SocketAddr = match addr {
+            SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
+            SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
+        };
+        let socket = UdpSocket::bind(local_addr).await?;
         socket.connect(addr).await?;
 
         // TODO remove this
@@ -250,21 +287,38 @@ impl ClientStream for UdpClientStream {
 /// A read half of [`UdpClientStream`].
 pub struct UdpClientReadHalf {
     socket: UdpSocket,
-    buffer: Vec<u8>,
+    buffer: Box<[u8]>,
 }
 
 #[async_trait]
 impl ReadStream for UdpClientReadHalf {
-    async fn read_exact(&mut self, buffer: &mut [u8]) -> std::io::Result<()> {
+    async fn read_exact(&mut self, _buffer: &mut [u8]) -> io::Result<()> {
+        Err(datagram_only_error())
+    }
+
+    async fn receive<ReceivingPacket, SendingPacket, S, LS>(
+        &mut self,
+        serializer: Arc<S>,
+        _length_serializer: &LS,
+    ) -> Result<ReceivingPacket, ReceiveError<S::DecodeError, LS>>
+    where
+        ReceivingPacket: Send + Sync + Debug + 'static,
+        SendingPacket: Send + Sync + Debug + 'static,
+        S: Serializer<ReceivingPacket, SendingPacket> + ?Sized,
+        LS: PacketLengthSerializer,
+    {
         loop {
-            if self.buffer.len() >= buffer.len() {
-                buffer.copy_from_slice(&self.buffer[..buffer.len()]);
-                self.buffer = self.buffer[buffer.len()..].to_vec();
-                return Ok(());
+            let len = self
+                .socket
+                .recv(&mut self.buffer)
+                .await
+                .map_err(ReceiveError::Io)?;
+            if len == 0 {
+                continue;
             }
-            let mut buf = [0; BUFFER_SIZE];
-            let read = self.socket.recv(&mut buf).await?;
-            self.buffer.extend(&buf[..read]);
+            if let Some(packet) = decode_datagram(&self.buffer[..len], &*serializer) {
+                return Ok(packet);
+            }
         }
     }
 }
@@ -282,6 +336,24 @@ impl WriteStream for UdpClientWriteHalf {
             .await
             .and_then(|i| assert_all(i, buffer))
     }
+
+    async fn send<ReceivingPacket, SendingPacket, S, LS>(
+        &mut self,
+        packet: SendingPacket,
+        serializer: Arc<S>,
+        _length_serializer: &LS,
+    ) -> io::Result<()>
+    where
+        ReceivingPacket: Send + Sync + Debug + 'static,
+        SendingPacket: Send + Sync + Debug + 'static,
+        S: Serializer<ReceivingPacket, SendingPacket> + ?Sized,
+        LS: PacketLengthSerializer,
+    {
+        match encode_datagram(packet, &*serializer) {
+            Some(datagram) => self.write_all(&datagram).await,
+            None => Ok(()),
+        }
+    }
 }
 
 fn assert_all(i: usize, buf: &[u8]) -> io::Result<()> {
@@ -289,5 +361,150 @@ fn assert_all(i: usize, buf: &[u8]) -> io::Result<()> {
         Ok(())
     } else {
         Err(io::Error::from(ErrorKind::BrokenPipe))
+    }
+}
+
+fn datagram_only_error() -> io::Error {
+    io::Error::new(
+        ErrorKind::Unsupported,
+        "UDP streams are datagram-based, use `ReadStream::receive`",
+    )
+}
+
+/// Returns `None` for datagrams that should be dropped without closing the connection.
+fn decode_datagram<ReceivingPacket, SendingPacket, S>(
+    datagram: &[u8],
+    serializer: &S,
+) -> Option<ReceivingPacket>
+where
+    ReceivingPacket: Send + Sync + Debug + 'static,
+    SendingPacket: Send + Sync + Debug + 'static,
+    S: Serializer<ReceivingPacket, SendingPacket> + ?Sized,
+{
+    if datagram.len() > MAX_PACKET_SIZE.load(Ordering::Relaxed) {
+        log::debug!(
+            "Dropping a {}-byte datagram larger than MaxPacketSize",
+            datagram.len()
+        );
+        return None;
+    }
+    match serializer.deserialize(datagram) {
+        Ok(packet) => Some(packet),
+        Err(err) => {
+            log::debug!("Dropping a malformed datagram: {err}");
+            None
+        }
+    }
+}
+
+fn encode_datagram<ReceivingPacket, SendingPacket, S>(
+    packet: SendingPacket,
+    serializer: &S,
+) -> Option<Vec<u8>>
+where
+    ReceivingPacket: Send + Sync + Debug + 'static,
+    SendingPacket: Send + Sync + Debug + 'static,
+    S: Serializer<ReceivingPacket, SendingPacket> + ?Sized,
+{
+    let datagram = serializer
+        .serialize(packet)
+        .expect("Error serializing packet");
+    if datagram.is_empty() || datagram.len() > MAX_DATAGRAM_SIZE {
+        log::warn!(
+            "Dropping a {}-byte packet: UDP packets must be 1..={MAX_DATAGRAM_SIZE} bytes",
+            datagram.len()
+        );
+        return None;
+    }
+    Some(datagram)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packet_length_serializer::LittleEndian;
+
+    /// Passes bytes through as-is; datagrams starting with `0xFF` are treated as malformed.
+    struct RawSerializer;
+
+    impl Serializer<Vec<u8>, Vec<u8>> for RawSerializer {
+        type EncodeError = io::Error;
+        type DecodeError = io::Error;
+
+        fn serialize(&self, packet: Vec<u8>) -> io::Result<Vec<u8>> {
+            Ok(packet)
+        }
+
+        fn deserialize(&self, data: &[u8]) -> io::Result<Vec<u8>> {
+            match data.first() {
+                Some(0xFF) => Err(ErrorKind::InvalidData.into()),
+                _ => Ok(data.to_vec()),
+            }
+        }
+    }
+
+    type Ls = LittleEndian<u32>;
+
+    #[tokio::test]
+    async fn each_datagram_is_one_packet() {
+        let serializer = Arc::new(RawSerializer);
+        let ls = Ls::default();
+        let listener = Arc::new(UdpProtocol::bind(([127, 0, 0, 1], 0).into()).await.unwrap());
+        let client = UdpProtocol::connect_to_server(listener.address())
+            .await
+            .unwrap();
+        let client_addr = client.local_addr();
+        let server = listener.accept().await.unwrap();
+        assert_eq!(server.peer_addr(), client_addr);
+        let pump = Arc::clone(&listener);
+        tokio::spawn(async move { while pump.accept().await.is_ok() {} });
+
+        let (mut client_read, mut client_write) = client.into_split().await.unwrap();
+        let (mut server_read, mut server_write) = server.into_split().await.unwrap();
+
+        // The oversized packet is dropped on send, the 0xFF one on receive.
+        for packet in [vec![1], vec![0; MAX_DATAGRAM_SIZE + 1], vec![2, 3]] {
+            client_write
+                .send::<Vec<u8>, _, _, _>(packet, Arc::clone(&serializer), &ls)
+                .await
+                .unwrap();
+        }
+        client_write.write_all(&[0xFF, 9]).await.unwrap();
+        client_write
+            .send::<Vec<u8>, _, _, _>(vec![4], Arc::clone(&serializer), &ls)
+            .await
+            .unwrap();
+
+        for expected in [vec![1], vec![2, 3], vec![4]] {
+            let packet = server_read
+                .receive::<_, Vec<u8>, _, _>(Arc::clone(&serializer), &ls)
+                .await
+                .unwrap();
+            assert_eq!(packet, expected);
+        }
+
+        server_write
+            .send::<Vec<u8>, _, _, _>(vec![5], Arc::clone(&serializer), &ls)
+            .await
+            .unwrap();
+        let packet = client_read
+            .receive::<_, Vec<u8>, _, _>(Arc::clone(&serializer), &ls)
+            .await
+            .unwrap();
+        assert_eq!(packet, vec![5]);
+    }
+
+    #[tokio::test]
+    async fn first_datagram_is_not_lost() {
+        let listener = UdpProtocol::bind(([127, 0, 0, 1], 0).into()).await.unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        peer.send_to(&[7], listener.address()).await.unwrap();
+
+        let (mut read, _) = listener.accept().await.unwrap().into_split().await.unwrap();
+        let packet = read
+            .receive::<_, Vec<u8>, _, _>(Arc::new(RawSerializer), &Ls::default())
+            .await
+            .unwrap();
+        assert_eq!(packet, vec![7]);
     }
 }
