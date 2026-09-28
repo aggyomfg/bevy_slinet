@@ -24,44 +24,64 @@ pub(crate) fn wait_until(mut step: impl FnMut() -> bool) {
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
 struct Packet(u64);
 
-struct TcpConfig;
+macro_rules! test_config {
+    ($name:ident, $protocol:ty) => {
+        struct $name;
 
-impl ServerConfig for TcpConfig {
-    type ClientPacket = Packet;
-    type ServerPacket = Packet;
-    type Protocol = TcpProtocol;
+        impl ServerConfig for $name {
+            type ClientPacket = Packet;
+            type ServerPacket = Packet;
+            type Protocol = $protocol;
 
-    type EncodeError = bitcode::Error;
-    type DecodeError = bitcode::Error;
+            type EncodeError = bitcode::Error;
+            type DecodeError = bitcode::Error;
 
-    type LengthSerializer = LittleEndian<u32>;
+            type LengthSerializer = LittleEndian<u32>;
 
-    fn build_serializer() -> SerializerAdapter<
-        Self::ClientPacket,
-        Self::ServerPacket,
-        Self::EncodeError,
-        Self::DecodeError,
-    > {
-        SerializerAdapter::ReadOnly(Arc::new(BitcodeSerdeSerializer))
-    }
+            fn build_serializer() -> SerializerAdapter<
+                Self::ClientPacket,
+                Self::ServerPacket,
+                Self::EncodeError,
+                Self::DecodeError,
+            > {
+                SerializerAdapter::ReadOnly(Arc::new(BitcodeSerdeSerializer))
+            }
+        }
+
+        impl ClientConfig for $name {
+            type ClientPacket = Packet;
+            type ServerPacket = Packet;
+            type Protocol = $protocol;
+            type EncodeError = bitcode::Error;
+            type DecodeError = bitcode::Error;
+
+            type LengthSerializer = LittleEndian<u32>;
+            fn build_serializer() -> SerializerAdapter<
+                Self::ServerPacket,
+                Self::ClientPacket,
+                Self::EncodeError,
+                Self::DecodeError,
+            > {
+                SerializerAdapter::ReadOnly(Arc::new(BitcodeSerdeSerializer))
+            }
+        }
+    };
 }
 
-impl ClientConfig for TcpConfig {
-    type ClientPacket = Packet;
-    type ServerPacket = Packet;
-    type Protocol = TcpProtocol;
-    type EncodeError = bitcode::Error;
-    type DecodeError = bitcode::Error;
+test_config!(TcpConfig, TcpProtocol);
+#[cfg(feature = "protocol_udp")]
+test_config!(UdpConfig, crate::protocols::udp::UdpProtocol);
 
-    type LengthSerializer = LittleEndian<u32>;
-    fn build_serializer() -> SerializerAdapter<
-        Self::ServerPacket,
-        Self::ClientPacket,
-        Self::EncodeError,
-        Self::DecodeError,
-    > {
-        SerializerAdapter::ReadOnly(Arc::new(BitcodeSerdeSerializer))
-    }
+trait TestConfig:
+    ServerConfig<ClientPacket = Packet, ServerPacket = Packet>
+    + ClientConfig<ClientPacket = Packet, ServerPacket = Packet>
+{
+}
+
+impl<C> TestConfig for C where
+    C: ServerConfig<ClientPacket = Packet, ServerPacket = Packet>
+        + ClientConfig<ClientPacket = Packet, ServerPacket = Packet>
+{
 }
 
 #[derive(Default, Resource)]
@@ -139,30 +159,69 @@ struct ServerToClientPacketResource(Packet);
 
 #[test]
 fn tcp_packets() {
+    let _apps = exchange_packets::<TcpConfig>();
+}
+
+#[cfg(feature = "protocol_udp")]
+#[test]
+fn udp_packets_and_disconnection() {
+    let (mut app_server, mut app_client) = exchange_packets::<UdpConfig>();
+
+    app_server
+        .world()
+        .resource::<ServerConnections<UdpConfig>>()[0]
+        .disconnect();
+    wait_until(|| {
+        app_client.update();
+        app_server.update();
+        app_server
+            .world()
+            .resource::<ServerConnections<UdpConfig>>()
+            .is_empty()
+    });
+    assert!(app_server
+        .world()
+        .resource::<ServerConnections<UdpConfig>>()
+        .is_empty());
+
+    // The client keeps sending keep-alives, which must not reopen the connection.
+    let deadline = Instant::now() + crate::protocols::udp::KEEPALIVE_INTERVAL * 2;
+    while Instant::now() < deadline {
+        app_client.update();
+        app_server.update();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(app_server
+        .world()
+        .resource::<ServerConnections<UdpConfig>>()
+        .is_empty());
+    assert!(app_client
+        .world()
+        .contains_resource::<ClientConnection<UdpConfig>>());
+}
+
+fn exchange_packets<C: TestConfig>() -> (App, App) {
     let client_to_server_packet = Packet(42);
     let server_to_client_packet = Packet(24);
 
     let mut app_server = App::new();
-    app_server.add_plugins(ServerPlugin::<TcpConfig>::bind("127.0.0.1:0"));
+    app_server.add_plugins(ServerPlugin::<C>::bind("127.0.0.1:0"));
     app_server.insert_resource(ReceivedPackets::<Packet>::default());
     app_server.insert_resource(ServerToClientPacketResource(server_to_client_packet));
 
-    app_server.add_observer(server_new_connection_system);
-    app_server.add_observer(server_packet_receive_system);
+    app_server.add_observer(server_new_connection_system::<C>);
+    app_server.add_observer(server_packet_receive_system::<C>);
 
     app_server.update(); // bind
-    let server_addr = app_server
-        .world()
-        .resource::<ServerAddress<TcpConfig>>()
-        .address();
+    let server_addr = app_server.world().resource::<ServerAddress<C>>().address();
 
     let mut app_client = App::new();
-    app_client.add_plugins(ClientPlugin::<TcpConfig>::connect(server_addr));
+    app_client.add_plugins(ClientPlugin::<C>::connect(server_addr));
     app_client.insert_resource(ReceivedPackets::<Packet>::default());
     app_client.insert_resource(ClientToServerPacketResource(client_to_server_packet));
 
-    app_client.add_observer(client_connection_establish_system);
-    app_client.add_observer(client_packet_receive_system);
+    app_client.add_observer(client_connection_establish_system::<C>);
+    app_client.add_observer(client_packet_receive_system::<C>);
 
     wait_until(|| {
         app_client.update();
@@ -200,10 +259,11 @@ fn tcp_packets() {
         Some(&server_to_client_packet),
         "Client did not receive the expected packet from server"
     );
+    (app_server, app_client)
 }
 
-fn server_new_connection_system(
-    event: On<NewConnectionEvent<TcpConfig>>,
+fn server_new_connection_system<C: TestConfig>(
+    event: On<NewConnectionEvent<C>>,
     server_to_client_packet: Res<ServerToClientPacketResource>,
 ) {
     event
@@ -213,15 +273,16 @@ fn server_new_connection_system(
         .expect("Couldn't send server packet");
 }
 
-fn server_packet_receive_system(
-    event: On<server::PacketReceiveEvent<TcpConfig>>,
+fn server_packet_receive_system<C: TestConfig>(
+    event: On<server::PacketReceiveEvent<C>>,
     mut received_packets: ResMut<ReceivedPackets<Packet>>,
 ) {
+    assert!(event.event().received_at <= bevy::platform::time::Instant::now());
     received_packets.packets.push(event.event().packet);
 }
 
-fn client_connection_establish_system(
-    event: On<ConnectionEstablishEvent<TcpConfig>>,
+fn client_connection_establish_system<C: TestConfig>(
+    event: On<ConnectionEstablishEvent<C>>,
     client_to_server_packet: Res<ClientToServerPacketResource>,
 ) {
     event
@@ -231,9 +292,10 @@ fn client_connection_establish_system(
         .expect("Couldn't send client packet");
 }
 
-fn client_packet_receive_system(
-    event: On<client::PacketReceiveEvent<TcpConfig>>,
+fn client_packet_receive_system<C: TestConfig>(
+    event: On<client::PacketReceiveEvent<C>>,
     mut received_packets: ResMut<ReceivedPackets<Packet>>,
 ) {
+    assert!(event.event().received_at <= bevy::platform::time::Instant::now());
     received_packets.packets.push(event.event().packet);
 }
