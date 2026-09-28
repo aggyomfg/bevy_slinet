@@ -1,6 +1,6 @@
 # Network configuration
 
-[Back to README](../README.md) · [UDP transport](udp.md) · [API migration](migration.md)
+[Back to README](../README.md) · [UDP transport](udp.md) · [API migration](019-migration.md)
 
 ## Queue limits
 
@@ -36,7 +36,7 @@ serialized payloads. The limit is shared only by plugins in that Bevy App.
 Changes apply during `Update`; removing the resource restores the unlimited
 default. TCP checks the declared length before allocating its payload; UDP
 checks each payload before decoding and discards oversized packets independently.
-The UDP session header is excluded from this limit.
+For UDP this is the complete serialized datagram, including any application-defined envelope.
 
 Low-level/custom protocols receive an explicit `connection::ReceiveLimits`
 argument in `PacketReader::receive` and `receive_with_timestamp`. Custom packet
@@ -53,7 +53,7 @@ unlimited receive size. Set a limit through
 private; use the constructor and accessors instead of struct literals or field
 access.
 
-See the [migration guide](migration.md) for typed transport handles, custom
+See the [migration guide](019-migration.md) for typed transport handles, custom
 protocol updates, send errors, and the differences from the older public APIs.
 
 Client `DisconnectionEvent::connection_id` is `Some(id)` for an established

@@ -1,11 +1,7 @@
 use super::diagnostics::{UdpConnectionHandle, UdpDropReason};
-use super::handshake::Handshake;
 use super::pacing::DataPacer;
-use super::session::{Heartbeat, PeerRegistration, QueuedDatagram, SessionState};
-use super::settings::{
-    DefaultUdpConfig, UdpConfig, UdpIdleTimeout, UdpOptions, ValidatedOptions, BUFFER_SIZE,
-};
-use super::wire::{Control, Frame, Payload, HEADER};
+use super::peer::{PeerRegistration, PeerState, QueuedDatagram};
+use super::settings::{DefaultUdpConfig, UdpConfig, UdpOptions, ValidatedOptions, BUFFER_SIZE};
 use crate::{
     connection::ReceiveLimits,
     packet_queue::LossyReceiver,
@@ -23,16 +19,15 @@ use std::{
     marker::PhantomData,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
-    time::Duration,
 };
-use tokio::{net::UdpSocket, sync::watch};
+use tokio::net::UdpSocket;
 
 struct TrackedIncoming {
     queue: LossyReceiver<QueuedDatagram>,
-    state: Arc<SessionState>,
+    state: Arc<PeerState>,
 }
 impl TrackedIncoming {
-    const fn new(queue: LossyReceiver<QueuedDatagram>, state: Arc<SessionState>) -> Self {
+    const fn new(queue: LossyReceiver<QueuedDatagram>, state: Arc<PeerState>) -> Self {
         Self { queue, state }
     }
     async fn recv(&mut self) -> Option<QueuedDatagram> {
@@ -75,7 +70,7 @@ impl Incoming {
                 let QueuedDatagram { bytes, received_at } = queue
                     .recv()
                     .await
-                    .ok_or_else(SessionState::disconnected_error)?;
+                    .ok_or_else(PeerState::disconnected_error)?;
                 *current = bytes;
                 Ok(ReceivedDatagram {
                     bytes: current,
@@ -95,11 +90,11 @@ impl Incoming {
     }
 }
 
-/// Accepted UDP session.
+/// Local server-side UDP address association.
 pub struct UdpServerStream {
     registration: PeerRegistration,
     incoming: TrackedIncoming,
-    state: Arc<SessionState>,
+    state: Arc<PeerState>,
     peer_addr: SocketAddr,
     local_addr: SocketAddr,
     socket: Arc<UdpSocket>,
@@ -108,7 +103,7 @@ impl UdpServerStream {
     pub(super) fn accepted(
         registration: PeerRegistration,
         incoming: LossyReceiver<QueuedDatagram>,
-        state: Arc<SessionState>,
+        state: Arc<PeerState>,
         peer_addr: SocketAddr,
         socket: Arc<UdpSocket>,
         local_addr: SocketAddr,
@@ -134,7 +129,7 @@ impl NetworkStream for UdpServerStream {
             current: Box::default(),
             _registration: self.registration,
         };
-        Ok(ConnectedSession {
+        Ok(ConnectedPeer {
             incoming,
             socket: self.socket,
             address: Some(self.peer_addr),
@@ -154,13 +149,13 @@ impl NetworkStream for UdpServerStream {
 }
 impl ServerStream for UdpServerStream {}
 
-/// Connected UDP session.
+/// Local client-side UDP endpoint; setup does not contact the peer.
 pub struct ConfiguredUdpClientStream<C: UdpConfig> {
     _config: PhantomData<C>,
     peer_addr: SocketAddr,
     local_addr: SocketAddr,
     socket: Arc<UdpSocket>,
-    state: Arc<SessionState>,
+    state: Arc<PeerState>,
 }
 /// Client stream with default UDP settings.
 pub type UdpClientStream = ConfiguredUdpClientStream<DefaultUdpConfig>;
@@ -177,11 +172,7 @@ impl<C: UdpConfig> ConfiguredUdpClientStream<C> {
         };
         let socket = Arc::new(UdpSocket::bind(local).await?);
         socket.connect(address).await?;
-        let (cookie, accepted) = Handshake::new(&socket).connect(options).await?;
-        let state = SessionState::new(cookie, options);
-        if accepted {
-            state.received_datagram(HEADER, false);
-        }
+        let state = PeerState::new(options);
         Ok(Self {
             _config: PhantomData,
             peer_addr: socket.peer_addr()?,
@@ -207,7 +198,7 @@ impl<C: UdpConfig> NetworkStream for ConfiguredUdpClientStream<C> {
             socket: Arc::clone(&self.socket),
             buffer: vec![0; BUFFER_SIZE].into_boxed_slice(),
         };
-        Ok(ConnectedSession {
+        Ok(ConnectedPeer {
             incoming,
             socket: self.socket,
             address: None,
@@ -226,13 +217,13 @@ impl<C: UdpConfig> NetworkStream for ConfiguredUdpClientStream<C> {
     }
 }
 
-struct ConnectedSession {
+struct ConnectedPeer {
     incoming: Incoming,
     socket: Arc<UdpSocket>,
     address: Option<SocketAddr>,
-    state: Arc<SessionState>,
+    state: Arc<PeerState>,
 }
-impl ConnectedSession {
+impl ConnectedPeer {
     fn into_split(self) -> (UdpReadHalf, UdpWriteHalf) {
         let Self {
             incoming,
@@ -240,13 +231,10 @@ impl ConnectedSession {
             address,
             state,
         } = self;
-        Heartbeat::new(Arc::clone(&socket), address, Arc::clone(&state)).spawn();
         (
             UdpReadHalf {
                 incoming,
                 state: Arc::clone(&state),
-                idle_timeout: watch::channel(UdpIdleTimeout::default().0).1,
-                timeout_updates_open: true,
             },
             UdpWriteHalf {
                 socket,
@@ -258,12 +246,10 @@ impl ConnectedSession {
     }
 }
 
-/// Read half of a UDP session; dropping it closes the session and stops heartbeats.
+/// Read half of a local UDP peer; dropping it cancels its writer.
 pub struct UdpReadHalf {
     incoming: Incoming,
-    state: Arc<SessionState>,
-    idle_timeout: watch::Receiver<Duration>,
-    timeout_updates_open: bool,
+    state: Arc<PeerState>,
 }
 impl Drop for UdpReadHalf {
     fn drop(&mut self) {
@@ -277,10 +263,6 @@ impl PacketReader for UdpReadHalf {
         self.state.close();
     }
 
-    fn set_idle_timeout(&mut self, timeout: watch::Receiver<Duration>) {
-        self.idle_timeout = timeout;
-        self.timeout_updates_open = true;
-    }
     async fn receive<R, S, Ser, LS>(
         &mut self,
         serializer: Arc<Ser>,
@@ -310,55 +292,25 @@ impl PacketReader for UdpReadHalf {
         LS: PacketLengthSerializer,
     {
         loop {
-            let timeout = *self.idle_timeout.borrow();
-            let last = self.state.last_received();
-            let deadline = async {
-                match last.checked_add(timeout) {
-                    Some(deadline) => tokio::time::sleep_until(deadline).await,
-                    None => std::future::pending::<()>().await,
-                }
-            };
             let from_socket = matches!(self.incoming, Incoming::Socket { .. });
-            let ReceivedDatagram { bytes, received_at } = tokio::select! {
+            let ReceivedDatagram {
+                bytes: payload,
+                received_at,
+            } = tokio::select! {
                 biased;
-                () = self.state.cancelled() => return Err(ReceiveError::Io(SessionState::disconnected_error())),
-                () = deadline => {
-                    // The listener may have received keepalives while this read waited on its queue.
-                    if self.state.last_received() != last { continue; }
-                    self.state.close();
-                    return Err(ReceiveError::Io(io::Error::new(ErrorKind::TimedOut, "no datagrams from the UDP peer")));
-                }
-                changed = self.idle_timeout.changed(), if self.timeout_updates_open => {
-                    self.timeout_updates_open = changed.is_ok(); continue;
-                }
+                () = self.state.cancelled() => return Err(ReceiveError::Io(PeerState::disconnected_error())),
                 result = self.incoming.next() => result.map_err(|err| {
                     self.state.close();
                     ReceiveError::Io(err)
                 })?,
             };
-            let Some(Frame { session, payload }) = Frame::parse(bytes) else {
-                self.state
-                    .handle
-                    .count_drop(UdpDropReason::MalformedPayload);
-                continue;
-            };
-            if session != self.state.id() {
-                continue;
-            }
             if from_socket {
-                self.state
-                    .received_datagram(bytes.len(), matches!(payload, Payload::Data(_)));
+                self.state.received_datagram(payload.len());
             }
-            if payload == Payload::Control(Control::Accept) {
+            if payload.len() > super::MAX_DATAGRAM_SIZE {
+                self.state.handle.count_drop(UdpDropReason::ReceiveLimit);
                 continue;
             }
-            if payload == Payload::Control(Control::Disconnect) {
-                self.state.close();
-                return Err(ReceiveError::Io(SessionState::disconnected_error()));
-            }
-            let Payload::Data(payload) = payload else {
-                continue;
-            };
             if payload.len() > limits.max_packet_size() {
                 self.state.handle.count_drop(UdpDropReason::ReceiveLimit);
                 continue;
@@ -376,11 +328,11 @@ impl PacketReader for UdpReadHalf {
     }
 }
 
-/// Write half of a UDP session.
+/// Write half of a local UDP peer.
 pub struct UdpWriteHalf {
     socket: Arc<UdpSocket>,
     address: Option<SocketAddr>,
-    state: Arc<SessionState>,
+    state: Arc<PeerState>,
     pacer: DataPacer,
 }
 impl UdpWriteHalf {
@@ -397,11 +349,11 @@ impl UdpWriteHalf {
 
     async fn send_datagram(&self, bytes: &[u8]) -> io::Result<()> {
         if self.state.is_closed() {
-            return Err(SessionState::disconnected_error());
+            return Err(PeerState::disconnected_error());
         }
         let sent = tokio::select! {
             biased;
-            () = self.state.cancelled() => return Err(SessionState::disconnected_error()),
+            () = self.state.cancelled() => return Err(PeerState::disconnected_error()),
             result = async {
                 match self.address {
                     Some(addr) => self.socket.send_to(bytes, addr).await,
@@ -412,13 +364,7 @@ impl UdpWriteHalf {
         if sent != bytes.len() {
             return Err(io::Error::from(ErrorKind::WriteZero));
         }
-        self.state.sent();
-        if let Some(frame) = Frame::parse(bytes) {
-            match frame.payload {
-                Payload::Data(_) => self.state.handle.data_sent(bytes.len()),
-                Payload::Control(_) => self.state.handle.control_sent(bytes.len()),
-            }
-        }
+        self.state.handle.data_sent(bytes.len());
         Ok(())
     }
 }
@@ -445,10 +391,9 @@ impl PacketWriter for UdpWriteHalf {
             log::warn!("Dropping oversized UDP payload ({} bytes)", payload.len());
             return Ok(());
         }
-        let frame = Frame::data(self.state.id(), &payload).encode();
         self.pacer.wait(self.state.closed_token()).await?;
-        let result = self.send_datagram(&frame).await;
-        self.pacer.sent(frame.len());
+        let result = self.send_datagram(&payload).await;
+        self.pacer.sent(payload.len());
         if let Err(err) = result {
             if self.state.is_closed() {
                 return Err(err);
@@ -462,9 +407,6 @@ impl PacketWriter for UdpWriteHalf {
 
 #[cfg(test)]
 impl UdpReadHalf {
-    pub(super) fn session(&self) -> &SessionState {
-        &self.state
-    }
     pub(super) fn queued_bytes(&self) -> usize {
         match &self.incoming {
             Incoming::Queue { queue, .. } => queue.queued_bytes(),
@@ -474,12 +416,6 @@ impl UdpReadHalf {
 }
 #[cfg(test)]
 impl UdpWriteHalf {
-    pub(super) fn session(&self) -> &SessionState {
-        &self.state
-    }
-    pub(super) fn local_addr(&self) -> SocketAddr {
-        self.socket.local_addr().unwrap()
-    }
     #[cfg(target_os = "linux")]
     pub(super) fn set_test_address(&mut self, address: SocketAddr) {
         self.address = Some(address);

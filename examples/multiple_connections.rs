@@ -142,6 +142,15 @@ fn main() -> std::thread::Result<()> {
                     ClientPlugin::<Config>::connect("127.0.0.1:3000"),
                 ))
                 .insert_resource(ClientId(id))
+                .add_observer(
+                    |event: On<client::ConnectionEstablishEvent<Config>>| -> Result {
+                        event
+                            .connection
+                            .send(ClientPacket::Hello)
+                            .with_severity(Severity::Error)?;
+                        Ok(())
+                    },
+                )
                 .add_observer(client_packet_receive_system)
                 .run();
         });

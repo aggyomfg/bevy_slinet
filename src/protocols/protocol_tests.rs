@@ -156,12 +156,34 @@ where
 
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let listener = Arc::new(P::bind(([127, 0, 0, 1], 0).into()).await.unwrap());
-        let (client, server) =
-            tokio::join!(P::connect_to_server(listener.address()), listener.accept());
-        let (client, server) = (client.unwrap(), server.unwrap());
+        let (client, server) = tokio::join!(
+            async {
+                let client = P::connect_to_server(listener.address()).await.unwrap();
+                let (read, mut write) = client.into_split().await.unwrap();
+                write
+                    .send(
+                        vec![0],
+                        Arc::new(DecodeTime::default()),
+                        &LittleEndian::<u32>::default(),
+                    )
+                    .await
+                    .unwrap();
+                (read, write)
+            },
+            listener.accept()
+        );
+        let server = server.unwrap();
         let pump = tokio::spawn(async move { while listener.accept().await.is_ok() {} });
-        let (mut client_read, mut client_write) = client.into_split().await.unwrap();
+        let (mut client_read, mut client_write) = client;
         let (mut server_read, mut server_write) = server.into_split().await.unwrap();
+        server_read
+            .receive(
+                Arc::new(DecodeTime::default()),
+                &LittleEndian::<u32>::default(),
+                &ReceiveLimits::default(),
+            )
+            .await
+            .unwrap();
         check(&mut server_read, &mut client_write).await;
         check(&mut client_read, &mut server_write).await;
         pump.abort();

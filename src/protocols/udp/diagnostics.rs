@@ -8,26 +8,18 @@ use std::{
 };
 use tokio::sync::watch;
 
-/// A snapshot of UDP session activity. Byte counts include the 37-byte SLN2 header.
+/// A snapshot of UDP peer activity. Byte counts contain only serialized application bytes, excluding UDP/IP headers.
 /// Successful socket sends do not imply that a peer received the datagram.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct UdpStatsSnapshot {
-    /// DATA datagrams accepted by the local socket.
+    /// datagrams accepted by the local socket.
     pub sent_data_packets: u64,
-    /// Wire bytes in successfully sent DATA datagrams.
+    /// Wire bytes in successfully sent datagrams.
     pub sent_data_bytes: u64,
-    /// Control datagrams accepted by the local socket.
-    pub sent_control_packets: u64,
-    /// Wire bytes in successfully sent control datagrams.
-    pub sent_control_bytes: u64,
-    /// DATA datagrams received for this session.
+    /// datagrams received for this peer.
     pub received_data_packets: u64,
-    /// Wire bytes in received DATA datagrams.
+    /// Wire bytes in received datagrams.
     pub received_data_bytes: u64,
-    /// Control datagrams received for this session.
-    pub received_control_packets: u64,
-    /// Wire bytes in received control datagrams.
-    pub received_control_bytes: u64,
     /// Outgoing datagrams rejected by a full queue.
     pub dropped_outgoing_queue_full: u64,
     /// Outgoing datagrams evicted to make room for newer ones.
@@ -40,7 +32,7 @@ pub struct UdpStatsSnapshot {
     pub dropped_receive_queue_full: u64,
     /// Decoded packets evicted from the receive queue.
     pub dropped_receive_queue_evicted: u64,
-    /// Packets discarded when the session closed before delivery.
+    /// Packets discarded when the peer closed before delivery.
     pub dropped_closed_before_delivery: u64,
     /// Outgoing payloads exceeding the configured datagram size.
     pub dropped_oversized_payload: u64,
@@ -48,7 +40,7 @@ pub struct UdpStatsSnapshot {
     pub dropped_receive_limit: u64,
     /// Incoming payloads that could not be parsed or decoded.
     pub dropped_malformed_payload: u64,
-    /// Outgoing DATA or control datagrams rejected by the socket.
+    /// Outgoing application datagrams rejected by the socket.
     pub dropped_socket_send_error: u64,
 }
 
@@ -71,12 +63,8 @@ pub(super) enum UdpDropReason {
 struct Counters {
     sent_data_packets: AtomicU64,
     sent_data_bytes: AtomicU64,
-    sent_control_packets: AtomicU64,
-    sent_control_bytes: AtomicU64,
     received_data_packets: AtomicU64,
     received_data_bytes: AtomicU64,
-    received_control_packets: AtomicU64,
-    received_control_bytes: AtomicU64,
     dropped_outgoing_queue_full: AtomicU64,
     dropped_outgoing_queue_evicted: AtomicU64,
     dropped_raw_queue_full: AtomicU64,
@@ -90,7 +78,7 @@ struct Counters {
     dropped_socket_send_error: AtomicU64,
 }
 
-/// A clonable view of one UDP session's counters and DATA send rate.
+/// A clonable view of one UDP peer's counters and datagram send rate.
 /// It remains usable after the connection closes.
 #[derive(Clone, Debug)]
 pub struct UdpConnectionHandle {
@@ -116,12 +104,8 @@ impl UdpConnectionHandle {
         UdpStatsSnapshot {
             sent_data_packets: load(&c.sent_data_packets),
             sent_data_bytes: load(&c.sent_data_bytes),
-            sent_control_packets: load(&c.sent_control_packets),
-            sent_control_bytes: load(&c.sent_control_bytes),
             received_data_packets: load(&c.received_data_packets),
             received_data_bytes: load(&c.received_data_bytes),
-            received_control_packets: load(&c.received_control_packets),
-            received_control_bytes: load(&c.received_control_bytes),
             dropped_outgoing_queue_full: load(&c.dropped_outgoing_queue_full),
             dropped_outgoing_queue_evicted: load(&c.dropped_outgoing_queue_evicted),
             dropped_raw_queue_full: load(&c.dropped_raw_queue_full),
@@ -136,13 +120,13 @@ impl UdpConnectionHandle {
         }
     }
 
-    /// Maximum application payload that fits in one configured DATA datagram.
+    /// Maximum application payload that fits in one configured datagram.
     #[must_use]
     pub const fn max_payload_size(&self) -> usize {
         self.max_payload_size
     }
 
-    /// Limits DATA wire bytes per second. `None` removes pacing immediately.
+    /// Limits serialized bytes per second. `None` removes pacing immediately.
     pub fn set_send_rate(&self, bytes_per_second: Option<NonZeroU64>) {
         self.rate.send_replace(bytes_per_second);
     }
@@ -160,29 +144,13 @@ impl UdpConnectionHandle {
             .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
-    pub(super) fn control_sent(&self, bytes: usize) {
+    pub(super) fn received(&self, bytes: usize) {
         self.counters
-            .sent_control_packets
+            .received_data_packets
             .fetch_add(1, Ordering::Relaxed);
         self.counters
-            .sent_control_bytes
+            .received_data_bytes
             .fetch_add(bytes as u64, Ordering::Relaxed);
-    }
-
-    pub(super) fn received(&self, bytes: usize, data: bool) {
-        let (packets, wire_bytes) = if data {
-            (
-                &self.counters.received_data_packets,
-                &self.counters.received_data_bytes,
-            )
-        } else {
-            (
-                &self.counters.received_control_packets,
-                &self.counters.received_control_bytes,
-            )
-        };
-        packets.fetch_add(1, Ordering::Relaxed);
-        wire_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
     pub(super) fn count_drop(&self, reason: UdpDropReason) {

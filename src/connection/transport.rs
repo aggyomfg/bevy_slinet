@@ -1,4 +1,4 @@
-//! Shared send cancellation accounting and optional app timeout setup.
+//! Shared send cancellation accounting.
 
 #[cfg(any(feature = "client", feature = "server"))]
 use crate::protocols::protocol::{QueueDropReason, TransportHandle};
@@ -28,28 +28,5 @@ impl<H: TransportHandle> Drop for PendingPacket<H> {
         if let Some(transport) = self.0.take() {
             transport.record_drop(QueueDropReason::ClosedBeforeDelivery);
         }
-    }
-}
-
-/// Installs app-local timeout updates for transports that support them.
-#[cfg(any(feature = "client", feature = "server"))]
-#[cfg_attr(
-    not(feature = "protocol_udp"),
-    expect(
-        clippy::needless_pass_by_ref_mut,
-        reason = "The enabled transport installs resources and systems in this app"
-    )
-)]
-pub fn install_idle_timeout(
-    app: &mut bevy::prelude::App,
-) -> tokio::sync::watch::Receiver<std::time::Duration> {
-    #[cfg(feature = "protocol_udp")]
-    {
-        crate::protocols::udp::IdleTimeoutSettings::install(app)
-    }
-    #[cfg(not(feature = "protocol_udp"))]
-    {
-        let _ = app;
-        tokio::sync::watch::channel(std::time::Duration::MAX).1
     }
 }

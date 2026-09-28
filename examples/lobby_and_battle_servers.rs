@@ -429,10 +429,15 @@ fn lobby_client_connect_handler(
 }
 
 fn battle_client_connect_handler(
-    _connection: On<ConnectionEstablishEvent<BattleConfig>>,
+    connection: On<ConnectionEstablishEvent<BattleConfig>>,
     mut timeout: ResMut<ClientKeepAliveTimeout>,
-) {
+) -> Result {
     timeout.refresh();
+    connection
+        .connection
+        .send(BattleClientPacket::KeepAlive)
+        .with_severity(Severity::Error)?;
+    Ok(())
 }
 
 fn lobby_client_keepalive_handler(

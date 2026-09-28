@@ -11,7 +11,7 @@ use tokio::select;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_util::sync::CancellationToken;
 
-use crate::connection::transport::{install_idle_timeout, PendingPacket};
+use crate::connection::transport::PendingPacket;
 use crate::connection::{
     ConnectionId, EcsConnection, MaxPacketSize, NetworkQueueSettings, OutgoingReceiver,
     PacketForwarder, RawConnection, ReceiveLimits,
@@ -86,14 +86,12 @@ pub struct ServerPlugin<Config: ServerConfig> {
 
 impl<Config: ServerConfig> Plugin for ServerPlugin<Config> {
     fn build(&self, app: &mut App) {
-        let idle_timeout = install_idle_timeout(app);
         app.init_resource::<ReceiveLimits>()
             .insert_resource(ServerConnections::<Config>::new())
             .add_systems(
                 Startup,
                 (
-                    Self::setup_system(self.address, idle_timeout)
-                        .after(SystemSets::SetMaxPacketSize),
+                    Self::setup_system(self.address).after(SystemSets::SetMaxPacketSize),
                     MaxPacketSize::warning_system.in_set(SystemSets::MaxPacketSizeWarning),
                 ),
             )
@@ -159,7 +157,6 @@ struct PacketReceiver<Config: ServerConfig> {
 impl<Config: ServerConfig> ServerPlugin<Config> {
     fn setup_system(
         address: SocketAddr,
-        idle_timeout: tokio::sync::watch::Receiver<std::time::Duration>,
     ) -> impl Fn(Commands, Option<Res<NetworkQueueSettings>>, Res<ReceiveLimits>) {
         #[cfg(target_family = "wasm")]
         compile_error!("Why would you run a bevy_slinet server on WASM? If you really need this, please open an issue (https://github.com/aggyomfg/bevy_slinet/issues/new)");
@@ -168,7 +165,6 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
             Self::setup(
                 commands,
                 address,
-                idle_timeout.clone(),
                 queues.as_deref().copied().unwrap_or_default(),
                 limits.clone(),
             );
@@ -178,7 +174,6 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
     fn setup(
         mut commands: Commands,
         address: SocketAddr,
-        idle_timeout: tokio::sync::watch::Receiver<std::time::Duration>,
         queues: NetworkQueueSettings,
         limits: ReceiveLimits,
     ) {
@@ -200,7 +195,6 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
                 pack_tx,
                 lifecycle_tx.clone(),
                 disconnect_sender,
-                idle_timeout,
             ));
             Self::accept_connections(
                 address,
@@ -289,7 +283,6 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
         packets: LossySender<PacketReceiveEvent<Config>>,
         lifecycle: Sender<ServerLifecycle<Config>>,
         disconnect_sender: Sender<SocketAddr>,
-        idle_timeout: tokio::sync::watch::Receiver<std::time::Duration>,
     ) {
         while let Some(connection) = incoming_connections.recv().await {
             connection
@@ -297,7 +290,6 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
                     packets.clone(),
                     lifecycle.clone(),
                     disconnect_sender.clone(),
-                    idle_timeout.clone(),
                 )
                 .await;
         }
@@ -348,7 +340,6 @@ impl<Config: ServerConfig> ConnectedTransport<Config> {
         packets: LossySender<PacketReceiveEvent<Config>>,
         lifecycle: Sender<ServerLifecycle<Config>>,
         disconnect_sender: Sender<SocketAddr>,
-        idle_timeout: tokio::sync::watch::Receiver<std::time::Duration>,
     ) {
         let RawConnection {
             disconnect_task,
@@ -359,7 +350,7 @@ impl<Config: ServerConfig> ConnectedTransport<Config> {
             receive_limits,
             id,
         } = self.connection;
-        let (mut read, write) = match stream.into_split().await {
+        let (read, write) = match stream.into_split().await {
             Ok(split) => split,
             Err(err) => {
                 log::error!("({:?}) Couldn't split stream: {}", id, err);
@@ -373,7 +364,6 @@ impl<Config: ServerConfig> ConnectedTransport<Config> {
                 return;
             }
         };
-        read.set_idle_timeout(idle_timeout);
         let transport = self.ecs_connection.transport().clone();
         tokio::spawn(Self::receive_packets(
             read,
@@ -512,7 +502,8 @@ impl<Config: ServerConfig> ServerAddress<Config> {
     }
 }
 
-/// A new client has connected.
+/// A transport peer is available.
+/// For UDP the first datagram creates a local peer; its sender is not validated.
 #[derive(Event)]
 #[non_exhaustive]
 pub struct NewConnectionEvent<Config: ServerConfig> {

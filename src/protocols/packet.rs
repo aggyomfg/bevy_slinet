@@ -21,9 +21,6 @@ pub trait PacketReader: Send + Sync + 'static {
     /// Implementations may retain their registration until this half is dropped.
     fn close(&mut self) {}
 
-    /// Supplies idle timeout updates for protocols that support them. Other protocols ignore it.
-    fn set_idle_timeout(&mut self, _timeout: tokio::sync::watch::Receiver<std::time::Duration>) {}
-
     /// Reads a single packet from this stream.
     ///
     /// `length_serializer` configures framing where the transport needs it;

@@ -2,7 +2,7 @@ use std::{io, num::NonZeroU64, time::Duration};
 use tokio::{sync::watch, time::Instant};
 use tokio_util::sync::CancellationToken;
 
-/// Spaces DATA sends by their full wire length; unused time never accumulates credit.
+/// Spaces datagram sends by their full wire length; unused time never accumulates credit.
 pub(super) struct DataPacer {
     rate: watch::Receiver<Option<NonZeroU64>>,
     previous: Option<(Instant, usize)>,
@@ -31,7 +31,7 @@ impl DataPacer {
             }
             tokio::select! {
                 biased;
-                () = closed.cancelled() => return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "UDP session closed")),
+                () = closed.cancelled() => return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "UDP peer closed")),
                 changed = self.rate.changed() => {
                     if changed.is_err() { return Ok(()); }
                 }

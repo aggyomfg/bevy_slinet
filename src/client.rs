@@ -14,7 +14,7 @@ use futures::StreamExt;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_util::sync::CancellationToken;
 
-use crate::connection::transport::{install_idle_timeout, PendingPacket};
+use crate::connection::transport::PendingPacket;
 use crate::connection::{
     ConnectionId, EcsConnection, MaxPacketSize, NetworkQueueSettings, OutgoingReceiver,
     OutgoingSender, PacketForwarder, RawConnection, ReceiveLimits,
@@ -92,7 +92,6 @@ struct AddInitialConnectionRequestEventLabel;
 impl<Config: ClientConfig> Plugin for ClientPlugin<Config> {
     fn build(&self, app: &mut App) {
         let address = self.address;
-        let idle_timeout = install_idle_timeout(app);
 
         app.init_resource::<ReceiveLimits>()
             .insert_resource(ClientConnections::<Config>::new())
@@ -121,7 +120,7 @@ impl<Config: ClientConfig> Plugin for ClientPlugin<Config> {
             .add_systems(
                 Startup,
                 (
-                    Self::setup_system(idle_timeout)
+                    Self::setup_system()
                         .after(SystemSets::SetMaxPacketSize)
                         .before(AddInitialConnectionRequestEventLabel),
                     (move |mut commands: Commands| {
@@ -261,25 +260,17 @@ struct ConnectionAttempt<Config: ClientConfig> {
 }
 
 impl<Config: ClientConfig> ClientPlugin<Config> {
-    fn setup_system(
-        idle_timeout: tokio::sync::watch::Receiver<std::time::Duration>,
-    ) -> impl Fn(Commands, Option<Res<NetworkQueueSettings>>, Res<ReceiveLimits>) {
+    fn setup_system() -> impl Fn(Commands, Option<Res<NetworkQueueSettings>>, Res<ReceiveLimits>) {
         move |commands, queues, limits: Res<ReceiveLimits>| {
             Self::setup(
                 commands,
-                idle_timeout.clone(),
                 queues.as_deref().copied().unwrap_or_default(),
                 limits.clone(),
             );
         }
     }
 
-    fn setup(
-        mut commands: Commands,
-        idle_timeout: tokio::sync::watch::Receiver<std::time::Duration>,
-        queues: NetworkQueueSettings,
-        limits: ReceiveLimits,
-    ) {
+    fn setup(mut commands: Commands, queues: NetworkQueueSettings, limits: ReceiveLimits) {
         let (req_tx, req_rx) = queues.incoming_channel();
         commands.insert_resource(ConnectionRequestSender::<Config>(req_tx, PhantomData));
 
@@ -305,7 +296,6 @@ impl<Config: ClientConfig> ClientPlugin<Config> {
             incoming_connections,
             pack_tx,
             lifecycle_tx,
-            idle_timeout,
         ));
     }
 
@@ -317,7 +307,7 @@ impl<Config: ClientConfig> ClientPlugin<Config> {
         connection_sender: Sender<ConnectedTransport<Config>>,
     ) {
         let mut warned = false;
-        // Bound in-flight handshakes while allowing other endpoints to connect.
+        // Bound in-flight connection attempts while allowing other endpoints to connect.
         let requests = futures::stream::unfold(req_rx, |mut requests| async move {
             requests.recv().await.map(|address| (address, requests))
         });
@@ -356,12 +346,9 @@ impl<Config: ClientConfig> ClientPlugin<Config> {
         mut incoming_connections: Receiver<ConnectedTransport<Config>>,
         packets: LossySender<PacketReceiveEvent<Config>>,
         lifecycle: Sender<ClientLifecycle<Config>>,
-        idle_timeout: tokio::sync::watch::Receiver<std::time::Duration>,
     ) {
         while let Some(connection) = incoming_connections.recv().await {
-            connection
-                .run(packets.clone(), lifecycle.clone(), idle_timeout.clone())
-                .await;
+            connection.run(packets.clone(), lifecycle.clone()).await;
         }
     }
 
@@ -442,7 +429,6 @@ impl<Config: ClientConfig> ConnectedTransport<Config> {
         self,
         packets: LossySender<PacketReceiveEvent<Config>>,
         lifecycle: Sender<ClientLifecycle<Config>>,
-        idle_timeout: tokio::sync::watch::Receiver<std::time::Duration>,
     ) {
         let RawConnection {
             disconnect_task,
@@ -454,7 +440,7 @@ impl<Config: ClientConfig> ConnectedTransport<Config> {
             id,
         } = self.connection;
         let peer_addr = stream.peer_addr();
-        let (mut read, write) = match stream.into_split().await {
+        let (read, write) = match stream.into_split().await {
             Ok(split) => split,
             Err(err) => {
                 log::error!("({:?}) Couldn't split stream: {}", id, err);
@@ -469,7 +455,6 @@ impl<Config: ClientConfig> ConnectedTransport<Config> {
                 return;
             }
         };
-        read.set_idle_timeout(idle_timeout);
         let transport = self.ecs_connection.transport().clone();
         tokio::spawn(Self::receive_packets(
             read,
@@ -673,7 +658,8 @@ fn lifecycle_system<Config: ClientConfig>(
     }
 }
 
-/// Indicates that a connection was successfully established.
+/// Indicates that the transport is ready.
+/// For UDP this is local socket readiness, not a handshake or remote liveness check.
 #[derive(Event)]
 #[non_exhaustive]
 pub struct ConnectionEstablishEvent<Config: ClientConfig> {

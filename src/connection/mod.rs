@@ -152,7 +152,7 @@ where
         &self.transport
     }
 
-    /// Closes the connection.
+    /// Closes the local connection. UDP sends no notification to the remote peer.
     pub fn disconnect(&self) {
         self.disconnect_task.cancel();
     }
@@ -325,7 +325,7 @@ where
         }
     }
 
-    /// Borrows the underlying stream without replacing its session state.
+    /// Borrows the underlying stream without replacing its transport state.
     #[must_use]
     pub const fn stream(&self) -> &NS {
         &self.stream

@@ -24,9 +24,7 @@ impl UdpConfig for Config {
         max_peers: 64,
         receive_queue_overflow: OverflowPolicy::DropOldest,
         send_rate: NonZeroU64::new(16 * 1024), // A rate cap; applications still control congestion.
-        max_datagram_size: 1200, // Includes the session header; keep below the path MTU.
-        heartbeat_interval: Duration::from_secs(1),
-        heartbeat_jitter: Duration::from_millis(100),
+        max_datagram_size: 1200,               // Full serialized payload; keep below the path MTU.
         ..UdpOptions::DEFAULT
     };
 }
@@ -79,7 +77,7 @@ fn main() -> std::thread::Result<()> {
     let server_addr = "127.0.0.1:3000";
     let server = std::thread::spawn(move || {
         App::new()
-            .insert_resource(MaxPacketSize(1163))
+            .insert_resource(MaxPacketSize(1200))
             .insert_resource(NetworkQueueSettings {
                 datagram_receive_overflow: OverflowPolicy::DropOldest,
                 ..NetworkQueueSettings::default()
@@ -97,13 +95,22 @@ fn main() -> std::thread::Result<()> {
     std::thread::sleep(Duration::from_millis(1000));
     let client = std::thread::spawn(move || {
         App::new()
-            .insert_resource(MaxPacketSize(1163))
+            .insert_resource(MaxPacketSize(1200))
             .insert_resource(NetworkQueueSettings {
                 datagram_receive_overflow: OverflowPolicy::DropOldest,
                 ..NetworkQueueSettings::default()
             })
             .add_plugins(MinimalPlugins)
             .add_plugins(ClientPlugin::<Config>::connect(server_addr))
+            .add_observer(
+                |event: On<client::ConnectionEstablishEvent<Config>>| -> Result {
+                    event
+                        .connection
+                        .send(ClientPacket::String("Hello, Server!".into()))
+                        .with_severity(Severity::Error)?;
+                    Ok(())
+                },
+            )
             .add_observer(client_packet_receive_system)
             .run();
     });
