@@ -15,8 +15,8 @@ use futures::StreamExt;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::connection::{
-    max_packet_size_warning_system, set_max_packet_size_system, ConnectionId, DisconnectTask,
-    EcsConnection, NetworkQueueSettings, PacketForwarder, RawConnection,
+    ConnectionId, DisconnectTask, EcsConnection, MaxPacketSize, NetworkQueueSettings,
+    PacketForwarder, RawConnection,
 };
 use crate::protocols::protocol::ReadStream;
 use crate::protocols::protocol::WriteStream;
@@ -95,11 +95,11 @@ impl<Config: ClientConfig> Plugin for ClientPlugin<Config> {
         app.insert_resource(ClientConnections::<Config>::new())
             .add_systems(
                 Startup,
-                max_packet_size_warning_system.in_set(SystemSets::MaxPacketSizeWarning),
+                MaxPacketSize::warning_system.in_set(SystemSets::MaxPacketSizeWarning),
             )
             .add_systems(
                 Update,
-                set_max_packet_size_system.in_set(SystemSets::SetMaxPacketSize),
+                MaxPacketSize::set_system.in_set(SystemSets::SetMaxPacketSize),
             )
             .add_systems(
                 PreUpdate,

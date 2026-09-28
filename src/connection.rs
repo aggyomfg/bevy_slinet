@@ -157,6 +157,25 @@ pub(crate) static MAX_PACKET_SIZE: AtomicUsize = AtomicUsize::new(usize::MAX);
 #[derive(Clone, Copy, Resource)]
 pub struct MaxPacketSize(pub usize);
 
+#[cfg(any(feature = "client", feature = "server"))]
+impl MaxPacketSize {
+    pub(crate) fn set_system(max_packet_size: Option<bevy::prelude::Res<Self>>) {
+        use bevy::prelude::DetectChanges;
+        match max_packet_size {
+            Some(res) if res.is_changed() => {
+                MAX_PACKET_SIZE.store(res.0, Ordering::Relaxed);
+            }
+            _ => (),
+        }
+    }
+
+    pub(crate) fn warning_system(max_packet_size: Option<bevy::prelude::Res<Self>>) {
+        if max_packet_size.is_none() {
+            bevy::log::warn!("You haven't set \"MaxPacketSize\" resource! This is a security risk, please insert it before using this in production.");
+        }
+    }
+}
+
 impl<ReceivingPacket, SendingPacket, NS, EncErr, DecErr, LS>
     RawConnection<ReceivingPacket, SendingPacket, NS, EncErr, DecErr, LS>
 where
@@ -206,28 +225,6 @@ where
 
 /// Shared cancellation signal for all tasks belonging to a connection.
 pub type DisconnectTask = tokio_util::sync::CancellationToken;
-
-#[cfg(any(feature = "client", feature = "server"))]
-pub(crate) fn set_max_packet_size_system(
-    max_packet_size: Option<bevy::prelude::Res<MaxPacketSize>>,
-) {
-    use bevy::prelude::DetectChanges;
-    match max_packet_size {
-        Some(res) if res.is_changed() => {
-            MAX_PACKET_SIZE.store(res.0, Ordering::Relaxed);
-        }
-        _ => (),
-    }
-}
-
-#[cfg(any(feature = "client", feature = "server"))]
-pub(crate) fn max_packet_size_warning_system(
-    max_packet_size: Option<bevy::prelude::Res<MaxPacketSize>>,
-) {
-    if max_packet_size.is_none() {
-        bevy::log::warn!("You haven't set \"MaxPacketSize\" resource! This is a security risk, please insert it before using this in production.");
-    }
-}
 
 /// Limits the channels between ECS and network tasks. Insert before `Startup`.
 ///
