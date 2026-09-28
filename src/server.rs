@@ -85,7 +85,8 @@ impl<Config: ServerConfig> Plugin for ServerPlugin<Config> {
             )
             .add_observer(connection_add_system::<Config>);
         #[cfg(feature = "protocol_udp")]
-        app.add_systems(Update, crate::protocols::udp::set_idle_timeout_system);
+        app.init_resource::<crate::protocols::udp::IdleTimeoutSettings>()
+            .add_systems(Update, crate::protocols::udp::set_idle_timeout_system);
     }
 }
 
@@ -125,11 +126,11 @@ struct PacketReceiver<Config: ServerConfig>(
     UnboundedReceiver<(ServerConnection<Config>, Config::ClientPacket, Instant)>,
 );
 
-fn create_setup_system<Config: ServerConfig>(address: SocketAddr) -> impl Fn(Commands) {
+fn create_setup_system<Config: ServerConfig>(address: SocketAddr) -> impl Fn(Commands, &World) {
     #[cfg(target_family = "wasm")]
     compile_error!("Why would you run a bevy_slinet server on WASM? If you really need this, please open an issue (https://github.com/aggyomfg/bevy_slinet/issues/new)");
 
-    move |mut commands: Commands| {
+    move |mut commands: Commands, _world: &World| {
         let (conn_tx, conn_rx) = tokio::sync::mpsc::unbounded_channel();
         let (conn_tx2, mut conn_rx2): (
             UnboundedSender<RawServerConnection<Config>>,
@@ -142,6 +143,8 @@ fn create_setup_system<Config: ServerConfig>(address: SocketAddr) -> impl Fn(Com
         commands.insert_resource(DisconnectionReceiver::<Config>(disc_rx));
         commands.insert_resource(PacketReceiver::<Config>(pack_rx));
         let (bound_tx, bound_rx) = std::sync::mpsc::sync_channel::<SocketAddr>(1);
+        #[cfg(feature = "protocol_udp")]
+        let idle_timeout = crate::protocols::udp::idle_timeout_receiver(_world);
 
         std::thread::spawn(move || {
             let runtime_result = tokio::runtime::Builder::new_multi_thread()
@@ -180,6 +183,8 @@ fn create_setup_system<Config: ServerConfig>(address: SocketAddr) -> impl Fn(Com
                         let serializer2 = Arc::clone(&serializer);
                         let disc_tx2_2 = disc_tx2.clone();
                         let packet_length_serializer2 = Arc::clone(&packet_length_serializer);
+                        #[cfg(feature = "protocol_udp")]
+                        read.set_idle_timeout(idle_timeout.clone());
                         tokio::spawn(async move {
                             loop {
                                 // `select!` handles intentional disconnections (ecs_connection.disconnect()).

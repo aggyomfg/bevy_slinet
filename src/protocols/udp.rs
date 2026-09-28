@@ -22,7 +22,7 @@ use std::fmt::Debug;
 use std::io;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Duration;
@@ -56,10 +56,10 @@ const MAX_QUEUED_DATAGRAMS: usize = 1024;
 /// Datagrams that would push a peer's unread bytes above this limit are dropped.
 const MAX_QUEUED_BYTES: usize = 1 << 20;
 
-static IDLE_TIMEOUT_MILLIS: AtomicU64 = AtomicU64::new(10_000);
-
 /// Closes a UDP connection when no datagrams arrive from the peer for this long.
 /// Must be longer than [`KEEPALIVE_INTERVAL`]; `Duration::MAX` disables it. Defaults to 10 seconds.
+/// Applies only to connections in this Bevy app. Changes take effect on the next receive,
+/// including after a keep-alive. Removing the resource restores the default.
 #[derive(Clone, Copy, Debug, Resource)]
 pub struct UdpIdleTimeout(pub Duration);
 
@@ -70,16 +70,45 @@ impl Default for UdpIdleTimeout {
 }
 
 #[cfg(any(feature = "client", feature = "server"))]
-pub(crate) fn set_idle_timeout_system(timeout: Option<bevy::prelude::Res<UdpIdleTimeout>>) {
-    use bevy::prelude::DetectChanges;
-    if let Some(timeout) = timeout.filter(|timeout| timeout.is_changed()) {
-        let millis = u64::try_from(timeout.0.as_millis()).unwrap_or(u64::MAX);
-        IDLE_TIMEOUT_MILLIS.store(millis, Ordering::Relaxed);
+#[derive(Resource)]
+pub(crate) struct IdleTimeoutSettings(tokio::sync::watch::Sender<Duration>);
+
+#[cfg(any(feature = "client", feature = "server"))]
+impl Default for IdleTimeoutSettings {
+    fn default() -> Self {
+        Self(tokio::sync::watch::channel(UdpIdleTimeout::default().0).0)
     }
 }
 
-fn idle_timeout() -> Duration {
-    Duration::from_millis(IDLE_TIMEOUT_MILLIS.load(Ordering::Relaxed))
+#[cfg(any(feature = "client", feature = "server"))]
+pub(crate) fn idle_timeout_receiver(
+    world: &bevy::prelude::World,
+) -> tokio::sync::watch::Receiver<Duration> {
+    let settings = world.resource::<IdleTimeoutSettings>();
+    settings.0.send_replace(
+        world
+            .get_resource::<UdpIdleTimeout>()
+            .copied()
+            .unwrap_or_default()
+            .0,
+    );
+    settings.0.subscribe()
+}
+
+#[cfg(any(feature = "client", feature = "server"))]
+pub(crate) fn set_idle_timeout_system(
+    timeout: Option<bevy::prelude::Res<UdpIdleTimeout>>,
+    settings: bevy::prelude::Res<IdleTimeoutSettings>,
+) {
+    let timeout = timeout.map(|timeout| *timeout).unwrap_or_default().0;
+    settings.0.send_if_modified(|current| {
+        if *current == timeout {
+            false
+        } else {
+            *current = timeout;
+            true
+        }
+    });
 }
 
 fn idle_error<E, LS>() -> ReceiveError<E, LS>
@@ -253,6 +282,7 @@ impl NetworkStream for UdpServerStream {
         Ok((
             UdpServerReadHalf {
                 task: self.task.clone(),
+                idle_timeout: tokio::sync::watch::channel(UdpIdleTimeout::default().0).1,
                 _keepalive: spawn_keepalive(Arc::clone(&self.socket), Some(peer_addr)),
             },
             UdpServerWriteHalf {
@@ -274,11 +304,16 @@ impl NetworkStream for UdpServerStream {
 /// The read half of [`UdpServerStream`].
 pub struct UdpServerReadHalf {
     task: UdpRead,
+    idle_timeout: tokio::sync::watch::Receiver<Duration>,
     _keepalive: oneshot::Sender<()>,
 }
 
 #[async_trait]
 impl ReadStream for UdpServerReadHalf {
+    fn set_idle_timeout(&mut self, timeout: tokio::sync::watch::Receiver<Duration>) {
+        self.idle_timeout = timeout;
+    }
+
     async fn read_exact(&mut self, _buffer: &mut [u8]) -> io::Result<()> {
         Err(datagram_only_error())
     }
@@ -295,7 +330,8 @@ impl ReadStream for UdpServerReadHalf {
         LS: PacketLengthSerializer,
     {
         loop {
-            let datagram = tokio::time::timeout(idle_timeout(), self.task.pop())
+            let idle_timeout = *self.idle_timeout.borrow();
+            let datagram = tokio::time::timeout(idle_timeout, self.task.pop())
                 .await
                 .map_err(|_| idle_error())?;
             if let Some(packet) = decode_datagram(
@@ -368,6 +404,7 @@ impl NetworkStream for UdpClientStream {
         let read = UdpClientReadHalf {
             socket: read_socket,
             buffer: vec![0; BUFFER_SIZE].into_boxed_slice(),
+            idle_timeout: tokio::sync::watch::channel(UdpIdleTimeout::default().0).1,
             _keepalive: spawn_keepalive(keepalive_socket, None),
         };
         Ok((read, write))
@@ -411,11 +448,16 @@ impl ClientStream for UdpClientStream {
 pub struct UdpClientReadHalf {
     socket: UdpSocket,
     buffer: Box<[u8]>,
+    idle_timeout: tokio::sync::watch::Receiver<Duration>,
     _keepalive: oneshot::Sender<()>,
 }
 
 #[async_trait]
 impl ReadStream for UdpClientReadHalf {
+    fn set_idle_timeout(&mut self, timeout: tokio::sync::watch::Receiver<Duration>) {
+        self.idle_timeout = timeout;
+    }
+
     async fn read_exact(&mut self, _buffer: &mut [u8]) -> io::Result<()> {
         Err(datagram_only_error())
     }
@@ -432,7 +474,8 @@ impl ReadStream for UdpClientReadHalf {
         LS: PacketLengthSerializer,
     {
         loop {
-            let len = tokio::time::timeout(idle_timeout(), self.socket.recv(&mut self.buffer))
+            let idle_timeout = *self.idle_timeout.borrow();
+            let len = tokio::time::timeout(idle_timeout, self.socket.recv(&mut self.buffer))
                 .await
                 .map_err(|_| idle_error())?
                 .map_err(ReceiveError::Io)?;
@@ -938,6 +981,69 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn idle_timeouts_are_per_connection() {
+        let listener = UdpProtocol::bind(([127, 0, 0, 1], 0).into()).await.unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        peer.send_to(&[], listener.address()).await.unwrap();
+        let (mut server_read, _server_write) =
+            listener.accept().await.unwrap().into_split().await.unwrap();
+        let client = UdpClientStream::connect(peer.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut client_read, _client_write) = client.into_split().await.unwrap();
+        server_read.set_idle_timeout(tokio::sync::watch::channel(Duration::from_secs(2)).1);
+        client_read.set_idle_timeout(tokio::sync::watch::channel(Duration::from_secs(4)).1);
+
+        let started = tokio::time::Instant::now();
+        let (server_elapsed, client_elapsed) = tokio::join!(
+            async {
+                assert_idle(
+                    server_read
+                        .receive::<Vec<u8>, Vec<u8>, _, _>(Arc::new(RawSerializer), &Ls::default())
+                        .await
+                        .unwrap_err(),
+                );
+                started.elapsed()
+            },
+            async {
+                assert_idle(
+                    client_read
+                        .receive::<Vec<u8>, Vec<u8>, _, _>(Arc::new(RawSerializer), &Ls::default())
+                        .await
+                        .unwrap_err(),
+                );
+                started.elapsed()
+            }
+        );
+        assert_eq!(server_elapsed, Duration::from_secs(2));
+        assert_eq!(client_elapsed, Duration::from_secs(4));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_updates_after_keepalive() {
+        let task = UdpRead::default();
+        let (settings, timeout) = tokio::sync::watch::channel(Duration::MAX);
+        let mut read = UdpServerReadHalf {
+            task: task.clone(),
+            idle_timeout: timeout,
+            _keepalive: oneshot::channel().0,
+        };
+        let mut receive = Box::pin(async move {
+            read.receive::<Vec<u8>, Vec<u8>, _, _>(Arc::new(RawSerializer), &Ls::default())
+                .await
+        });
+        assert!(futures::poll!(receive.as_mut()).is_pending());
+        tokio::time::advance(UdpIdleTimeout::default().0 * 2).await;
+        assert!(futures::poll!(receive.as_mut()).is_pending());
+
+        settings.send_replace(Duration::from_secs(2));
+        task.push(&[KEEPALIVE_DATAGRAM]);
+        assert!(futures::poll!(receive.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_idle(receive.await.unwrap_err());
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn keepalives_prevent_idle_timeout() {
         let (mut client_read, _client_write, mut server_read, mut server_write) =
             connected_pair().await;
@@ -947,7 +1053,7 @@ mod tests {
                 .receive::<Vec<u8>, Vec<u8>, _, _>(Arc::new(RawSerializer), &Ls::default())
                 .await
         });
-        tokio::time::sleep(idle_timeout() * 3).await;
+        tokio::time::sleep(UdpIdleTimeout::default().0 * 3).await;
         server_write
             .send::<Vec<u8>, _, _, _>(vec![7], Arc::clone(&serializer), &Ls::default())
             .await
@@ -958,6 +1064,39 @@ mod tests {
             .unwrap();
         assert_eq!(packet, vec![7]);
         assert!(!idle.is_finished());
+    }
+
+    #[cfg(any(feature = "client", feature = "server"))]
+    #[test]
+    fn idle_timeout_settings_are_per_app() {
+        use bevy::prelude::{App, Update};
+
+        let mut first = App::new();
+        first
+            .init_resource::<IdleTimeoutSettings>()
+            .insert_resource(UdpIdleTimeout(Duration::MAX))
+            .add_systems(Update, set_idle_timeout_system);
+        let first_timeout = idle_timeout_receiver(first.world());
+        assert_eq!(*first_timeout.borrow(), Duration::MAX);
+
+        let mut second = App::new();
+        second
+            .init_resource::<IdleTimeoutSettings>()
+            .add_systems(Update, set_idle_timeout_system);
+        let second_timeout = idle_timeout_receiver(second.world());
+        assert_eq!(*second_timeout.borrow(), UdpIdleTimeout::default().0);
+
+        second.insert_resource(UdpIdleTimeout(Duration::from_secs(3)));
+        second.update();
+        first.update();
+        assert_eq!(*first_timeout.borrow(), Duration::MAX);
+        assert_eq!(*second_timeout.borrow(), Duration::from_secs(3));
+
+        second.world_mut().remove_resource::<UdpIdleTimeout>();
+        second.update();
+        assert_eq!(*second_timeout.borrow(), UdpIdleTimeout::default().0);
+        drop(first);
+        assert_eq!(*second_timeout.borrow(), UdpIdleTimeout::default().0);
     }
 
     #[cfg(feature = "serializer_bitcode")]

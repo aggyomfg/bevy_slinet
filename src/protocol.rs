@@ -94,6 +94,9 @@ pub trait NetworkStream: Send + Sync + 'static {
 /// A readable stream.
 #[async_trait]
 pub trait ReadStream: Send + Sync + 'static {
+    /// Supplies idle timeout updates for protocols that support them. Other protocols ignore it.
+    fn set_idle_timeout(&mut self, _timeout: tokio::sync::watch::Receiver<std::time::Duration>) {}
+
     /// Fills the whole buffer with bytes in this stream.
     async fn read_exact(&mut self, buffer: &mut [u8]) -> io::Result<()>;
 
