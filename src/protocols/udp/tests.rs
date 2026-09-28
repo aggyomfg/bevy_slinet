@@ -626,6 +626,13 @@ impl RawServer {
 
 #[tokio::test(start_paused = true)]
 async fn application_traffic_suppresses_heartbeats_and_idle_resumes_them() {
+    // Real socket readiness must not auto-advance the paused clock: that can
+    // queue handshake retries or heartbeats while a datagram is still in flight.
+    let keep_clock_paused = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
     let RawServer {
         server,
         read: _read,
@@ -641,14 +648,15 @@ async fn application_traffic_suppresses_heartbeats_and_idle_resumes_them() {
             Payload::Data(&[7])
         );
     }
-    let last_data = Clock::now();
+    // A tick can fall just before the idle interval expires; the following
+    // tick must send a heartbeat even with the maximum jitter.
+    tokio::time::advance((KEEPALIVE_INTERVAL + UdpOptions::DEFAULT.heartbeat_jitter) * 2).await;
     let len = server.recv(&mut buffer).await.unwrap();
     assert_eq!(
         Frame::parse(&buffer[..len]).unwrap().payload,
         Payload::Control(Control::Keepalive)
     );
-    assert!(last_data.elapsed() >= KEEPALIVE_INTERVAL);
-    assert!(last_data.elapsed() <= (KEEPALIVE_INTERVAL + UdpOptions::DEFAULT.heartbeat_jitter) * 2);
+    keep_clock_paused.abort();
 }
 
 #[tokio::test(start_paused = true)]
