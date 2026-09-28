@@ -11,11 +11,11 @@ use bevy::log;
 use bevy::platform::time::Instant;
 use bevy::prelude::*;
 use futures::StreamExt;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::connection::{
-    max_packet_size_warning_system, set_max_packet_size_system, warn_if_stateful_over_datagrams,
-    EcsConnection, RawConnection,
+    forward_packet, max_packet_size_warning_system, set_max_packet_size_system,
+    warn_if_stateful_over_datagrams, EcsConnection, NetworkQueueSettings, RawConnection,
 };
 use crate::protocol::ReadStream;
 use crate::protocol::WriteStream;
@@ -175,21 +175,16 @@ impl<Config: ClientConfig> Clone for ConnectionRequestEvent<Config> {
 }
 
 #[derive(Resource)]
-struct ConnectionRequestSender<Config: ClientConfig>(
-    UnboundedSender<SocketAddr>,
-    PhantomData<Config>,
-);
+struct ConnectionRequestSender<Config: ClientConfig>(Sender<SocketAddr>, PhantomData<Config>);
 
 #[derive(Resource)]
-struct ConnectionReceiver<Config: ClientConfig>(
-    UnboundedReceiver<(SocketAddr, ClientConnection<Config>)>,
-);
+struct ConnectionReceiver<Config: ClientConfig>(Receiver<(SocketAddr, ClientConnection<Config>)>);
 
 #[allow(clippy::type_complexity)]
 #[derive(Resource)]
 
 struct DisconnectionReceiver<Config: ClientConfig>(
-    UnboundedReceiver<(
+    Receiver<(
         ReceiveError<Config::DecodeError, Config::LengthSerializer>,
         SocketAddr,
         Option<crate::connection::ConnectionId>,
@@ -199,26 +194,33 @@ struct DisconnectionReceiver<Config: ClientConfig>(
 
 #[derive(Resource)]
 struct PacketReceiver<Config: ClientConfig>(
-    UnboundedReceiver<(ClientConnection<Config>, Config::ServerPacket, Instant)>,
+    Receiver<(ClientConnection<Config>, Config::ServerPacket, Instant)>,
 );
 
 fn create_setup_system<Config: ClientConfig>(
     idle_timeout: tokio::sync::watch::Receiver<std::time::Duration>,
-) -> impl Fn(Commands) {
-    move |commands| setup_system::<Config>(commands, idle_timeout.clone())
+) -> impl Fn(Commands, Option<Res<NetworkQueueSettings>>) {
+    move |commands, queues| {
+        setup_system::<Config>(
+            commands,
+            idle_timeout.clone(),
+            queues.as_deref().copied().unwrap_or_default(),
+        )
+    }
 }
 
 fn setup_system<Config: ClientConfig>(
     mut commands: Commands,
     idle_timeout: tokio::sync::watch::Receiver<std::time::Duration>,
+    queues: NetworkQueueSettings,
 ) {
-    let (req_tx, req_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (req_tx, req_rx) = tokio::sync::mpsc::channel(queues.receive_capacity.max(1));
     commands.insert_resource(ConnectionRequestSender::<Config>(req_tx, PhantomData));
 
-    let (conn_tx, conn_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (conn_tx2, mut conn_rx2) = tokio::sync::mpsc::unbounded_channel();
-    let (disc_tx, disc_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (pack_tx, pack_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (conn_tx, conn_rx) = tokio::sync::mpsc::channel(queues.receive_capacity.max(1));
+    let (conn_tx2, mut conn_rx2) = tokio::sync::mpsc::channel(queues.receive_capacity.max(1));
+    let (disc_tx, disc_rx) = tokio::sync::mpsc::channel(queues.receive_capacity.max(1));
+    let (pack_tx, pack_rx) = tokio::sync::mpsc::channel(queues.receive_capacity.max(1));
     commands.insert_resource(ConnectionReceiver::<Config>(conn_rx));
     commands.insert_resource(DisconnectionReceiver::<Config>(disc_rx, PhantomData));
     commands.insert_resource(PacketReceiver::<Config>(pack_rx));
@@ -234,7 +236,7 @@ fn setup_system<Config: ClientConfig>(
         });
         let connections = requests
             .map(|address| {
-                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                let (tx, rx) = tokio::sync::mpsc::channel(queues.send_capacity.max(1));
                 let serializer = Config::build_serializer();
                 warn_if_stateful_over_datagrams::<Config::Protocol, _, _, _, _>(
                     &serializer,
@@ -263,18 +265,19 @@ fn setup_system<Config: ClientConfig>(
                         local_addr: connection.local_addr(),
                         peer_addr: connection.peer_addr(),
                     };
-                    if let Err(err) = conn_tx.send((address, ecs_conn.clone())) {
+                    if let Err(err) = conn_tx.send((address, ecs_conn.clone())).await {
                         log::error!("Failed to send connection establishment: {err:?}");
                         return;
                     }
-                    if let Err(err) = conn_tx2.send((connection, ecs_conn)) {
+                    if let Err(err) = conn_tx2.send((connection, ecs_conn)).await {
                         log::error!("Failed to send raw connection: {err:?}");
                     }
                 }
                 Err(err) => {
                     log::warn!("Couldn't connect to server: {err:?}");
-                    if let Err(send_err) =
-                        disc_tx2.send((ReceiveError::NoConnection(err), address, None))
+                    if let Err(send_err) = disc_tx2
+                        .send((ReceiveError::NoConnection(err), address, None))
+                        .await
                     {
                         log::error!("Failed to send disconnection event: {send_err:?}");
                     }
@@ -317,14 +320,14 @@ fn setup_system<Config: ClientConfig>(
                             match result {
                                 Ok((packet, received_at)) => {
                                     log::trace!("({id:?}) Received packet {packet:?}");
-                                    if pack_tx2.send((ecs_conn.clone(), packet, received_at)).is_err() {
+                                    if !forward_packet(&pack_tx2, (ecs_conn.clone(), packet, received_at), Config::Protocol::DATAGRAM, &disconnect_task).await {
                                         break
                                     }
                                 }
                                 Err(err) => {
                                     disconnect_task.cancel();
                                     log::debug!("({id:?}) Error receiving next packet: {err:?}");
-                                    if disc_tx2.send((err, peer_addr, Some(id))).is_err() {
+                                    if disc_tx2.send((err, peer_addr, Some(id))).await.is_err() {
                                         break
                                     }
                                     break;
@@ -333,7 +336,7 @@ fn setup_system<Config: ClientConfig>(
                         }
                         _ = disconnect_task.cancelled() => {
                             log::debug!("({id:?}) Client disconnected intentionally");
-                            if let Err(err) = disc_tx2.send((ReceiveError::IntentionalDisconnection, peer_addr, Some(id))) {
+                            if let Err(err) = disc_tx2.send((ReceiveError::IntentionalDisconnection, peer_addr, Some(id))).await {
                                 log::error!("({id:?}) Failed to send disconnection event: {err:?}");
                             }
                             break
@@ -376,7 +379,7 @@ pub(crate) async fn create_connection<Config: ClientConfig>(
         >,
     >,
     packet_length_serializer: Config::LengthSerializer,
-    packet_rx: UnboundedReceiver<Config::ClientPacket>,
+    packet_rx: Receiver<Config::ClientPacket>,
 ) -> io::Result<RawClientConnection<Config>> {
     Ok(RawConnection::new(
         Config::Protocol::connect_to_server(addr).await?,
@@ -390,7 +393,7 @@ fn connection_request_system<Config: ClientConfig>(
     connection_request: On<ConnectionRequestEvent<Config>>,
     requests: Res<ConnectionRequestSender<Config>>,
 ) {
-    if let Err(err) = requests.0.send(connection_request.event().address) {
+    if let Err(err) = requests.0.try_send(connection_request.event().address) {
         log::error!("Failed to send connection request: {err:?}");
     }
 }
@@ -398,8 +401,15 @@ fn connection_request_system<Config: ClientConfig>(
 fn packet_receive_system<Config: ClientConfig>(
     mut packets: ResMut<PacketReceiver<Config>>,
     mut commands: Commands,
+    queues: Option<Res<NetworkQueueSettings>>,
 ) {
-    while let Ok((connection, packet, received_at)) = packets.0.try_recv() {
+    for (connection, packet, received_at) in std::iter::from_fn(|| packets.0.try_recv().ok()).take(
+        queues
+            .as_deref()
+            .copied()
+            .unwrap_or_default()
+            .events_per_frame,
+    ) {
         commands.trigger(PacketReceiveEvent::<Config> {
             connection,
             packet,
@@ -412,8 +422,15 @@ fn connection_establish_system<Config: ClientConfig>(
     mut commands: Commands,
     mut new_connections: ResMut<ConnectionReceiver<Config>>,
     mut connections: ResMut<ClientConnections<Config>>,
+    queues: Option<Res<NetworkQueueSettings>>,
 ) {
-    while let Ok((address, connection)) = new_connections.0.try_recv() {
+    for (address, connection) in std::iter::from_fn(|| new_connections.0.try_recv().ok()).take(
+        queues
+            .as_deref()
+            .copied()
+            .unwrap_or_default()
+            .events_per_frame,
+    ) {
         commands.insert_resource(connection.clone());
         connections.push(connection.clone());
         commands.trigger(ConnectionEstablishEvent::<Config> {
@@ -427,8 +444,15 @@ fn connection_remove_system<Config: ClientConfig>(
     mut commands: Commands,
     mut old_connections: ResMut<DisconnectionReceiver<Config>>,
     mut connections: ResMut<ClientConnections<Config>>,
+    queues: Option<Res<NetworkQueueSettings>>,
 ) {
-    while let Ok((error, address, id)) = old_connections.0.try_recv() {
+    for (error, address, id) in std::iter::from_fn(|| old_connections.0.try_recv().ok()).take(
+        queues
+            .as_deref()
+            .copied()
+            .unwrap_or_default()
+            .events_per_frame,
+    ) {
         if let Some(id) = id {
             commands.remove_resource::<ClientConnection<Config>>();
             connections.retain(|conn| conn.id() != id);

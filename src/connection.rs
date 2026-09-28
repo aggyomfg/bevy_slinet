@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use bevy::prelude::Resource;
-use tokio::sync::mpsc::error::SendError;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::packet_length_serializer::PacketLengthSerializer;
 use crate::protocol::NetworkStream;
@@ -25,7 +25,7 @@ where
 {
     pub(crate) disconnect_task: DisconnectTask,
     pub(crate) id: ConnectionId,
-    pub(crate) packet_tx: UnboundedSender<SendingPacket>,
+    pub(crate) packet_tx: Sender<SendingPacket>,
     pub(crate) local_addr: SocketAddr,
     pub(crate) peer_addr: SocketAddr,
 }
@@ -73,12 +73,12 @@ where
         self.local_addr
     }
 
-    /// Sends a packet to the server. Returns error if disconnected.
-    pub fn send(&self, packet: SendingPacket) -> Result<(), SendError<SendingPacket>> {
+    /// Sends a packet to the server. Returns an error if disconnected or the outgoing queue is full.
+    pub fn send(&self, packet: SendingPacket) -> Result<(), TrySendError<SendingPacket>> {
         if self.disconnect_task.is_cancelled() {
-            return Err(SendError(packet));
+            return Err(TrySendError::Closed(packet));
         }
-        self.packet_tx.send(packet)
+        self.packet_tx.try_send(packet)
     }
 
     /// Closes the connection.
@@ -102,7 +102,7 @@ where
         dyn Serializer<ReceivingPacket, SendingPacket, EncodeError = EncErr, DecodeError = DecErr>,
     >,
     pub packet_length_serializer: Arc<LS>,
-    pub packets_rx: UnboundedReceiver<SendingPacket>,
+    pub packets_rx: Receiver<SendingPacket>,
     pub id: ConnectionId,
 }
 
@@ -182,7 +182,7 @@ where
             >,
         >,
         packet_length_serializer: LS,
-        packets_rx: UnboundedReceiver<SendingPacket>,
+        packets_rx: Receiver<SendingPacket>,
     ) -> Self {
         Self {
             disconnect_task: DisconnectTask::default(),
@@ -252,5 +252,85 @@ pub(crate) fn max_packet_size_warning_system(
 ) {
     if max_packet_size.is_none() {
         bevy::log::warn!("You haven't set \"MaxPacketSize\" resource! This is a security risk, please insert it before using this in production.")
+    }
+}
+
+/// Limits the channels between ECS and network tasks. Insert before `Startup`.
+/// Capacities count packets/events (not decoded bytes); zero capacities are clamped to one.
+/// UDP drops newly received packets when the ECS queue is full; streams apply backpressure.
+#[derive(Clone, Copy, Debug, Resource)]
+pub struct NetworkQueueSettings {
+    /// Outgoing packets per connection. `EcsConnection::send` reports `Full` on overflow.
+    pub send_capacity: usize,
+    /// Incoming packets per plugin and capacity of each connection/event channel.
+    pub receive_capacity: usize,
+    /// Maximum items drained by each networking ECS system per frame. May change at runtime.
+    pub events_per_frame: usize,
+}
+
+impl Default for NetworkQueueSettings {
+    fn default() -> Self {
+        Self {
+            send_capacity: 1024,
+            receive_capacity: 4096,
+            events_per_frame: 256,
+        }
+    }
+}
+
+#[cfg(any(feature = "client", feature = "server"))]
+pub(crate) async fn forward_packet<T>(
+    sender: &Sender<T>,
+    packet: T,
+    datagram: bool,
+    cancel: &DisconnectTask,
+) -> bool {
+    if datagram {
+        !matches!(sender.try_send(packet), Err(TrySendError::Closed(_)))
+    } else {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => false,
+            result = sender.send(packet) => result.is_ok(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+
+    #[test]
+    fn outgoing_queue_reports_full_and_closed() {
+        let (packet_tx, _receiver) = tokio::sync::mpsc::channel(1);
+        let connection = EcsConnection {
+            disconnect_task: DisconnectTask::new(),
+            id: ConnectionId::next(),
+            packet_tx,
+            local_addr: "127.0.0.1:1".parse().unwrap(),
+            peer_addr: "127.0.0.1:2".parse().unwrap(),
+        };
+        connection.send(1).unwrap();
+        assert!(matches!(connection.send(2), Err(TrySendError::Full(2))));
+        connection.disconnect();
+        assert!(matches!(connection.send(3), Err(TrySendError::Closed(3))));
+    }
+
+    #[cfg(any(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn udp_overflow_drops_new_packets_and_tcp_waits_cancel_safely() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let cancel = DisconnectTask::new();
+        assert!(forward_packet(&sender, 1, true, &cancel).await);
+        assert!(forward_packet(&sender, 2, true, &cancel).await);
+        assert_eq!(receiver.recv().await, Some(1));
+        assert!(receiver.try_recv().is_err());
+        sender.send(3).await.unwrap();
+        let mut pending = Box::pin(forward_packet(&sender, 4, false, &cancel));
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        cancel.cancel();
+        assert!(!pending.await);
+        assert_eq!(receiver.recv().await, Some(3));
+        assert!(receiver.try_recv().is_err());
     }
 }

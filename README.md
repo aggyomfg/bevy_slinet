@@ -37,3 +37,15 @@ Note: with TCP, you should implement keep-alive and disconnection systems yourse
 | `0.18`         | `0.19`       |
 | `0.19`         | `0.19`       |
 | `main`         | `0.19`       |
+
+## Queue limits
+
+Insert `connection::NetworkQueueSettings` before startup to configure outgoing
+packets per connection, incoming packets per plugin, and the event budget per
+frame. Defaults are 1024 outgoing packets, 4096 incoming packets/events per
+channel, and 256 events per networking system per frame. Capacities count items,
+not decoded bytes; serializers must also bound allocations made during decoding.
+UDP drops newly received packets when the ECS queue is full. TCP waits for space.
+`EcsConnection::send` returns `TrySendError::Full(packet)` on outgoing overflow and
+`TrySendError::Closed(packet)` after disconnection. Connection requests also have
+a bounded queue; excess requests are rejected with a log message.

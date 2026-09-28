@@ -7,11 +7,12 @@ use std::sync::Arc;
 use bevy::platform::time::Instant;
 use bevy::{log, prelude::*};
 use tokio::select;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::connection::{
-    max_packet_size_warning_system, set_max_packet_size_system, warn_if_stateful_over_datagrams,
-    ConnectionId, DisconnectTask, EcsConnection, RawConnection,
+    forward_packet, max_packet_size_warning_system, set_max_packet_size_system,
+    warn_if_stateful_over_datagrams, ConnectionId, DisconnectTask, EcsConnection,
+    NetworkQueueSettings, RawConnection,
 };
 use crate::protocol::{Listener, NetworkStream, Protocol, ReadStream, ReceiveError, WriteStream};
 use crate::{ServerConfig, SystemSets};
@@ -109,14 +110,12 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
 }
 
 #[derive(Resource)]
-struct ConnectionReceiver<Config: ServerConfig>(
-    UnboundedReceiver<(SocketAddr, ServerConnection<Config>)>,
-);
+struct ConnectionReceiver<Config: ServerConfig>(Receiver<(SocketAddr, ServerConnection<Config>)>);
 
 #[allow(clippy::type_complexity)]
 #[derive(Resource)]
 struct DisconnectionReceiver<Config: ServerConfig>(
-    UnboundedReceiver<(
+    Receiver<(
         ReceiveError<Config::DecodeError, Config::LengthSerializer>,
         ServerConnection<Config>,
     )>,
@@ -124,25 +123,26 @@ struct DisconnectionReceiver<Config: ServerConfig>(
 
 #[derive(Resource)]
 struct PacketReceiver<Config: ServerConfig>(
-    UnboundedReceiver<(ServerConnection<Config>, Config::ClientPacket, Instant)>,
+    Receiver<(ServerConnection<Config>, Config::ClientPacket, Instant)>,
 );
 
 fn create_setup_system<Config: ServerConfig>(
     address: SocketAddr,
     idle_timeout: tokio::sync::watch::Receiver<std::time::Duration>,
-) -> impl Fn(Commands) {
+) -> impl Fn(Commands, Option<Res<NetworkQueueSettings>>) {
     #[cfg(target_family = "wasm")]
     compile_error!("Why would you run a bevy_slinet server on WASM? If you really need this, please open an issue (https://github.com/aggyomfg/bevy_slinet/issues/new)");
 
-    move |mut commands: Commands| {
-        let (conn_tx, conn_rx) = tokio::sync::mpsc::unbounded_channel();
+    move |mut commands: Commands, queues: Option<Res<NetworkQueueSettings>>| {
+        let queues = queues.as_deref().copied().unwrap_or_default();
+        let (conn_tx, conn_rx) = tokio::sync::mpsc::channel(queues.receive_capacity.max(1));
         let (conn_tx2, mut conn_rx2): (
-            UnboundedSender<RawServerConnection<Config>>,
-            UnboundedReceiver<RawServerConnection<Config>>,
-        ) = tokio::sync::mpsc::unbounded_channel();
-        let (disc_tx, disc_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (pack_tx, pack_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (disc_tx2, mut disc_rx2) = tokio::sync::mpsc::unbounded_channel();
+            Sender<RawServerConnection<Config>>,
+            Receiver<RawServerConnection<Config>>,
+        ) = tokio::sync::mpsc::channel(queues.receive_capacity.max(1));
+        let (disc_tx, disc_rx) = tokio::sync::mpsc::channel(queues.receive_capacity.max(1));
+        let (pack_tx, pack_rx) = tokio::sync::mpsc::channel(queues.receive_capacity.max(1));
+        let (disc_tx2, mut disc_rx2) = tokio::sync::mpsc::channel(queues.receive_capacity.max(1));
         commands.insert_resource(ConnectionReceiver::<Config>(conn_rx));
         commands.insert_resource(DisconnectionReceiver::<Config>(disc_rx));
         commands.insert_resource(PacketReceiver::<Config>(pack_rx));
@@ -198,16 +198,16 @@ fn create_setup_system<Config: ServerConfig>(
                                         match result {
                                             Ok((packet, received_at)) => {
                                                 log::trace!("({id:?}) Received packet {:?}", packet);
-                                                if let Err(err) = pack_tx2.send((ecs_conn.clone(), packet, received_at)) {
-                                                    log::error!("({id:?}) Failed to forward received packet: {err}");
+                                                if !forward_packet(&pack_tx2, (ecs_conn.clone(), packet, received_at), Config::Protocol::DATAGRAM, &disconnect_task).await {
+                                                    break;
                                                 }
                                             }
                                             Err(err) => {
                                                 disconnect_task.cancel();
-                                                if let Err(send_err) = disc_tx_2.send((err, ecs_conn.clone())) {
+                                                if let Err(send_err) = disc_tx_2.send((err, ecs_conn.clone())).await {
                                                     log::error!("({id:?}) Failed to send disconnection event: {send_err}");
                                                 }
-                                                if let Err(send_err) = disc_tx2_2.send(ecs_conn.peer_addr) {
+                                                if let Err(send_err) = disc_tx2_2.send(ecs_conn.peer_addr).await {
                                                     log::error!("({id:?}) Failed to send address for disconnection handling: {send_err}");
                                                 }
                                                 break;
@@ -216,10 +216,10 @@ fn create_setup_system<Config: ServerConfig>(
                                     }
                                     _ = disconnect_task.cancelled() => {
                                         log::debug!("({id:?}) Client was disconnected intentionally");
-                                        if let Err(send_err) = disc_tx_2.send((ReceiveError::IntentionalDisconnection, ecs_conn.clone())) {
+                                        if let Err(send_err) = disc_tx_2.send((ReceiveError::IntentionalDisconnection, ecs_conn.clone())).await {
                                             log::error!("({id:?}) Failed to send intentional disconnection event: {send_err}");
                                         }
-                                        if let Err(send_err) = disc_tx2_2.send(ecs_conn.peer_addr) {
+                                        if let Err(send_err) = disc_tx2_2.send(ecs_conn.peer_addr).await {
                                             log::error!("({id:?}) Failed to send address for intentional disconnection handling: {send_err}");
                                         }
                                         break;
@@ -267,7 +267,7 @@ fn create_setup_system<Config: ServerConfig>(
                             let serializer = Config::build_serializer();
                             warn_if_stateful_over_datagrams::<Config::Protocol, _, _, _, _>(&serializer, &mut warned);
                             tokio::spawn(async move {
-                                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                                let (tx, rx) = tokio::sync::mpsc::channel(queues.send_capacity.max(1));
                                 let disconnect_task = DisconnectTask::default();
                                 let connection = RawConnection {
                                     disconnect_task: disconnect_task.clone(),
@@ -284,11 +284,11 @@ fn create_setup_system<Config: ServerConfig>(
                                     local_addr: connection.local_addr(),
                                     peer_addr: connection.peer_addr(),
                                 };
-                                if let Err(err) = conn_tx_2.send((ecs_conn.peer_addr, ecs_conn.clone())) {
+                                if let Err(err) = conn_tx_2.send((ecs_conn.peer_addr, ecs_conn.clone())).await {
                                     log::error!("Failed to send new connection to ECS: {}", err);
                                     return;
                                 }
-                                if let Err(err) = conn_tx2_2.send((connection, ecs_conn)) {
+                                if let Err(err) = conn_tx2_2.send((connection, ecs_conn)).await {
                                     log::error!("Failed to send new raw connection: {}", err);
                                 }
                             });
@@ -366,8 +366,15 @@ pub struct PacketReceiveEvent<Config: ServerConfig> {
 fn accept_new_connections<Config: ServerConfig>(
     mut receiver: ResMut<ConnectionReceiver<Config>>,
     mut commands: Commands,
+    queues: Option<Res<NetworkQueueSettings>>,
 ) {
-    while let Ok((address, connection)) = receiver.0.try_recv() {
+    for (address, connection) in std::iter::from_fn(|| receiver.0.try_recv().ok()).take(
+        queues
+            .as_deref()
+            .copied()
+            .unwrap_or_default()
+            .events_per_frame,
+    ) {
         commands.trigger(NewConnectionEvent::<Config> {
             connection,
             address,
@@ -385,8 +392,15 @@ fn connection_add_system<Config: ServerConfig>(
 fn accept_new_packets<Config: ServerConfig>(
     mut receiver: ResMut<PacketReceiver<Config>>,
     mut commands: Commands,
+    queues: Option<Res<NetworkQueueSettings>>,
 ) {
-    while let Ok((connection, packet, received_at)) = receiver.0.try_recv() {
+    for (connection, packet, received_at) in std::iter::from_fn(|| receiver.0.try_recv().ok()).take(
+        queues
+            .as_deref()
+            .copied()
+            .unwrap_or_default()
+            .events_per_frame,
+    ) {
         commands.trigger(PacketReceiveEvent::<Config> {
             connection,
             packet,
@@ -399,8 +413,15 @@ fn remove_connections<Config: ServerConfig>(
     mut connections: ResMut<ServerConnections<Config>>,
     mut disconnections: ResMut<DisconnectionReceiver<Config>>,
     mut commands: Commands,
+    queues: Option<Res<NetworkQueueSettings>>,
 ) {
-    while let Ok((error, connection)) = disconnections.0.try_recv() {
+    for (error, connection) in std::iter::from_fn(|| disconnections.0.try_recv().ok()).take(
+        queues
+            .as_deref()
+            .copied()
+            .unwrap_or_default()
+            .events_per_frame,
+    ) {
         connections.retain(|conn| conn.id() != connection.id());
         commands.trigger(DisconnectionEvent::<Config> { error, connection });
     }

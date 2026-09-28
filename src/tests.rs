@@ -492,3 +492,35 @@ fn retained_connection_transmits_after_disconnection_event() {
     worker.join().unwrap();
     assert!(wire_result.is_err(), "after DisconnectionEvent retained.send returned {send_result:?} and peer received {wire_result:?}");
 }
+
+#[test]
+fn ecs_packet_budget_limits_each_frame() {
+    let (mut server, mut client) = exchange_packets::<TcpConfig>();
+    server.insert_resource(crate::connection::NetworkQueueSettings {
+        events_per_frame: 1,
+        ..Default::default()
+    });
+    let connection = client
+        .world()
+        .resource::<ClientConnection<TcpConfig>>()
+        .clone();
+    for n in 0..16 {
+        connection.send(Packet(n)).unwrap();
+    }
+    wait_until(|| {
+        let before = server
+            .world()
+            .resource::<ReceivedPackets<Packet>>()
+            .packets
+            .len();
+        server.update();
+        client.update();
+        let after = server
+            .world()
+            .resource::<ReceivedPackets<Packet>>()
+            .packets
+            .len();
+        assert!(after <= before + 1);
+        after == 17
+    });
+}
