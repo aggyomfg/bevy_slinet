@@ -391,7 +391,7 @@ impl WriteStream for UdpServerWriteHalf {
         LS: PacketLengthSerializer,
     {
         match encode_datagram(packet, &*serializer) {
-            Some(datagram) => self.write_all(&datagram).await,
+            Some(datagram) => drop_on_error(self.write_all(&datagram).await, &datagram),
             None => Ok(()),
         }
     }
@@ -552,10 +552,18 @@ impl WriteStream for UdpClientWriteHalf {
         LS: PacketLengthSerializer,
     {
         match encode_datagram(packet, &*serializer) {
-            Some(datagram) => self.write_all(&datagram).await,
+            Some(datagram) => drop_on_error(self.write_all(&datagram).await, &datagram),
             None => Ok(()),
         }
     }
+}
+
+/// UDP send errors (`EMSGSIZE`, `ENOBUFS`, ICMP errors) affect one packet, not the connection.
+fn drop_on_error(result: io::Result<()>, datagram: &[u8]) -> io::Result<()> {
+    if let Err(err) = result {
+        log::warn!("Dropping a {}-byte UDP packet: {err}", datagram.len());
+    }
+    Ok(())
 }
 
 fn assert_all(i: usize, buf: &[u8]) -> io::Result<()> {
@@ -839,6 +847,20 @@ mod tests {
             decode_datagram(&[0xAB, 7], &RawSerializer, usize::MAX),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn send_errors_drop_only_the_packet() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mut write = UdpServerWriteHalf {
+            peer_addr: (Ipv6Addr::LOCALHOST, 1).into(),
+            socket,
+        };
+        assert!(write.write_all(&[DATA_DATAGRAM]).await.is_err());
+        write
+            .send::<Vec<u8>, _, _, _>(vec![7], Arc::new(RawSerializer), &Ls::default())
+            .await
+            .unwrap();
     }
 
     #[test]
