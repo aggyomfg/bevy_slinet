@@ -138,6 +138,7 @@ fn create_setup_system<Config: ServerConfig>(address: SocketAddr) -> impl Fn(Com
         commands.insert_resource(ConnectionReceiver::<Config>(conn_rx));
         commands.insert_resource(DisconnectionReceiver::<Config>(disc_rx));
         commands.insert_resource(PacketReceiver::<Config>(pack_rx));
+        let (bound_tx, bound_rx) = std::sync::mpsc::sync_channel::<SocketAddr>(1);
 
         std::thread::spawn(move || {
             let runtime_result = tokio::runtime::Builder::new_multi_thread()
@@ -243,6 +244,7 @@ fn create_setup_system<Config: ServerConfig>(address: SocketAddr) -> impl Fn(Com
                         return;
                     }
                 };
+                let _ = bound_tx.send(listener.address());
 
                 loop {
                     select! {
@@ -267,7 +269,7 @@ fn create_setup_system<Config: ServerConfig>(address: SocketAddr) -> impl Fn(Com
                                     local_addr: connection.local_addr(),
                                     peer_addr: connection.peer_addr(),
                                 };
-                                if let Err(err) = conn_tx_2.send((address, ecs_conn.clone())) {
+                                if let Err(err) = conn_tx_2.send((ecs_conn.peer_addr, ecs_conn.clone())) {
                                     log::error!("Failed to send new connection to ECS: {}", err);
                                     return;
                                 }
@@ -286,6 +288,30 @@ fn create_setup_system<Config: ServerConfig>(address: SocketAddr) -> impl Fn(Com
                 }
             });
         });
+
+        // Clients may connect right after Startup, so the listener must exist by then.
+        // Returns Err (no hang) if binding failed or the thread exited.
+        if let Ok(local_addr) = bound_rx.recv() {
+            commands.insert_resource(ServerAddress::<Config> {
+                address: local_addr,
+                _marker: PhantomData,
+            });
+        }
+    }
+}
+
+/// The address the server is actually listening on, available after `Startup`.
+/// Not inserted if binding failed. Useful when binding to port `0`.
+#[derive(Resource)]
+pub struct ServerAddress<Config: ServerConfig> {
+    address: SocketAddr,
+    _marker: PhantomData<Config>,
+}
+
+impl<Config: ServerConfig> ServerAddress<Config> {
+    /// The bound address.
+    pub fn address(&self) -> SocketAddr {
+        self.address
     }
 }
 

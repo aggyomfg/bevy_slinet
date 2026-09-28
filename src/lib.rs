@@ -26,8 +26,8 @@ mod tests;
 mod tests_mut_serializer;
 
 /// [`SystemSets`](bevy::ecs::schedule::SystemSet) in [`bevy`] are used for system ordering.
-/// See [System Order of Execution][cheatbook_order] on unofficial bevy cheatbook for details.
-/// For more details on what each SystemSet means, refer to [`client`](crate::client) or [`server`](crate::server) source code
+/// See [System Sets][cheatbook_systemsets] on unofficial bevy cheatbook for details.
+/// For more details on what each SystemSet means, refer to [`client`] or [`server`] source code
 ///
 /// [cheatbook_systemsets]: https://bevy-cheatbook.github.io/programming/system-sets.html
 #[derive(Clone, Debug, Eq, Hash, PartialEq, SystemSet)]

@@ -67,7 +67,7 @@ pub trait ClientStream: NetworkStream {
         Self: Sized;
 }
 
-/// A [NetworkStream](NetworkStream) that can be used server-side.
+/// A [NetworkStream] that can be used server-side.
 pub trait ServerStream: NetworkStream {}
 
 /// A read-write stream between the client and the server.

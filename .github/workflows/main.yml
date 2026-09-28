@@ -47,4 +47,4 @@ jobs:
         run: cargo build --target ${{ matrix.target }} --all-features
 
       - name: Run cargo test
-        run: cargo test --target ${{ matrix.target }} --all-features -- --test-threads=1
+        run: cargo test --target ${{ matrix.target }} --all-features

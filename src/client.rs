@@ -115,7 +115,7 @@ impl<Config: ClientConfig> Default for ClientPlugin<Config> {
 
 impl<Config: ClientConfig> ClientPlugin<Config> {
     /// Adds the required systems, but doesn't connect immediately.
-    /// Create a [ClientConnection](ClientConnection) using [`Protocol::connect_to_server`]
+    /// Create a [ClientConnection] using [`Protocol::connect_to_server`]
     /// and add it as a resource to start the server.
     pub fn new() -> ClientPlugin<Config> {
         ClientPlugin::default()
@@ -404,7 +404,7 @@ pub struct ConnectionEstablishEvent<Config: ClientConfig> {
     pub connection: ClientConnection<Config>,
 }
 
-/// Indicates that something went wrong during a connection attempt. See [`DisconnectionEvent.error`] for details
+/// Indicates that something went wrong during a connection attempt. See [`DisconnectionEvent::error`] for details
 #[derive(Event)]
 pub struct DisconnectionEvent<Config: ClientConfig> {
     /// The error.

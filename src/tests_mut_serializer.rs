@@ -9,11 +9,11 @@ use crate::serializers::custom_crypt::{
     CustomCryptClientPacket, CustomCryptEngine, CustomCryptSerializer, CustomCryptServerPacket,
     CustomSerializationError,
 };
-use crate::server::{self, NewConnectionEvent, ServerConnections, ServerPlugin};
+use crate::server::{self, NewConnectionEvent, ServerAddress, ServerConnections, ServerPlugin};
+use crate::tests::wait_until;
 use crate::{ClientConfig, ServerConfig};
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 struct TcpConfig;
 
@@ -69,18 +69,29 @@ impl ClientConfig for TcpConfig {
 
 #[test]
 fn tcp_connection() {
-    let srv_addr = "127.0.0.1:3004";
     let mut app_server = App::new();
-    app_server.add_plugins(ServerPlugin::<TcpConfig>::bind(srv_addr));
+    app_server.add_plugins(ServerPlugin::<TcpConfig>::bind("127.0.0.1:0"));
+    app_server.update(); // bind
+    let srv_addr = app_server
+        .world()
+        .resource::<ServerAddress<TcpConfig>>()
+        .address();
 
     let mut app_client = App::new();
     app_client.add_plugins(ClientPlugin::<TcpConfig>::connect(srv_addr));
 
-    app_server.update(); // bind
-    app_client.update(); // connect
-    std::thread::sleep(std::time::Duration::from_secs(1));
-    app_client.update(); // add connection resource
-    app_server.update(); // handle connection
+    wait_until(|| {
+        app_client.update();
+        app_server.update();
+        app_client
+            .world()
+            .contains_resource::<ClientConnection<TcpConfig>>()
+            && app_server
+                .world()
+                .resource::<ServerConnections<TcpConfig>>()
+                .len()
+                == 1
+    });
 
     assert!(
         app_client
@@ -114,10 +125,9 @@ struct ServerToClientPacketResource(CustomCryptServerPacket);
 fn tcp_encrypted_packets() {
     let client_to_server_packet = CustomCryptClientPacket::String("Hello, Server!".to_string());
     let server_to_client_packet = CustomCryptServerPacket::String("Hello, Client!".to_string());
-    let server_addr = "127.0.0.1:3005";
 
     let mut app_server = App::new();
-    app_server.add_plugins(ServerPlugin::<TcpConfig>::bind(server_addr));
+    app_server.add_plugins(ServerPlugin::<TcpConfig>::bind("127.0.0.1:0"));
     app_server.insert_resource(ReceivedPackets::<CustomCryptClientPacket>::default());
     app_server.insert_resource(ServerToClientPacketResource(
         server_to_client_packet.clone(),
@@ -125,6 +135,12 @@ fn tcp_encrypted_packets() {
 
     app_server.add_observer(server_new_connection_system);
     app_server.add_observer(server_packet_receive_system);
+
+    app_server.update(); // bind
+    let server_addr = app_server
+        .world()
+        .resource::<ServerAddress<TcpConfig>>()
+        .address();
 
     let mut app_client = App::new();
     app_client.add_plugins(ClientPlugin::<TcpConfig>::connect(server_addr));
@@ -136,14 +152,20 @@ fn tcp_encrypted_packets() {
     app_client.add_observer(client_connection_establish_system);
     app_client.add_observer(client_packet_receive_system);
 
-    app_server.update(); // bind
-    app_client.update(); // connect
-    std::thread::sleep(Duration::from_secs(1));
-    app_client.update(); // add connection resource
-    app_server.update(); // handle connection
-    std::thread::sleep(Duration::from_secs(1));
-    app_client.update(); // handle packet
-    app_server.update(); // handle packet
+    wait_until(|| {
+        app_client.update();
+        app_server.update();
+        !app_server
+            .world()
+            .resource::<ReceivedPackets<CustomCryptClientPacket>>()
+            .packets
+            .is_empty()
+            && !app_client
+                .world()
+                .resource::<ReceivedPackets<CustomCryptServerPacket>>()
+                .packets
+                .is_empty()
+    });
 
     // Check if the server received the packet from the client
     let server_received_packets = app_server

@@ -4,13 +4,22 @@ use crate::packet_length_serializer::LittleEndian;
 use crate::protocols::tcp::TcpProtocol;
 use crate::serializer::SerializerAdapter;
 use crate::serializers::bincode_serde::BincodeSerdeSerializer;
-use crate::server::{NewConnectionEvent, ServerConnections, ServerPlugin};
+use crate::server::{NewConnectionEvent, ServerAddress, ServerConnections, ServerPlugin};
 use crate::{server, ClientConfig, ServerConfig};
 use bevy::app::App;
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Calls `step` until it returns `true` or a timeout expires.
+pub(crate) fn wait_until(mut step: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !step() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
 struct Packet(u64);
@@ -55,21 +64,40 @@ impl ClientConfig for TcpConfig {
     }
 }
 
+#[derive(Default, Resource)]
+struct NewConnectionAddress(Option<SocketAddr>);
+
 #[test]
 fn tcp_connection() {
-    let server_addr = "127.0.0.1:3000";
-
     let mut app_server = App::new();
-    app_server.add_plugins(ServerPlugin::<TcpConfig>::bind(server_addr));
+    app_server.add_plugins(ServerPlugin::<TcpConfig>::bind("127.0.0.1:0"));
+    app_server.init_resource::<NewConnectionAddress>();
+    app_server.add_observer(
+        |event: On<NewConnectionEvent<TcpConfig>>, mut address: ResMut<NewConnectionAddress>| {
+            address.0 = Some(event.event().address);
+        },
+    );
+    app_server.update(); // bind
+    let server_addr = app_server
+        .world()
+        .resource::<ServerAddress<TcpConfig>>()
+        .address();
 
     let mut app_client = App::new();
     app_client.add_plugins(ClientPlugin::<TcpConfig>::connect(server_addr));
 
-    app_server.update(); // bind
-    app_client.update(); // connect
-    std::thread::sleep(Duration::from_secs(1));
-    app_client.update(); // add connection resource
-    app_server.update(); // handle connection
+    wait_until(|| {
+        app_client.update();
+        app_server.update();
+        app_client
+            .world()
+            .contains_resource::<ClientConnection<TcpConfig>>()
+            && app_server
+                .world()
+                .resource::<ServerConnections<TcpConfig>>()
+                .len()
+                == 1
+    });
 
     assert!(
         app_client
@@ -85,6 +113,16 @@ fn tcp_connection() {
             .unwrap()
             .len(),
         1,
+    );
+    assert_eq!(
+        app_server.world().resource::<NewConnectionAddress>().0,
+        Some(
+            app_client
+                .world()
+                .resource::<ClientConnection<TcpConfig>>()
+                .local_addr()
+        ),
+        "NewConnectionEvent.address must be the client's address"
     );
 }
 
@@ -103,15 +141,20 @@ struct ServerToClientPacketResource(Packet);
 fn tcp_packets() {
     let client_to_server_packet = Packet(42);
     let server_to_client_packet = Packet(24);
-    let server_addr = "127.0.0.1:3007";
 
     let mut app_server = App::new();
-    app_server.add_plugins(ServerPlugin::<TcpConfig>::bind(server_addr));
+    app_server.add_plugins(ServerPlugin::<TcpConfig>::bind("127.0.0.1:0"));
     app_server.insert_resource(ReceivedPackets::<Packet>::default());
     app_server.insert_resource(ServerToClientPacketResource(server_to_client_packet));
 
     app_server.add_observer(server_new_connection_system);
     app_server.add_observer(server_packet_receive_system);
+
+    app_server.update(); // bind
+    let server_addr = app_server
+        .world()
+        .resource::<ServerAddress<TcpConfig>>()
+        .address();
 
     let mut app_client = App::new();
     app_client.add_plugins(ClientPlugin::<TcpConfig>::connect(server_addr));
@@ -121,14 +164,20 @@ fn tcp_packets() {
     app_client.add_observer(client_connection_establish_system);
     app_client.add_observer(client_packet_receive_system);
 
-    app_server.update(); // bind
-    app_client.update(); // connect
-    std::thread::sleep(Duration::from_secs(1));
-    app_client.update(); // add connection resource
-    app_server.update(); // handle connection
-    std::thread::sleep(Duration::from_secs(1));
-    app_client.update(); // handle packet
-    app_server.update(); // handle packet
+    wait_until(|| {
+        app_client.update();
+        app_server.update();
+        !app_server
+            .world()
+            .resource::<ReceivedPackets<Packet>>()
+            .packets
+            .is_empty()
+            && !app_client
+                .world()
+                .resource::<ReceivedPackets<Packet>>()
+                .packets
+                .is_empty()
+    });
 
     // Check if the server received the packet from the client
     let server_received_packets = app_server
