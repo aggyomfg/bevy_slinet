@@ -1,5 +1,21 @@
+use super::session::HeartbeatTiming;
+use super::settings::{ValidatedOptions, MAX_QUEUED_BYTES, MAX_QUEUED_DATAGRAMS};
+use super::test_support::RawPeer;
+use super::wire::*;
 use super::*;
 use crate::packet_length_serializer::LittleEndian;
+use crate::{
+    protocol::{ClientStream, Listener, NetworkStream, ReadStream, ReceiveError, WriteStream},
+    serializer::Serializer,
+    Protocol,
+};
+use bevy::platform::time::Instant;
+use std::{
+    io::{self, ErrorKind},
+    sync::Arc,
+    time::Duration,
+};
+use tokio::{net::UdpSocket, sync::watch, time::Instant as Clock};
 type Ls = LittleEndian<u32>;
 struct Raw;
 impl Serializer<Vec<u8>, Vec<u8>> for Raw {
@@ -25,38 +41,73 @@ async fn send(write: &mut UdpWriteHalf, packet: Vec<u8>) {
         .await
         .unwrap();
 }
-async fn pair() -> (UdpReadHalf, UdpWriteHalf, UdpReadHalf, UdpWriteHalf) {
-    let listener = Arc::new(
-        UdpProtocol::bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap(),
-    );
-    let (client, server) = tokio::join!(
-        UdpClientStream::connect(listener.address()),
-        listener.accept()
-    );
-    let (cr, cw) = client.unwrap().into_split().await.unwrap();
-    let (sr, sw) = server.unwrap().into_split().await.unwrap();
-    tokio::spawn(async move { while listener.accept().await.is_ok() {} });
-    (cr, cw, sr, sw)
+struct ConnectedPair {
+    client_read: UdpReadHalf,
+    client_write: UdpWriteHalf,
+    server_read: UdpReadHalf,
+    server_write: UdpWriteHalf,
 }
-async fn fixture(options: UdpOptions) -> (UdpNetworkListener, UdpSocket, Cookie, UdpServerStream) {
-    let listener = UdpNetworkListener::bind("127.0.0.1:0".parse().unwrap(), options)
-        .await
-        .unwrap();
-    let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let address = peer.local_addr().unwrap();
-    let cookie = listener.cookies.issue(address, [9; 16]);
-    let stream = listener
-        .dispatch(&cookie.encode(CONFIRM), address, Instant::now())
-        .unwrap();
-    (listener, peer, cookie, stream)
+impl ConnectedPair {
+    async fn new() -> Self {
+        let listener = Arc::new(
+            UdpProtocol::bind("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap(),
+        );
+        let (client, server) = tokio::join!(
+            UdpClientStream::connect(listener.address()),
+            listener.accept()
+        );
+        let (cr, cw) = client.unwrap().into_split().await.unwrap();
+        let (sr, sw) = server.unwrap().into_split().await.unwrap();
+        tokio::spawn(async move { while listener.accept().await.is_ok() {} });
+        Self {
+            client_read: cr,
+            client_write: cw,
+            server_read: sr,
+            server_write: sw,
+        }
+    }
+}
+struct AcceptedPeer {
+    listener: UdpNetworkListener,
+    peer: UdpSocket,
+    cookie: Cookie,
+    stream: UdpServerStream,
+}
+impl AcceptedPeer {
+    async fn new(options: UdpOptions) -> Self {
+        let listener = UdpNetworkListener::bind("127.0.0.1:0".parse().unwrap(), options)
+            .await
+            .unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = peer.local_addr().unwrap();
+        let cookie = listener.issue_cookie(address, Nonce::from_bytes([9; 16]));
+        let stream = listener
+            .dispatch(
+                &HandshakeFrame::confirm(cookie).encode(),
+                address,
+                Instant::now(),
+            )
+            .unwrap();
+        Self {
+            listener,
+            peer,
+            cookie,
+            stream,
+        }
+    }
 }
 
 #[tokio::test]
 async fn each_datagram_is_independent_including_empty_payloads() {
     tokio::time::timeout(Duration::from_secs(5), async {
-        let (mut cr, mut cw, mut sr, mut sw) = pair().await;
+        let ConnectedPair {
+            client_read: mut cr,
+            client_write: mut cw,
+            server_read: mut sr,
+            server_write: mut sw,
+        } = ConnectedPair::new().await;
         for packet in [vec![1], vec![], vec![255], vec![2, 3], vec![1]] {
             send(&mut cw, packet).await;
         }
@@ -79,11 +130,15 @@ async fn cookie_is_required_before_allocating_a_peer() {
     for bytes in [
         vec![],
         vec![1],
-        Cookie::hello([1; 16]).encode(HELLO).to_vec(),
-        Cookie::hello([1; 16]).encode(CONFIRM).to_vec(),
+        HandshakeFrame::hello(Nonce::from_bytes([1; 16]))
+            .encode()
+            .to_vec(),
+        HandshakeFrame::confirm(Cookie::hello(Nonce::from_bytes([1; 16])))
+            .encode()
+            .to_vec(),
     ] {
         assert!(listener.dispatch(&bytes, address, Instant::now()).is_none());
-        assert!(listener.peers.lock().unwrap().is_empty());
+        assert!(listener.peer_count() == 0);
     }
 }
 
@@ -91,11 +146,13 @@ async fn cookie_is_required_before_allocating_a_peer() {
 async fn cookies_bind_address_nonce_generation_and_expiry() {
     let jar = CookieJar::new().unwrap();
     let address = "127.0.0.1:1234".parse().unwrap();
-    let cookie = jar.issue(address, [7; 16]);
+    let cookie = jar.issue(address, Nonce::from_bytes([7; 16]));
     assert!(jar.verify(address, &cookie));
     assert!(!jar.verify("127.0.0.1:1235".parse().unwrap(), &cookie));
     let mut tampered = cookie;
-    tampered.nonce[0] ^= 1;
+    let mut nonce = *tampered.nonce.as_bytes();
+    nonce[0] ^= 1;
+    tampered.nonce = Nonce::from_bytes(nonce);
     assert!(!jar.verify(address, &tampered));
     tampered = cookie;
     tampered.generation += 1;
@@ -107,25 +164,34 @@ async fn cookies_bind_address_nonce_generation_and_expiry() {
 
 #[tokio::test]
 async fn session_replacement_rejects_old_data_disconnect_and_confirmation() {
-    let (listener, peer, old, old_stream) = fixture(UdpOptions::DEFAULT).await;
+    let AcceptedPeer {
+        listener,
+        peer,
+        cookie: old,
+        stream: old_stream,
+    } = AcceptedPeer::new(UdpOptions::DEFAULT).await;
     let address = peer.local_addr().unwrap();
-    let new = listener.cookies.issue(address, [8; 16]);
+    let new = listener.issue_cookie(address, Nonce::from_bytes([8; 16]));
     let stream = listener
-        .dispatch(&new.encode(CONFIRM), address, Instant::now())
+        .dispatch(
+            &HandshakeFrame::confirm(new).encode(),
+            address,
+            Instant::now(),
+        )
         .unwrap();
     drop(old_stream); // Its registration must not remove the replacement.
     let (mut read, _write) = stream.into_split().await.unwrap();
     for bytes in [
-        frame(DATA, &old.mac, &[1]),
-        control(DISCONNECT, &old.mac).to_vec(),
-        old.encode(CONFIRM).to_vec(),
+        Frame::data(old.mac, &[1]).encode(),
+        Control::Disconnect.encode(old.mac).to_vec(),
+        HandshakeFrame::confirm(old).encode().to_vec(),
     ] {
         assert!(listener.dispatch(&bytes, address, Instant::now()).is_none());
     }
-    assert!(!read.state.closed.is_cancelled());
-    assert_eq!(listener.peers.lock().unwrap().len(), 1);
+    assert!(!read.session().is_closed());
+    assert_eq!(listener.peer_count(), 1);
     let received_at = Instant::now();
-    listener.dispatch(&frame(DATA, &new.mac, &[7]), address, received_at);
+    listener.dispatch(&Frame::data(new.mac, &[7]).encode(), address, received_at);
     let (packet, timestamp) = read
         .receive_with_timestamp::<_, Vec<u8>, _, _>(Arc::new(Raw), &Ls::default())
         .await
@@ -133,38 +199,56 @@ async fn session_replacement_rejects_old_data_disconnect_and_confirmation() {
     assert_eq!(packet, [7]);
     assert_eq!(timestamp, received_at);
     drop(read);
-    assert!(listener.peers.lock().unwrap().is_empty());
+    assert!(listener.peer_count() == 0);
 }
 
 #[tokio::test]
 async fn duplicate_confirmations_do_not_allocate_another_peer() {
-    let (listener, peer, cookie, _stream) = fixture(UdpOptions::DEFAULT).await;
+    let AcceptedPeer {
+        listener,
+        peer,
+        cookie,
+        stream: _stream,
+    } = AcceptedPeer::new(UdpOptions::DEFAULT).await;
     assert!(listener
         .dispatch(
-            &cookie.encode(CONFIRM),
+            &HandshakeFrame::confirm(cookie).encode(),
             peer.local_addr().unwrap(),
             Instant::now()
         )
         .is_none());
-    assert_eq!(listener.peers.lock().unwrap().len(), 1);
+    assert_eq!(listener.peer_count(), 1);
 }
 
 #[tokio::test]
 async fn peer_cap_includes_unsplit_connections() {
-    let (listener, _peer, _cookie, stream) = fixture(UdpOptions {
+    let AcceptedPeer {
+        listener,
+        peer: _peer,
+        cookie: _cookie,
+        stream,
+    } = AcceptedPeer::new(UdpOptions {
         max_peers: 1,
         ..UdpOptions::DEFAULT
     })
     .await;
     let address = "127.0.0.1:1234".parse().unwrap();
-    let cookie = listener.cookies.issue(address, [1; 16]);
+    let cookie = listener.issue_cookie(address, Nonce::from_bytes([1; 16]));
     assert!(listener
-        .dispatch(&cookie.encode(CONFIRM), address, Instant::now())
+        .dispatch(
+            &HandshakeFrame::confirm(cookie).encode(),
+            address,
+            Instant::now()
+        )
         .is_none());
-    assert_eq!(listener.peers.lock().unwrap().len(), 1);
+    assert_eq!(listener.peer_count(), 1);
     drop(stream);
     assert!(listener
-        .dispatch(&cookie.encode(CONFIRM), address, Instant::now())
+        .dispatch(
+            &HandshakeFrame::confirm(cookie).encode(),
+            address,
+            Instant::now()
+        )
         .is_some());
 }
 
@@ -181,36 +265,57 @@ async fn handshake_rate_limit_recovers_without_allocating_pending_state() {
     .unwrap();
     let address = "127.0.0.1:1234".parse().unwrap();
     listener.dispatch(
-        &Cookie::hello([0; 16]).encode(HELLO),
+        &HandshakeFrame::hello(Nonce::from_bytes([0; 16])).encode(),
         address,
         Instant::now(),
     );
-    let cookie = listener.cookies.issue(address, [0; 16]);
+    let cookie = listener.issue_cookie(address, Nonce::from_bytes([0; 16]));
     assert!(listener
-        .dispatch(&cookie.encode(CONFIRM), address, Instant::now())
+        .dispatch(
+            &HandshakeFrame::confirm(cookie).encode(),
+            address,
+            Instant::now()
+        )
         .is_none());
-    assert!(listener.peers.lock().unwrap().is_empty());
+    assert!(listener.peer_count() == 0);
     tokio::time::advance(Duration::from_secs(1)).await;
     assert!(listener
-        .dispatch(&cookie.encode(CONFIRM), address, Instant::now())
+        .dispatch(
+            &HandshakeFrame::confirm(cookie).encode(),
+            address,
+            Instant::now()
+        )
         .is_some());
 }
 
 #[tokio::test]
 async fn queue_limits_and_control_packets_under_overload() {
-    let (listener, peer, cookie, stream) = fixture(UdpOptions::DEFAULT).await;
+    let AcceptedPeer {
+        listener,
+        peer,
+        cookie,
+        stream,
+    } = AcceptedPeer::new(UdpOptions::DEFAULT).await;
     let address = peer.local_addr().unwrap();
     let (mut read, _write) = stream.into_split().await.unwrap();
     for _ in 0..MAX_QUEUED_DATAGRAMS + 1 {
-        listener.dispatch(&frame(DATA, &cookie.mac, &[7]), address, Instant::now());
+        listener.dispatch(
+            &Frame::data(cookie.mac, &[7]).encode(),
+            address,
+            Instant::now(),
+        );
     }
     assert_eq!(
-        read.state.queued_bytes.load(Ordering::Relaxed),
+        read.session().queued_bytes(),
         (HEADER + 1) * MAX_QUEUED_DATAGRAMS
     );
     assert_eq!(receive(&mut read).await.unwrap(), [7]);
     // Disconnect bypasses the saturated application queue.
-    listener.dispatch(&control(DISCONNECT, &cookie.mac), address, Instant::now());
+    listener.dispatch(
+        &Control::Disconnect.encode(cookie.mac),
+        address,
+        Instant::now(),
+    );
     assert!(
         matches!(receive(&mut read).await, Err(ReceiveError::Io(err)) if err.kind() == ErrorKind::ConnectionAborted)
     );
@@ -218,25 +323,32 @@ async fn queue_limits_and_control_packets_under_overload() {
 
 #[tokio::test]
 async fn queue_byte_budget_is_bounded() {
-    let (listener, peer, cookie, stream) = fixture(UdpOptions::DEFAULT).await;
+    let AcceptedPeer {
+        listener,
+        peer,
+        cookie,
+        stream,
+    } = AcceptedPeer::new(UdpOptions::DEFAULT).await;
     let address = peer.local_addr().unwrap();
-    let bytes = frame(DATA, &cookie.mac, &vec![7; MAX_DATAGRAM_SIZE - HEADER]);
+    let bytes = Frame::data(cookie.mac, &vec![7; MAX_DATAGRAM_SIZE - HEADER]).encode();
     for _ in 0..100 {
         listener.dispatch(&bytes, address, Instant::now());
     }
     let (mut read, _write) = stream.into_split().await.unwrap();
     let expected = MAX_QUEUED_BYTES / bytes.len() * bytes.len();
-    assert_eq!(read.state.queued_bytes.load(Ordering::Relaxed), expected);
+    assert_eq!(read.session().queued_bytes(), expected);
     receive(&mut read).await.unwrap();
-    assert_eq!(
-        read.state.queued_bytes.load(Ordering::Relaxed),
-        expected - bytes.len()
-    );
+    assert_eq!(read.session().queued_bytes(), expected - bytes.len());
 }
 
 #[tokio::test(start_paused = true)]
 async fn idle_deadline_tracks_reception_and_setting_changes() {
-    let (listener, peer, cookie, stream) = fixture(UdpOptions::DEFAULT).await;
+    let AcceptedPeer {
+        listener,
+        peer,
+        cookie,
+        stream,
+    } = AcceptedPeer::new(UdpOptions::DEFAULT).await;
     let address = peer.local_addr().unwrap();
     let (mut read, _write) = stream.into_split().await.unwrap();
     let (settings, timeout) = watch::channel(Duration::MAX);
@@ -244,7 +356,11 @@ async fn idle_deadline_tracks_reception_and_setting_changes() {
     let mut waiting = Box::pin(receive(&mut read));
     assert!(futures::poll!(waiting.as_mut()).is_pending());
     tokio::time::advance(Duration::from_secs(20)).await;
-    listener.dispatch(&control(KEEPALIVE, &cookie.mac), address, Instant::now());
+    listener.dispatch(
+        &Control::Keepalive.encode(cookie.mac),
+        address,
+        Instant::now(),
+    );
     settings.send_replace(Duration::from_secs(2));
     assert!(futures::poll!(waiting.as_mut()).is_pending());
     tokio::time::advance(Duration::from_secs(2)).await;
@@ -255,13 +371,22 @@ async fn idle_deadline_tracks_reception_and_setting_changes() {
 
 #[tokio::test(start_paused = true)]
 async fn invalid_or_stale_packets_do_not_extend_idle_timeout() {
-    let (listener, peer, _cookie, stream) = fixture(UdpOptions::DEFAULT).await;
+    let AcceptedPeer {
+        listener,
+        peer,
+        cookie: _cookie,
+        stream,
+    } = AcceptedPeer::new(UdpOptions::DEFAULT).await;
     let address = peer.local_addr().unwrap();
     let (mut read, _write) = stream.into_split().await.unwrap();
     let mut waiting = Box::pin(receive(&mut read));
     assert!(futures::poll!(waiting.as_mut()).is_pending());
     tokio::time::advance(Duration::from_secs(9)).await;
-    listener.dispatch(&frame(DATA, &[0; 32], &[7]), address, Instant::now());
+    listener.dispatch(
+        &Frame::data(Session::from_bytes([0; 32]), &[7]).encode(),
+        address,
+        Instant::now(),
+    );
     tokio::time::advance(Duration::from_secs(1)).await;
     assert!(
         matches!(waiting.await, Err(ReceiveError::Io(err)) if err.kind() == ErrorKind::TimedOut)
@@ -271,7 +396,7 @@ async fn invalid_or_stale_packets_do_not_extend_idle_timeout() {
 #[tokio::test]
 async fn dropping_read_half_closes_writer_and_remote() {
     tokio::time::timeout(Duration::from_secs(5), async {
-        let (cr, mut cw, mut sr, _sw) = pair().await;
+        let ConnectedPair { client_read: cr, client_write: mut cw, server_read: mut sr, server_write: _sw } = ConnectedPair::new().await;
         drop(cr);
         assert!(cw.send::<Vec<u8>, _, _, _>(vec![1], Arc::new(Raw), &Ls::default()).await.is_err());
         assert!(matches!(receive(&mut sr).await, Err(ReceiveError::Io(err)) if err.kind() == ErrorKind::ConnectionAborted));
@@ -279,7 +404,7 @@ async fn dropping_read_half_closes_writer_and_remote() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn connect_times_out_without_an_answer() {
+async fn connect_times_out_without_a_response() {
     let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let started = Clock::now();
     let result = UdpClientStream::connect(server.local_addr().unwrap()).await;
@@ -297,25 +422,26 @@ async fn handshake_retries_both_legs_and_preserves_early_data() {
             let (mut hellos, mut confirms) = (0, 0);
             loop {
                 let (len, address) = server.recv_from(&mut buffer).await.unwrap();
-                let Some((tag, cookie)) = Cookie::parse(&buffer[..len]) else {
+                let Some(HandshakeFrame { kind, cookie }) = HandshakeFrame::parse(&buffer[..len])
+                else {
                     continue;
                 };
-                if tag == HELLO {
+                if kind == HandshakeKind::Hello {
                     hellos += 1;
                     if hellos == 1 {
                         continue;
                     }
                     server
-                        .send_to(&test_answer(&buffer[..len]).unwrap(), address)
+                        .send_to(&RawPeer::respond(&buffer[..len]).unwrap(), address)
                         .await
                         .unwrap();
-                } else if tag == CONFIRM {
+                } else if kind == HandshakeKind::Confirm {
                     confirms += 1;
                     if confirms == 1 {
                         continue;
                     }
                     server
-                        .send_to(&frame(DATA, &cookie.mac, &[7]), address)
+                        .send_to(&Frame::data(cookie.mac, &[7]).encode(), address)
                         .await
                         .unwrap();
                     break;
@@ -335,13 +461,23 @@ fn invalid_frames_are_rejected() {
     for bytes in [
         vec![],
         vec![1],
-        frame(KEEPALIVE, &[1; 32], &[9]),
-        frame(9, &[1; 32], &[]),
+        {
+            let mut bytes = Control::Keepalive
+                .encode(Session::from_bytes([1; 32]))
+                .to_vec();
+            bytes.push(9);
+            bytes
+        },
+        {
+            let mut bytes = vec![1; 37];
+            bytes[..5].copy_from_slice(b"SLN2\x09");
+            bytes
+        },
         vec![1; MAX_DATAGRAM_SIZE + 1],
     ] {
-        assert!(parse_frame(&bytes).is_none());
+        assert!(Frame::parse(&bytes).is_none());
     }
-    assert!(parse_frame(&frame(DATA, &[1; 32], &[])).is_some());
+    assert!(Frame::parse(&Frame::data(Session::from_bytes([1; 32]), &[]).encode()).is_some());
 }
 
 #[cfg(any(feature = "client", feature = "server"))]
@@ -350,10 +486,10 @@ fn idle_timeout_settings_are_per_app() {
     use bevy::prelude::App;
     let mut first = App::new();
     first.insert_resource(UdpIdleTimeout(Duration::MAX));
-    let a = idle_timeout_receiver(&mut first);
+    let a = IdleTimeoutSettings::install(&mut first);
     first.update();
     let mut second = App::new();
-    let b = idle_timeout_receiver(&mut second);
+    let b = IdleTimeoutSettings::install(&mut second);
     second.update();
     assert_eq!(*a.borrow(), Duration::MAX);
     assert_eq!(*b.borrow(), UdpIdleTimeout::default().0);
@@ -367,7 +503,12 @@ fn idle_timeout_settings_are_per_app() {
 
 #[tokio::test]
 async fn outgoing_size_budget_drops_only_oversized_packets() {
-    let (_cr, mut cw, mut sr, _sw) = pair().await;
+    let ConnectedPair {
+        client_read: _cr,
+        client_write: mut cw,
+        server_read: mut sr,
+        server_write: _sw,
+    } = ConnectedPair::new().await;
     let payload_limit = UdpOptions::DEFAULT.max_datagram_size - HEADER;
     send(&mut cw, vec![7; payload_limit + 1]).await;
     assert_eq!(cw.dropped_oversized_packets(), 1);
@@ -427,17 +568,15 @@ fn invalid_udp_options_are_rejected() {
             ..UdpOptions::DEFAULT
         },
     ] {
-        assert!(options.validate().is_err());
+        assert!(ValidatedOptions::new(options).is_err());
     }
 }
 
 #[test]
 fn heartbeat_jitter_stays_inside_its_budget_and_varies() {
     let options = UdpOptions::DEFAULT;
-    let mut seed = 42;
-    let delays: Vec<_> = (0..100)
-        .map(|_| heartbeat_delay(options, &mut seed))
-        .collect();
+    let mut timing = HeartbeatTiming::new(ValidatedOptions::new(options).unwrap(), 42);
+    let delays: Vec<_> = (0..100).map(|_| timing.next_delay()).collect();
     assert!(delays
         .iter()
         .all(|delay| *delay >= options.heartbeat_interval
@@ -445,46 +584,72 @@ fn heartbeat_jitter_stays_inside_its_budget_and_varies() {
     assert!(delays.windows(2).any(|pair| pair[0] != pair[1]));
 }
 
-async fn raw_client(options: UdpOptions) -> (UdpSocket, UdpReadHalf, UdpWriteHalf) {
-    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let (client, ()) = tokio::join!(
-        UdpClientStream::connect_with_options(server.local_addr().unwrap(), options),
-        async {
-            let mut buffer = [0; 256];
-            loop {
-                let (len, peer) = server.recv_from(&mut buffer).await.unwrap();
-                let answer = test_answer(&buffer[..len]).unwrap();
-                server.send_to(&answer, peer).await.unwrap();
-                if buffer[4] == CONFIRM {
-                    break;
+struct RawServer {
+    server: UdpSocket,
+    read: UdpReadHalf,
+    write: UdpWriteHalf,
+}
+impl RawServer {
+    async fn new(options: UdpOptions) -> Self {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (client, ()) = tokio::join!(
+            UdpClientStream::connect_with_options(server.local_addr().unwrap(), options),
+            async {
+                let mut buffer = [0; 256];
+                loop {
+                    let (len, peer) = server.recv_from(&mut buffer).await.unwrap();
+                    let response = RawPeer::respond(&buffer[..len]).unwrap();
+                    server.send_to(&response, peer).await.unwrap();
+                    if buffer[4] == 6 {
+                        break;
+                    }
                 }
             }
+        );
+        let (read, write) = client.unwrap().into_split().await.unwrap();
+        Self {
+            server,
+            read,
+            write,
         }
-    );
-    let (read, write) = client.unwrap().into_split().await.unwrap();
-    (server, read, write)
+    }
 }
 
 #[tokio::test(start_paused = true)]
 async fn application_traffic_suppresses_heartbeats_and_idle_resumes_them() {
-    let (server, _read, mut write) = raw_client(UdpOptions::DEFAULT).await;
+    let RawServer {
+        server,
+        read: _read,
+        mut write,
+    } = RawServer::new(UdpOptions::DEFAULT).await;
     let mut buffer = [0; 256];
     for _ in 0..8 {
         tokio::time::advance(Duration::from_millis(500)).await;
         send(&mut write, vec![7]).await;
         let len = server.recv(&mut buffer).await.unwrap();
-        assert_eq!(parse_frame(&buffer[..len]).unwrap().0, DATA);
+        assert_eq!(
+            Frame::parse(&buffer[..len]).unwrap().payload,
+            Payload::Data(&[7])
+        );
     }
     let last_data = Clock::now();
     let len = server.recv(&mut buffer).await.unwrap();
-    assert_eq!(parse_frame(&buffer[..len]).unwrap().0, KEEPALIVE);
+    assert_eq!(
+        Frame::parse(&buffer[..len]).unwrap().payload,
+        Payload::Control(Control::Keepalive)
+    );
     assert!(last_data.elapsed() >= KEEPALIVE_INTERVAL);
     assert!(last_data.elapsed() <= (KEEPALIVE_INTERVAL + UdpOptions::DEFAULT.heartbeat_jitter) * 2);
 }
 
 #[tokio::test(start_paused = true)]
 async fn idle_sessions_stay_alive_with_heartbeats() {
-    let (mut cr, _cw, mut sr, mut sw) = pair().await;
+    let ConnectedPair {
+        client_read: mut cr,
+        client_write: _cw,
+        server_read: mut sr,
+        server_write: mut sw,
+    } = ConnectedPair::new().await;
     let server = tokio::spawn(async move { receive(&mut sr).await });
     let client = tokio::spawn(async move { receive(&mut cr).await });
     tokio::time::sleep(Duration::from_secs(30)).await;
@@ -497,14 +662,24 @@ async fn idle_sessions_stay_alive_with_heartbeats() {
 
 #[tokio::test]
 async fn client_ignores_stale_disconnect_and_malformed_frames() {
-    let (server, mut read, write) = raw_client(UdpOptions::DEFAULT).await;
-    let address = write.socket.local_addr().unwrap();
+    let RawServer {
+        server,
+        mut read,
+        write,
+    } = RawServer::new(UdpOptions::DEFAULT).await;
+    let address = write.local_addr();
     for bytes in [
-        control(DISCONNECT, &[0; 32]).to_vec(),
+        Control::Disconnect
+            .encode(Session::from_bytes([0; 32]))
+            .to_vec(),
         vec![1],
-        frame(KEEPALIVE, &write.state.id, &[1]),
-        frame(DATA, &write.state.id, &[255]),
-        frame(DATA, &write.state.id, &[7]),
+        {
+            let mut bytes = Control::Keepalive.encode(write.session().id()).to_vec();
+            bytes.push(1);
+            bytes
+        },
+        Frame::data(write.session().id(), &[255]).encode(),
+        Frame::data(write.session().id(), &[7]).encode(),
     ] {
         server.send_to(&bytes, address).await.unwrap();
     }
@@ -520,18 +695,21 @@ async fn refusal_is_reported_only_for_the_selected_session() {
             let mut buffer = [0; 256];
             let (len, peer) = server.recv_from(&mut buffer).await.unwrap();
             server
-                .send_to(&control(DISCONNECT, &[0; 32]), peer)
+                .send_to(
+                    &Control::Disconnect.encode(Session::from_bytes([0; 32])),
+                    peer,
+                )
                 .await
                 .unwrap();
             server
-                .send_to(&test_answer(&buffer[..len]).unwrap(), peer)
+                .send_to(&RawPeer::respond(&buffer[..len]).unwrap(), peer)
                 .await
                 .unwrap();
             let (len, peer) = server.recv_from(&mut buffer).await.unwrap();
-            let (tag, cookie) = Cookie::parse(&buffer[..len]).unwrap();
-            assert_eq!(tag, CONFIRM);
+            let HandshakeFrame { kind, cookie } = HandshakeFrame::parse(&buffer[..len]).unwrap();
+            assert_eq!(kind, HandshakeKind::Confirm);
             server
-                .send_to(&control(DISCONNECT, &cookie.mac), peer)
+                .send_to(&Control::Disconnect.encode(cookie.mac), peer)
                 .await
                 .unwrap();
         }
@@ -541,34 +719,55 @@ async fn refusal_is_reported_only_for_the_selected_session() {
 
 #[tokio::test]
 async fn replacement_registrations_also_consume_peer_slots() {
-    let (listener, peer, _cookie, old) = fixture(UdpOptions {
+    let AcceptedPeer {
+        listener,
+        peer,
+        cookie: _cookie,
+        stream: old,
+    } = AcceptedPeer::new(UdpOptions {
         max_peers: 2,
         ..UdpOptions::DEFAULT
     })
     .await;
     let address = peer.local_addr().unwrap();
-    let second = listener.cookies.issue(address, [2; 16]);
+    let second = listener.issue_cookie(address, Nonce::from_bytes([2; 16]));
     let replacement = listener
-        .dispatch(&second.encode(CONFIRM), address, Instant::now())
+        .dispatch(
+            &HandshakeFrame::confirm(second).encode(),
+            address,
+            Instant::now(),
+        )
         .unwrap();
-    let third = listener.cookies.issue(address, [3; 16]);
+    let third = listener.issue_cookie(address, Nonce::from_bytes([3; 16]));
     assert!(listener
-        .dispatch(&third.encode(CONFIRM), address, Instant::now())
+        .dispatch(
+            &HandshakeFrame::confirm(third).encode(),
+            address,
+            Instant::now()
+        )
         .is_none());
     drop(old);
     assert!(listener
-        .dispatch(&third.encode(CONFIRM), address, Instant::now())
+        .dispatch(
+            &HandshakeFrame::confirm(third).encode(),
+            address,
+            Instant::now()
+        )
         .is_some());
     drop(replacement);
 }
 
 #[tokio::test]
 async fn receiving_disconnect_closes_a_retained_read_half_and_writer() {
-    let (server, mut read, mut write) = raw_client(UdpOptions::DEFAULT).await;
+    let RawServer {
+        server,
+        mut read,
+        mut write,
+    } = RawServer::new(UdpOptions::DEFAULT).await;
     server
         .send_to(
-            &control(DISCONNECT, &write.state.id),
-            write.socket.local_addr().unwrap(),
+            &Control::Disconnect.encode(write.session().id()),
+            write.local_addr(),
         )
         .await
         .unwrap();

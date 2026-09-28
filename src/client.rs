@@ -14,8 +14,8 @@ use futures::StreamExt;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::connection::{
-    forward_packet, max_packet_size_warning_system, set_max_packet_size_system,
-    warn_if_stateful_over_datagrams, EcsConnection, NetworkQueueSettings, RawConnection,
+    max_packet_size_warning_system, set_max_packet_size_system, warn_if_stateful_over_datagrams,
+    EcsConnection, NetworkQueueSettings, PacketForwarder, RawConnection,
 };
 use crate::protocol::ReadStream;
 use crate::protocol::WriteStream;
@@ -71,7 +71,7 @@ impl<Config: ClientConfig> Plugin for ClientPlugin<Config> {
     fn build(&self, app: &mut App) {
         let address = self.address;
         #[cfg(feature = "protocol_udp")]
-        let idle_timeout = crate::protocols::udp::idle_timeout_receiver(app);
+        let idle_timeout = crate::protocols::udp::IdleTimeoutSettings::install(app);
         #[cfg(not(feature = "protocol_udp"))]
         let idle_timeout = tokio::sync::watch::channel(std::time::Duration::MAX).1;
 
@@ -122,14 +122,15 @@ impl<Config: ClientConfig> Default for ClientPlugin<Config> {
 }
 
 impl<Config: ClientConfig> ClientPlugin<Config> {
-    /// Adds the required systems, but doesn't connect immediately.
-    /// Create a [ClientConnection] using [`Protocol::connect_to_server`]
-    /// and add it as a resource to start the server.
+    /// Installs networking without connecting; trigger [`ConnectionRequestEvent`] to connect later.
     pub fn new() -> ClientPlugin<Config> {
         ClientPlugin::default()
     }
 
-    /// Adds the required systems and connects immediately.
+    /// Requests a connection during startup.
+    ///
+    /// # Panics
+    /// Panics if the address cannot be resolved or resolves to no endpoints.
     pub fn connect<A>(addr: A) -> ClientPlugin<Config>
     where
         A: ToSocketAddrs,
@@ -155,7 +156,10 @@ pub struct ConnectionRequestEvent<Config: ClientConfig> {
 }
 
 impl<Config: ClientConfig> ConnectionRequestEvent<Config> {
-    /// Create a new connection request.
+    /// Resolves the first endpoint for a connection request.
+    ///
+    /// # Panics
+    /// Panics if the address cannot be resolved or resolves to no endpoints.
     pub fn new(address: impl ToSocketAddrs) -> ConnectionRequestEvent<Config> {
         ConnectionRequestEvent {
             address: address
@@ -226,7 +230,6 @@ fn setup_system<Config: ClientConfig>(
     commands.insert_resource(PacketReceiver::<Config>(pack_rx));
     commands.add_observer(connection_request_system::<Config>);
 
-    // Connection
     let disc_tx2 = disc_tx.clone();
     run_async(async move {
         let mut warned = false;
@@ -314,6 +317,11 @@ fn setup_system<Config: ClientConfig>(
             let write_cancel = disconnect_task.clone();
             tokio::spawn(async move {
                 let _guard = disconnect_task.clone().drop_guard();
+                let packets = PacketForwarder::new(
+                    pack_tx2,
+                    Config::Protocol::DATAGRAM,
+                    disconnect_task.clone(),
+                );
                 let error = loop {
                     tokio::select! {
                         biased;
@@ -322,7 +330,7 @@ fn setup_system<Config: ClientConfig>(
                             match result {
                                 Ok((packet, received_at)) => {
                                     log::trace!("({id:?}) Received packet {packet:?}");
-                                    if !forward_packet(&pack_tx2, (ecs_conn.clone(), packet, received_at), Config::Protocol::DATAGRAM, &disconnect_task).await {
+                                    if !packets.forward((ecs_conn.clone(), packet, received_at)).await {
                                         break ReceiveError::IntentionalDisconnection;
                                     }
                                 }
@@ -474,7 +482,7 @@ pub struct ConnectionEstablishEvent<Config: ClientConfig> {
     pub connection: ClientConnection<Config>,
 }
 
-/// Indicates that something went wrong during a connection attempt. See [`DisconnectionEvent::error`] for details
+/// Reports a failed connection attempt or the closure of an established connection.
 #[derive(Event)]
 pub struct DisconnectionEvent<Config: ClientConfig> {
     /// The error.
@@ -493,7 +501,7 @@ pub struct PacketReceiveEvent<Config: ClientConfig> {
     /// The packet.
     pub packet: Config::ServerPacket,
     /// When the built-in transport finished reading the packet, before decoding or queueing.
-    /// Custom protocols use `ReadStream::receive_with_timestamp` semantics.
+    /// Custom protocols use [`ReadStream::receive_with_timestamp`] semantics.
     pub received_at: Instant,
 }
 

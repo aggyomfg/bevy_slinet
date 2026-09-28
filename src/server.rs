@@ -10,14 +10,14 @@ use tokio::select;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::connection::{
-    forward_packet, max_packet_size_warning_system, set_max_packet_size_system,
-    warn_if_stateful_over_datagrams, ConnectionId, DisconnectTask, EcsConnection,
-    NetworkQueueSettings, RawConnection,
+    max_packet_size_warning_system, set_max_packet_size_system, warn_if_stateful_over_datagrams,
+    ConnectionId, DisconnectTask, EcsConnection, NetworkQueueSettings, PacketForwarder,
+    RawConnection,
 };
 use crate::protocol::{Listener, NetworkStream, Protocol, ReadStream, ReceiveError, WriteStream};
 use crate::{ServerConfig, SystemSets};
 
-/// Server-side connection to a server.
+/// Represents the server side of a client connection.
 pub type ServerConnection<Config> = EcsConnection<<Config as ServerConfig>::ServerPacket>;
 type RawServerConnection<Config> = (
     RawConnection<
@@ -30,7 +30,7 @@ type RawServerConnection<Config> = (
     >,
     ServerConnection<Config>,
 );
-/// List of server-side connections to a server.
+/// Tracks client connections registered with this server plugin.
 #[derive(Resource)]
 pub struct ServerConnections<Config: ServerConfig>(Vec<ServerConnection<Config>>);
 impl<Config: ServerConfig> ServerConnections<Config> {
@@ -60,7 +60,7 @@ pub struct ServerPlugin<Config: ServerConfig> {
 impl<Config: ServerConfig> Plugin for ServerPlugin<Config> {
     fn build(&self, app: &mut App) {
         #[cfg(feature = "protocol_udp")]
-        let idle_timeout = crate::protocols::udp::idle_timeout_receiver(app);
+        let idle_timeout = crate::protocols::udp::IdleTimeoutSettings::install(app);
         #[cfg(not(feature = "protocol_udp"))]
         let idle_timeout = tokio::sync::watch::channel(std::time::Duration::MAX).1;
         app.insert_resource(ServerConnections::<Config>::new())
@@ -93,7 +93,10 @@ impl<Config: ServerConfig> Plugin for ServerPlugin<Config> {
 }
 
 impl<Config: ServerConfig> ServerPlugin<Config> {
-    /// Bind to the specified address and return a [`ServerPlugin`].
+    /// Configures the endpoint to bind during startup.
+    ///
+    /// # Panics
+    /// Panics if the address cannot be resolved or resolves to no endpoints.
     pub fn bind<A>(address: A) -> ServerPlugin<Config>
     where
         A: ToSocketAddrs,
@@ -163,7 +166,6 @@ fn create_setup_system<Config: ServerConfig>(
             };
 
             runtime.block_on(async move {
-                // Receiving packets
                 tokio::spawn(async move {
                     while let Some((connection, ecs_conn)) = conn_rx2.recv().await {
                         let RawConnection {
@@ -190,6 +192,11 @@ fn create_setup_system<Config: ServerConfig>(
                         let write_cancel = disconnect_task.clone();
                         tokio::spawn(async move {
                             let _guard = disconnect_task.clone().drop_guard();
+                            let packets = PacketForwarder::new(
+                                pack_tx2,
+                                Config::Protocol::DATAGRAM,
+                                disconnect_task.clone(),
+                            );
                             let error = loop {
                                 tokio::select! {
                                     biased;
@@ -198,7 +205,7 @@ fn create_setup_system<Config: ServerConfig>(
                                         match result {
                                             Ok((packet, received_at)) => {
                                                 log::trace!("({id:?}) Received packet {packet:?}");
-                                                if !forward_packet(&pack_tx2, (ecs_conn.clone(), packet, received_at), Config::Protocol::DATAGRAM, &disconnect_task).await {
+                                                if !packets.forward((ecs_conn.clone(), packet, received_at)).await {
                                                     break ReceiveError::IntentionalDisconnection;
                                                 }
                                             }
@@ -220,7 +227,7 @@ fn create_setup_system<Config: ServerConfig>(
                             let _guard = write_cancel.clone().drop_guard();
                             let sending = async {
                                 while let Some(packet) = packets_rx.recv().await {
-                        if write_cancel.is_cancelled() { break; }
+                                        if write_cancel.is_cancelled() { break; }
                                     log::trace!("({id:?}) Sending packet {packet:?}");
                                     if let Err(err) = write.send(packet, Arc::clone(&serializer), &*packet_length_serializer).await {
                                         log::error!("({id:?}) Error sending packet: {err}");
@@ -237,7 +244,6 @@ fn create_setup_system<Config: ServerConfig>(
                     }
                 });
 
-                // New connections
                 let binding_result = Config::Protocol::bind(address).await;
                 let listener = match binding_result {
                     Ok(listener) => listener,
@@ -295,7 +301,6 @@ fn create_setup_system<Config: ServerConfig>(
         });
 
         // Clients may connect right after Startup, so the listener must exist by then.
-        // Returns Err (no hang) if binding failed or the thread exited.
         if let Ok(local_addr) = bound_rx.recv() {
             commands.insert_resource(ServerAddress::<Config> {
                 address: local_addr,
@@ -349,7 +354,7 @@ pub struct PacketReceiveEvent<Config: ServerConfig> {
     /// The packet.
     pub packet: Config::ClientPacket,
     /// When the built-in transport finished reading the packet, before decoding or queueing.
-    /// Custom protocols use `ReadStream::receive_with_timestamp` semantics.
+    /// Custom protocols use [`ReadStream::receive_with_timestamp`] semantics.
     pub received_at: Instant,
 }
 

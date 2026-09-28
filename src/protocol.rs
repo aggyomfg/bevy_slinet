@@ -52,13 +52,12 @@ pub trait Listener {
     type Stream: ServerStream;
 
     /// Returns a [ServerStream](ServerStream) when a client wants to connect.
-    /// Runs in an endless loop.
     async fn accept(&self) -> io::Result<Self::Stream>;
 
-    /// Get the local address that this listeners listens at.
+    /// Returns the bound endpoint, including the assigned port when bound to port zero.
     fn address(&self) -> SocketAddr;
 
-    /// Do something when [`ServerConnection::disconnect`](crate::connection::EcsConnection::disconnect) gets called
+    /// Releases listener-side state after a connection’s receive task closes.
     fn handle_disconnection(&self, #[allow(unused_variables)] peer_addr: SocketAddr) {}
 }
 
@@ -85,10 +84,10 @@ pub trait NetworkStream: Send + Sync + 'static {
     /// Splits this stream into read and write half to use them in different futures.
     async fn into_split(self) -> io::Result<(Self::ReadHalf, Self::WriteHalf)>;
 
-    /// Returns the socket address of the remote peer of this TCP connection.
+    /// Returns the socket address of the remote peer.
     fn peer_addr(&self) -> SocketAddr;
 
-    /// Returns the socket address of the local half of this TCP connection.
+    /// Returns the socket address of the local endpoint.
     fn local_addr(&self) -> SocketAddr;
 }
 
@@ -107,7 +106,7 @@ pub trait ReadStream: Send + Sync + 'static {
 
     /// Reads a single packet from this stream.
     ///
-    /// You shouldn't override this method unless you know what you're doing.
+    /// The default uses length-prefixed framing; datagram transports override it.
     async fn receive<ReceivingPacket, SendingPacket, S, LS>(
         &mut self,
         serializer: Arc<S>,
@@ -119,7 +118,8 @@ pub trait ReadStream: Send + Sync + 'static {
         S: Serializer<ReceivingPacket, SendingPacket> + ?Sized,
         LS: PacketLengthSerializer,
     {
-        receive_framed(self, serializer, length_serializer)
+        FramedReader::new(self)
+            .receive(serializer, length_serializer)
             .await
             .map(|(packet, _)| packet)
     }
@@ -145,45 +145,58 @@ pub trait ReadStream: Send + Sync + 'static {
     }
 }
 
-pub(crate) async fn receive_framed<R, ReceivingPacket, SendingPacket, S, LS>(
-    read: &mut R,
-    serializer: Arc<S>,
-    length_serializer: &LS,
-) -> Result<(ReceivingPacket, Instant), ReceiveError<S::DecodeError, LS>>
-where
-    R: ReadStream + ?Sized,
-    ReceivingPacket: Send + Sync + Debug + 'static,
-    SendingPacket: Send + Sync + Debug + 'static,
-    S: Serializer<ReceivingPacket, SendingPacket> + ?Sized,
-    LS: PacketLengthSerializer,
-{
-    let mut buf = Vec::new();
-    let mut length = Err(PacketLengthDeserializationError::NeedMoreBytes(LS::SIZE));
-    while let Err(PacketLengthDeserializationError::NeedMoreBytes(amt)) = length {
-        let mut tmp = vec![0; amt];
-        read.read_exact(&mut tmp).await.map_err(ReceiveError::Io)?;
-        buf.extend(tmp);
-        length = length_serializer.deserialize_packet_length(&buf);
+pub(crate) struct FramedReader<'a, R: ?Sized> {
+    read: &'a mut R,
+}
+impl<'a, R: ReadStream + ?Sized> FramedReader<'a, R> {
+    pub(crate) fn new(read: &'a mut R) -> Self {
+        Self { read }
     }
+    pub(crate) async fn receive<ReceivingPacket, SendingPacket, S, LS>(
+        self,
+        serializer: Arc<S>,
+        length_serializer: &LS,
+    ) -> Result<(ReceivingPacket, Instant), ReceiveError<S::DecodeError, LS>>
+    where
+        ReceivingPacket: Send + Sync + Debug + 'static,
+        SendingPacket: Send + Sync + Debug + 'static,
+        S: Serializer<ReceivingPacket, SendingPacket> + ?Sized,
+        LS: PacketLengthSerializer,
+    {
+        let mut buf = Vec::new();
+        let mut length = Err(PacketLengthDeserializationError::NeedMoreBytes(LS::SIZE));
+        while let Err(PacketLengthDeserializationError::NeedMoreBytes(amt)) = length {
+            let mut tmp = vec![0; amt];
+            self.read
+                .read_exact(&mut tmp)
+                .await
+                .map_err(ReceiveError::Io)?;
+            buf.extend(tmp);
+            length = length_serializer.deserialize_packet_length(&buf);
+        }
 
-    match length {
-        Ok(length) => {
-            if length > MAX_PACKET_SIZE.load(Ordering::Relaxed) {
-                Err(ReceiveError::PacketTooBig)
-            } else {
-                let mut buf = vec![0; length];
-                read.read_exact(&mut buf).await.map_err(ReceiveError::Io)?;
-                let received_at = Instant::now();
-                let packet = serializer
-                    .deserialize(&buf)
-                    .map_err(ReceiveError::Deserialization)?;
-                Ok((packet, received_at))
+        match length {
+            Ok(length) => {
+                if length > MAX_PACKET_SIZE.load(Ordering::Relaxed) {
+                    Err(ReceiveError::PacketTooBig)
+                } else {
+                    let mut buf = vec![0; length];
+                    self.read
+                        .read_exact(&mut buf)
+                        .await
+                        .map_err(ReceiveError::Io)?;
+                    let received_at = Instant::now();
+                    let packet = serializer
+                        .deserialize(&buf)
+                        .map_err(ReceiveError::Deserialization)?;
+                    Ok((packet, received_at))
+                }
             }
+            Err(PacketLengthDeserializationError::Err(err)) => {
+                Err(ReceiveError::LengthDeserialization(err))
+            }
+            Err(PacketLengthDeserializationError::NeedMoreBytes(_)) => unreachable!(),
         }
-        Err(PacketLengthDeserializationError::Err(err)) => {
-            Err(ReceiveError::LengthDeserialization(err))
-        }
-        Err(PacketLengthDeserializationError::NeedMoreBytes(_)) => unreachable!(),
     }
 }
 

@@ -1,36 +1,41 @@
-//! Implement the [`ReadOnlySerializer`] or [`MutableSerializer`] trait for serialzer and build it in config refer
-//! BitcodeSerializer to check how to do this.
-
 use core::fmt::Debug;
 use std::{
     error::Error,
     sync::{Arc, Mutex},
 };
 
-// Serializer trait defines the core functionality for serializing and deserializing packets,
-// ensuring compatibility with multi-threaded contexts as it requires the Send and Sync bounds.
+/// Encodes and decodes packets shared by a connection’s read and write tasks.
 pub trait Serializer<ReceivingPacket, SendingPacket>: Send + Sync + 'static
 where
     ReceivingPacket: Send + Sync + Debug + 'static,
     SendingPacket: Send + Sync + Debug + 'static,
 {
-    type EncodeError: Error + Send + Sync; // Error type for serialization/encoding operations
-    type DecodeError: Error + Send + Sync; // Error type for deserialization/decoding operations
+    /// Reports packets the codec cannot encode.
+    type EncodeError: Error + Send + Sync;
+    /// Reports bytes the codec cannot decode.
+    type DecodeError: Error + Send + Sync;
 
-    // Serializes a packet into bytes to be sent over a network. The method takes ownership of the packet
-    // and a peer address, returning either a byte vector or an error if serialization fails.
+    /// Consumes a packet for encoding.
+    ///
+    /// # Errors
+    /// Returns the codec’s error when the packet cannot be represented.
     fn serialize(&self, packet: SendingPacket) -> Result<Vec<u8>, Self::EncodeError>;
-    // Deserializes bytes received from a network back into a packet structure.
+
+    /// Decodes a complete packet payload.
+    ///
+    /// # Errors
+    /// Returns the codec’s error for invalid or unsupported payloads.
     fn deserialize(&self, data: &[u8]) -> Result<ReceivingPacket, Self::DecodeError>;
 }
 
-// SerializerAdapter allows for flexibility in serializer implementation; supporting both immutable
-// and mutable serialization strategies.
+/// Adapts a codec for shared access, locking mutable codecs for each operation.
+/// A poisoned mutable codec panics on subsequent access.
 pub enum SerializerAdapter<ReceivingPacket, SendingPacket, EncErr, DecErr>
 where
     EncErr: Error + Send + Sync,
     DecErr: Error + Send + Sync,
 {
+    /// Allows independent calls without an adapter lock.
     ReadOnly(
         Arc<
             dyn ReadOnlySerializer<
@@ -41,6 +46,7 @@ where
             >,
         >,
     ),
+    /// Serializes access to connection-local codec state.
     Mutable(
         Arc<
             Mutex<
@@ -55,8 +61,6 @@ where
     ),
 }
 
-// Implementing Serializer for SerializerAdapter provides a concrete example of polymorphism,
-// enabling different serialization strategies under the same interface.
 impl<ReceivingPacket, SendingPacket, EncErr, DecErr> Serializer<ReceivingPacket, SendingPacket>
     for SerializerAdapter<ReceivingPacket, SendingPacket, EncErr, DecErr>
 where
@@ -68,8 +72,6 @@ where
     type EncodeError = EncErr;
     type DecodeError = DecErr;
 
-    // Depending on the adapter's type, serialization can either directly pass the data or
-    // require locking a mutex to ensure thread-safety in mutable contexts.
     fn serialize(&self, packet: SendingPacket) -> Result<Vec<u8>, Self::EncodeError> {
         match self {
             SerializerAdapter::ReadOnly(serializer) => serializer.serialize(packet),
@@ -77,7 +79,6 @@ where
         }
     }
 
-    // Deserialization behaves similarly to serialization, respecting the adapter's type.
     fn deserialize(&self, data: &[u8]) -> Result<ReceivingPacket, Self::DecodeError> {
         match self {
             SerializerAdapter::ReadOnly(serializer) => serializer.deserialize(data),
@@ -86,19 +87,37 @@ where
     }
 }
 
-/// ReadOnlySerializer is designed for scenarios where the data structure does not change,
-/// ensuring efficient and thread-safe operations without the overhead of locking mechanisms.
+/// Supports shared access without mutable codec state.
 pub trait ReadOnlySerializer<ReceivingPacket, SendingPacket>: Send + Sync + 'static {
+    /// Reports packets the codec cannot encode.
     type EncodeError: Error + Send + Sync;
+    /// Reports bytes the codec cannot decode.
     type DecodeError: Error + Send + Sync;
+    /// Consumes a packet for encoding.
+    ///
+    /// # Errors
+    /// Returns the codec’s error when the packet cannot be represented.
     fn serialize(&self, packet: SendingPacket) -> Result<Vec<u8>, Self::EncodeError>;
+    /// Decodes a complete packet payload.
+    ///
+    /// # Errors
+    /// Returns the codec’s error for invalid or unsupported payloads.
     fn deserialize(&self, buffer: &[u8]) -> Result<ReceivingPacket, Self::DecodeError>;
 }
-/// MutableSerializer supports scenarios where serialization state needs to be altered during operation,
-/// useful in cases like cryptographic transformations where state is critical.
+/// Maintains connection-local codec state; datagram codecs must tolerate loss and reordering.
 pub trait MutableSerializer<ReceivingPacket, SendingPacket>: Send + Sync + 'static {
+    /// Reports packets the codec cannot encode.
     type EncodeError: Error + Send + Sync;
+    /// Reports bytes the codec cannot decode.
     type DecodeError: Error + Send + Sync;
+    /// Consumes a packet for encoding.
+    ///
+    /// # Errors
+    /// Returns the codec’s error when the packet cannot be represented.
     fn serialize(&mut self, p: SendingPacket) -> Result<Vec<u8>, Self::EncodeError>;
+    /// Decodes a complete packet payload.
+    ///
+    /// # Errors
+    /// Returns the codec’s error for invalid or unsupported payloads.
     fn deserialize(&mut self, buf: &[u8]) -> Result<ReceivingPacket, Self::DecodeError>;
 }

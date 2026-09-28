@@ -363,8 +363,10 @@ fn failed_parallel_attempt_must_not_remove_live_connection() {
             if ignored == Some(source) {
                 continue;
             }
-            if let Some(answer) = crate::protocols::udp::test_answer(&buffer[..len]) {
-                socket.send_to(&answer, source).unwrap();
+            if let Some(response) =
+                crate::protocols::udp::test_support::RawPeer::respond(&buffer[..len])
+            {
+                socket.send_to(&response, source).unwrap();
             }
         }
     });
@@ -452,8 +454,10 @@ fn retained_connection_cannot_transmit_after_disconnection_event() {
             let Ok((len, source)) = socket.recv_from(&mut buffer) else {
                 continue;
             };
-            if let Some(answer) = crate::protocols::udp::test_answer(&buffer[..len]) {
-                socket.send_to(&answer, source).unwrap();
+            if let Some(response) =
+                crate::protocols::udp::test_support::RawPeer::respond(&buffer[..len])
+            {
+                socket.send_to(&response, source).unwrap();
             } else if buffer[..len].starts_with(b"SLN2\x01") {
                 data_tx.send(buffer[..len].to_vec()).unwrap();
             }

@@ -12,7 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
 use crate::protocol::{
-    receive_framed, ClientStream, Listener, NetworkStream, Protocol, ReadStream, ReceiveError,
+    ClientStream, FramedReader, Listener, NetworkStream, Protocol, ReadStream, ReceiveError,
     ServerStream, WriteStream,
 };
 use crate::serializer::Serializer;
@@ -87,7 +87,9 @@ impl ReadStream for OwnedReadHalf {
         S: Serializer<ReceivingPacket, SendingPacket> + ?Sized,
         LS: PacketLengthSerializer,
     {
-        receive_framed(self, serializer, length_serializer).await
+        FramedReader::new(self)
+            .receive(serializer, length_serializer)
+            .await
     }
 }
 

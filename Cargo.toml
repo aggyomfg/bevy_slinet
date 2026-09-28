@@ -29,6 +29,8 @@ features = [
 ]
 
 [dependencies]
+thiserror = "2"
+strum = { version = "0.27", features = ["derive"], optional = true }
 bevy = { version = "0.19", default-features = false, features = ["bevy_log"]}
 byteorder = "1"
 serde = { version = "1", features = ["derive"], optional = true }
@@ -55,7 +57,7 @@ serializer_bitcode_serde = ["bitcode", "bitcode/serde", "serde"]
 serializer_bincode = ["bincode"]
 serializer_bincode_serde = ["bincode", "bincode/serde", "serde"]
 protocol_tcp = ["tokio/net"]
-protocol_udp = ["tokio/net", "tokio/time", "dep:blake3", "dep:getrandom"]
+protocol_udp = ["tokio/net", "tokio/time", "dep:blake3", "dep:getrandom", "dep:strum"]
 client = []
 server = []
 

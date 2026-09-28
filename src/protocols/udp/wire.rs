@@ -1,98 +1,223 @@
-//! Versioned UDP frames and stateless, address-bound handshake cookies.
+//! SLN2 encoding and stateless, address-bound handshake cookies.
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::time::Instant;
 
-pub(super) const MAGIC: &[u8; 4] = b"SLN2";
-pub(super) const DATA: u8 = 1;
-pub(super) const KEEPALIVE: u8 = 2;
-pub(super) const DISCONNECT: u8 = 3;
-pub(super) const HELLO: u8 = 4;
-pub(super) const CHALLENGE: u8 = 5;
-pub(super) const CONFIRM: u8 = 6;
-pub(super) const ACCEPT: u8 = 7;
-pub(super) const HEADER: usize = 5 + 32;
-pub(super) const HANDSHAKE_SIZE: usize = 5 + 16 + 8 + 8 + 32;
-pub(super) type Session = [u8; 32];
+const MAGIC: &[u8; 4] = b"SLN2";
+pub(super) const HEADER: usize = 37;
+pub(super) const HANDSHAKE_SIZE: usize = 69;
 
-pub(super) fn random<const N: usize>() -> io::Result<[u8; N]> {
-    let mut bytes = [0; N];
-    getrandom::fill(&mut bytes).map_err(|err| io::Error::other(err.to_string()))?;
-    Ok(bytes)
+/// Discriminants are SLN2 wire values, independent of declaration order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::FromRepr)]
+#[repr(u8)]
+enum Tag {
+    Data = 1,
+    Keepalive = 2,
+    Disconnect = 3,
+    Hello = 4,
+    Challenge = 5,
+    Confirm = 6,
+    Accept = 7,
 }
 
-pub(super) fn control(tag: u8, session: &Session) -> [u8; HEADER] {
-    let mut bytes = [0; HEADER];
-    bytes[..4].copy_from_slice(MAGIC);
-    bytes[4] = tag;
-    bytes[5..].copy_from_slice(session);
-    bytes
-}
-
-pub(super) fn frame(tag: u8, session: &Session, payload: &[u8]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(HEADER + payload.len());
-    bytes.extend_from_slice(&control(tag, session));
-    bytes.extend_from_slice(payload);
-    bytes
-}
-
-pub(super) fn parse_frame(bytes: &[u8]) -> Option<(u8, Session, &[u8])> {
-    if bytes.len() < HEADER || bytes.len() > super::MAX_DATAGRAM_SIZE || &bytes[..4] != MAGIC {
-        return None;
+struct RandomBytes;
+impl RandomBytes {
+    fn generate<const N: usize>() -> io::Result<[u8; N]> {
+        let mut bytes = [0; N];
+        getrandom::fill(&mut bytes).map_err(|err| io::Error::other(err.to_string()))?;
+        Ok(bytes)
     }
-    let tag = bytes[4];
-    if tag != DATA && (!matches!(tag, KEEPALIVE | DISCONNECT | ACCEPT) || bytes.len() != HEADER) {
-        return None;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Nonce([u8; 16]);
+impl Nonce {
+    pub fn generate() -> io::Result<Self> {
+        RandomBytes::generate().map(Self)
     }
-    Some((tag, bytes[5..HEADER].try_into().ok()?, &bytes[HEADER..]))
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+    pub fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Session([u8; 32]);
+impl Session {
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Control {
+    Keepalive,
+    Disconnect,
+    Accept,
+}
+impl Control {
+    fn tag(self) -> Tag {
+        match self {
+            Self::Keepalive => Tag::Keepalive,
+            Self::Disconnect => Tag::Disconnect,
+            Self::Accept => Tag::Accept,
+        }
+    }
+    pub fn encode(self, session: Session) -> [u8; HEADER] {
+        let mut bytes = [0; HEADER];
+        bytes[..4].copy_from_slice(MAGIC);
+        bytes[4] = self.tag() as u8;
+        bytes[5..].copy_from_slice(session.as_bytes());
+        bytes
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Payload<'a> {
+    Data(&'a [u8]),
+    Control(Control),
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Frame<'a> {
+    pub session: Session,
+    pub payload: Payload<'a>,
+}
+impl<'a> Frame<'a> {
+    pub fn data(session: Session, payload: &'a [u8]) -> Self {
+        Self {
+            session,
+            payload: Payload::Data(payload),
+        }
+    }
+    pub fn encode(self) -> Vec<u8> {
+        match self.payload {
+            Payload::Control(control) => control.encode(self.session).to_vec(),
+            Payload::Data(payload) => {
+                let mut bytes = Vec::with_capacity(HEADER + payload.len());
+                bytes.extend_from_slice(MAGIC);
+                bytes.push(Tag::Data as u8);
+                bytes.extend_from_slice(self.session.as_bytes());
+                bytes.extend_from_slice(payload);
+                bytes
+            }
+        }
+    }
+    /// Rejects unknown tags, nonempty control payloads and invalid datagram sizes.
+    pub fn parse(bytes: &'a [u8]) -> Option<Self> {
+        if !(HEADER..=super::MAX_DATAGRAM_SIZE).contains(&bytes.len()) || &bytes[..4] != MAGIC {
+            return None;
+        }
+        let tag = Tag::from_repr(bytes[4])?;
+        let payload = match tag {
+            Tag::Data => Payload::Data(&bytes[HEADER..]),
+            Tag::Keepalive | Tag::Disconnect | Tag::Accept if bytes.len() == HEADER => {
+                Payload::Control(match tag {
+                    Tag::Keepalive => Control::Keepalive,
+                    Tag::Disconnect => Control::Disconnect,
+                    _ => Control::Accept,
+                })
+            }
+            _ => return None,
+        };
+        Some(Self {
+            session: Session::from_bytes(bytes[5..HEADER].try_into().ok()?),
+            payload,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Cookie {
-    pub nonce: [u8; 16],
+    pub nonce: Nonce,
     pub epoch: u64,
     pub generation: u64,
     pub mac: Session,
 }
-
 impl Cookie {
-    pub fn hello(nonce: [u8; 16]) -> Self {
+    pub fn hello(nonce: Nonce) -> Self {
         Self {
             nonce,
             epoch: 0,
             generation: 0,
-            mac: [0; 32],
+            mac: Session::from_bytes([0; 32]),
         }
     }
+}
 
-    pub fn encode(&self, tag: u8) -> [u8; HANDSHAKE_SIZE] {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HandshakeKind {
+    Hello,
+    Challenge,
+    Confirm,
+}
+impl HandshakeKind {
+    fn tag(self) -> Tag {
+        match self {
+            Self::Hello => Tag::Hello,
+            Self::Challenge => Tag::Challenge,
+            Self::Confirm => Tag::Confirm,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug)]
+pub(super) struct HandshakeFrame {
+    pub kind: HandshakeKind,
+    pub cookie: Cookie,
+}
+impl HandshakeFrame {
+    pub fn hello(nonce: Nonce) -> Self {
+        Self {
+            kind: HandshakeKind::Hello,
+            cookie: Cookie::hello(nonce),
+        }
+    }
+    pub fn challenge(cookie: Cookie) -> Self {
+        Self {
+            kind: HandshakeKind::Challenge,
+            cookie,
+        }
+    }
+    pub fn confirm(cookie: Cookie) -> Self {
+        Self {
+            kind: HandshakeKind::Confirm,
+            cookie,
+        }
+    }
+    pub fn encode(self) -> [u8; HANDSHAKE_SIZE] {
         let mut bytes = [0; HANDSHAKE_SIZE];
         bytes[..4].copy_from_slice(MAGIC);
-        bytes[4] = tag;
-        bytes[5..21].copy_from_slice(&self.nonce);
-        bytes[21..29].copy_from_slice(&self.epoch.to_le_bytes());
-        bytes[29..37].copy_from_slice(&self.generation.to_le_bytes());
-        bytes[37..].copy_from_slice(&self.mac);
+        bytes[4] = self.kind.tag() as u8;
+        bytes[5..21].copy_from_slice(self.cookie.nonce.as_bytes());
+        bytes[21..29].copy_from_slice(&self.cookie.epoch.to_le_bytes());
+        bytes[29..37].copy_from_slice(&self.cookie.generation.to_le_bytes());
+        bytes[37..].copy_from_slice(self.cookie.mac.as_bytes());
         bytes
     }
-
-    pub fn parse(bytes: &[u8]) -> Option<(u8, Self)> {
-        if bytes.len() != HANDSHAKE_SIZE
-            || &bytes[..4] != MAGIC
-            || !matches!(bytes[4], HELLO | CHALLENGE | CONFIRM)
-        {
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != HANDSHAKE_SIZE || &bytes[..4] != MAGIC {
             return None;
         }
-        Some((
-            bytes[4],
-            Self {
-                nonce: bytes[5..21].try_into().ok()?,
+        let kind = match Tag::from_repr(bytes[4])? {
+            Tag::Hello => HandshakeKind::Hello,
+            Tag::Challenge => HandshakeKind::Challenge,
+            Tag::Confirm => HandshakeKind::Confirm,
+            _ => return None,
+        };
+        Some(Self {
+            kind,
+            cookie: Cookie {
+                nonce: Nonce::from_bytes(bytes[5..21].try_into().ok()?),
                 epoch: u64::from_le_bytes(bytes[21..29].try_into().ok()?),
                 generation: u64::from_le_bytes(bytes[29..37].try_into().ok()?),
-                mac: bytes[37..].try_into().ok()?,
+                mac: Session::from_bytes(bytes[37..].try_into().ok()?),
             },
-        ))
+        })
     }
 }
 
@@ -105,7 +230,7 @@ pub(super) struct CookieJar {
 impl CookieJar {
     pub fn new() -> io::Result<Self> {
         Ok(Self {
-            key: random()?,
+            key: RandomBytes::generate()?,
             started: Instant::now(),
             generation: AtomicU64::new(1),
         })
@@ -129,20 +254,20 @@ impl CookieJar {
             }
         }
         hasher.update(&address.port().to_le_bytes());
-        hasher.update(&cookie.nonce);
+        hasher.update(cookie.nonce.as_bytes());
         hasher.update(&cookie.epoch.to_le_bytes());
         hasher.update(&cookie.generation.to_le_bytes());
         hasher.finalize()
     }
 
-    pub fn issue(&self, address: SocketAddr, nonce: [u8; 16]) -> Cookie {
+    pub fn issue(&self, address: SocketAddr, nonce: Nonce) -> Cookie {
         let mut cookie = Cookie {
             nonce,
             epoch: self.epoch(),
             generation: self.generation.fetch_add(1, Ordering::Relaxed),
-            mac: [0; 32],
+            mac: Session::from_bytes([0; 32]),
         };
-        cookie.mac = *self.sign(address, &cookie).as_bytes();
+        cookie.mac = Session::from_bytes(*self.sign(address, &cookie).as_bytes());
         cookie
     }
 
@@ -150,6 +275,119 @@ impl CookieJar {
         let epoch = self.epoch();
         cookie.epoch <= epoch
             && epoch - cookie.epoch <= 1
-            && self.sign(address, cookie) == blake3::Hash::from(cookie.mac)
+            && self.sign(address, cookie) == blake3::Hash::from(*cookie.mac.as_bytes())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_frames_match_sln2_bytes() {
+        let session = Session::from_bytes([0xa5; 32]);
+        let mut expected = b"SLN2\x01".to_vec();
+        expected.extend_from_slice(&[0xa5; 32]);
+        expected.extend_from_slice(&[0x10, 0x20]);
+        assert_eq!(Frame::data(session, &[0x10, 0x20]).encode(), expected);
+        assert_eq!(
+            Frame::parse(&expected),
+            Some(Frame::data(session, &[0x10, 0x20]))
+        );
+        for (control, tag) in [
+            (Control::Keepalive, 2),
+            (Control::Disconnect, 3),
+            (Control::Accept, 7),
+        ] {
+            let mut expected = b"SLN2".to_vec();
+            expected.push(tag);
+            expected.extend_from_slice(&[0xa5; 32]);
+            assert_eq!(control.encode(session).as_slice(), expected);
+            assert_eq!(
+                Frame::parse(&expected),
+                Some(Frame {
+                    session,
+                    payload: Payload::Control(control)
+                })
+            );
+            expected.push(0);
+            assert!(Frame::parse(&expected).is_none());
+        }
+    }
+
+    #[test]
+    fn handshake_frames_match_sln2_bytes() {
+        let nonce = Nonce::from_bytes([0x11; 16]);
+        let cookie = Cookie {
+            nonce,
+            epoch: 0x0807060504030201,
+            generation: 0x1817161514131211,
+            mac: Session::from_bytes([0x22; 32]),
+        };
+        let mut hello = b"SLN2\x04".to_vec();
+        hello.extend_from_slice(&[0x11; 16]);
+        hello.extend_from_slice(&[0; 48]);
+        assert_eq!(HandshakeFrame::hello(nonce).encode().as_slice(), hello);
+        assert_eq!(
+            HandshakeFrame::parse(&hello).unwrap().kind,
+            HandshakeKind::Hello
+        );
+        for (frame, tag) in [
+            (HandshakeFrame::challenge(cookie), 5),
+            (HandshakeFrame::confirm(cookie), 6),
+        ] {
+            let mut expected = b"SLN2".to_vec();
+            expected.push(tag);
+            expected.extend_from_slice(&[0x11; 16]);
+            expected.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+            expected.extend_from_slice(&[17, 18, 19, 20, 21, 22, 23, 24]);
+            expected.extend_from_slice(&[0x22; 32]);
+            assert_eq!(frame.encode().as_slice(), expected);
+            let parsed = HandshakeFrame::parse(&expected).unwrap();
+            assert_eq!(parsed.kind, frame.kind);
+            assert_eq!(parsed.cookie.nonce, nonce);
+            assert_eq!(parsed.cookie.epoch, cookie.epoch);
+            assert_eq!(parsed.cookie.generation, cookie.generation);
+            assert_eq!(parsed.cookie.mac, cookie.mac);
+            assert!(HandshakeFrame::parse(&expected[..68]).is_none());
+            expected.push(0);
+            assert!(HandshakeFrame::parse(&expected).is_none());
+        }
+    }
+
+    #[test]
+    fn parsers_reject_wrong_tags_magic_and_sizes() {
+        for tag in 0..=u8::MAX {
+            let mut bytes = vec![0; 37];
+            bytes[..4].copy_from_slice(b"SLN2");
+            bytes[4] = tag;
+            assert_eq!(Frame::parse(&bytes).is_some(), matches!(tag, 1 | 2 | 3 | 7));
+            bytes.resize(69, 0);
+            assert_eq!(
+                HandshakeFrame::parse(&bytes).is_some(),
+                matches!(tag, 4..=6)
+            );
+        }
+        let mut bytes = vec![0; 65_507];
+        bytes[..5].copy_from_slice(b"SLN2\x01");
+        assert!(Frame::parse(&bytes).is_some());
+        bytes.push(0);
+        assert!(Frame::parse(&bytes).is_none());
+        for len in 0..37 {
+            assert!(Frame::parse(&bytes[..len]).is_none());
+        }
+        bytes[0] = b'X';
+        assert!(Frame::parse(&bytes[..37]).is_none());
+        bytes[4] = 4;
+        assert!(HandshakeFrame::parse(&bytes[..69]).is_none());
+    }
+
+    #[test]
+    fn hello_parsing_preserves_nonzero_cookie_fields() {
+        let mut bytes = [0x33; 69];
+        bytes[..5].copy_from_slice(b"SLN2\x04");
+        let parsed = HandshakeFrame::parse(&bytes).unwrap();
+        assert_eq!(parsed.kind, HandshakeKind::Hello);
+        assert_eq!(parsed.encode(), bytes);
     }
 }

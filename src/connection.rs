@@ -1,4 +1,4 @@
-//! This module contains structs that are used connection handling.
+//! Connects ECS packet queues to transport tasks.
 
 use std::error::Error;
 use std::fmt::{Debug, Formatter};
@@ -14,10 +14,7 @@ use crate::packet_length_serializer::PacketLengthSerializer;
 use crate::protocol::NetworkStream;
 use crate::serializer::Serializer;
 
-/// The ecs-side connection struct. There is 2 structs,
-/// one raw (with the stream, runs on another thread),
-/// and ecs that can be cheaply cloned and interacts with
-/// the raw connection via [`tokio::sync::mpsc`].
+/// Provides a cloneable ECS handle to a transport task through a bounded packet queue.
 #[derive(Resource)]
 pub struct EcsConnection<SendingPacket>
 where
@@ -58,22 +55,25 @@ impl<SendingPacket> EcsConnection<SendingPacket>
 where
     SendingPacket: Send + Sync + Debug + 'static,
 {
-    /// Returns this connection's [`ID`](ConnectionId).
+    /// Identifies this connection independently of its peer address.
     pub fn id(&self) -> ConnectionId {
         self.id
     }
 
-    /// Returns the socket address of the remote peer of this TCP connection.
+    /// Returns the socket address of the remote peer.
     pub fn peer_addr(&self) -> SocketAddr {
         self.peer_addr
     }
 
-    /// Returns the socket address of the local half of this TCP connection.
+    /// Returns the socket address of the local endpoint.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 
-    /// Sends a packet to the server. Returns an error if disconnected or the outgoing queue is full.
+    /// Queues a packet for the remote peer.
+    ///
+    /// # Errors
+    /// Returns the unsent packet if the connection is closed or its outgoing queue is full.
     pub fn send(&self, packet: SendingPacket) -> Result<(), TrySendError<SendingPacket>> {
         if self.disconnect_task.is_cancelled() {
             return Err(TrySendError::Closed(packet));
@@ -279,19 +279,30 @@ impl Default for NetworkQueueSettings {
 }
 
 #[cfg(any(feature = "client", feature = "server"))]
-pub(crate) async fn forward_packet<T>(
-    sender: &Sender<T>,
-    packet: T,
+pub(crate) struct PacketForwarder<T> {
+    sender: Sender<T>,
     datagram: bool,
-    cancel: &DisconnectTask,
-) -> bool {
-    if datagram {
-        !matches!(sender.try_send(packet), Err(TrySendError::Closed(_)))
-    } else {
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => false,
-            result = sender.send(packet) => result.is_ok(),
+    cancel: DisconnectTask,
+}
+#[cfg(any(feature = "client", feature = "server"))]
+impl<T> PacketForwarder<T> {
+    pub(crate) fn new(sender: Sender<T>, datagram: bool, cancel: DisconnectTask) -> Self {
+        Self {
+            sender,
+            datagram,
+            cancel,
+        }
+    }
+    /// Returns false when forwarding must stop; a full UDP queue drops the packet.
+    pub(crate) async fn forward(&self, packet: T) -> bool {
+        if self.datagram {
+            !matches!(self.sender.try_send(packet), Err(TrySendError::Closed(_)))
+        } else {
+            tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => false,
+                result = self.sender.send(packet) => result.is_ok(),
+            }
         }
     }
 }
@@ -321,12 +332,14 @@ mod queue_tests {
     async fn udp_overflow_drops_new_packets_and_tcp_waits_cancel_safely() {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
         let cancel = DisconnectTask::new();
-        assert!(forward_packet(&sender, 1, true, &cancel).await);
-        assert!(forward_packet(&sender, 2, true, &cancel).await);
+        let udp = PacketForwarder::new(sender.clone(), true, cancel.clone());
+        assert!(udp.forward(1).await);
+        assert!(udp.forward(2).await);
         assert_eq!(receiver.recv().await, Some(1));
         assert!(receiver.try_recv().is_err());
         sender.send(3).await.unwrap();
-        let mut pending = Box::pin(forward_packet(&sender, 4, false, &cancel));
+        let tcp = PacketForwarder::new(sender, false, cancel.clone());
+        let mut pending = Box::pin(tcp.forward(4));
         assert!(futures::poll!(pending.as_mut()).is_pending());
         cancel.cancel();
         assert!(!pending.await);
