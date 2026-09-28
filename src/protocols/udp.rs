@@ -124,7 +124,7 @@ impl Listener for UdpNetworkListener {
             let datagram = &buf[..len];
             if let Some(task) = self.tasks.get(&address) {
                 task.push(datagram);
-            } else {
+            } else if matches!(datagram.first(), None | Some(&DATA_DATAGRAM)) {
                 let new_task = UdpRead::default();
                 new_task.push(datagram);
                 self.tasks.insert(address, new_task.clone());
@@ -571,6 +571,24 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(packet, vec![7]);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn unknown_datagrams_do_not_open_connections() {
+        with_timeout(async {
+            let listener = UdpProtocol::bind(([127, 0, 0, 1], 0).into()).await.unwrap();
+            let garbage = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            for datagram in [&[0][..], &[0xAB, 7]] {
+                garbage.send_to(datagram, listener.address()).await.unwrap();
+            }
+            peer.send_to(&[], listener.address()).await.unwrap();
+
+            let stream = listener.accept().await.unwrap();
+            assert_eq!(stream.peer_addr(), peer.local_addr().unwrap());
+            assert!(!listener.tasks.contains_key(&garbage.local_addr().unwrap()));
         })
         .await;
     }
