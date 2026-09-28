@@ -215,29 +215,6 @@ pub(crate) fn set_max_packet_size_system(
     }
 }
 
-/// Warns once per `warned` flag, which callers keep per plugin.
-#[cfg(any(feature = "client", feature = "server"))]
-pub(crate) fn warn_if_stateful_over_datagrams<P, ReceivingPacket, SendingPacket, EncErr, DecErr>(
-    serializer: &crate::serializer::SerializerAdapter<
-        ReceivingPacket,
-        SendingPacket,
-        EncErr,
-        DecErr,
-    >,
-    warned: &mut bool,
-) where
-    P: crate::protocol::Protocol,
-    EncErr: Error + Send + Sync,
-    DecErr: Error + Send + Sync,
-{
-    if P::DATAGRAM
-        && matches!(serializer, crate::serializer::SerializerAdapter::Mutable(_))
-        && !std::mem::replace(warned, true)
-    {
-        bevy::log::warn!("A mutable serializer is used with a datagram protocol. Stateful serializers desynchronize when packets are lost or reordered.");
-    }
-}
-
 #[cfg(any(feature = "client", feature = "server"))]
 pub(crate) fn max_packet_size_warning_system(
     max_packet_size: Option<bevy::prelude::Res<MaxPacketSize>>,
@@ -252,7 +229,7 @@ pub(crate) fn max_packet_size_warning_system(
 /// UDP drops newly received packets when the ECS queue is full; streams apply backpressure.
 #[derive(Clone, Copy, Debug, Resource)]
 pub struct NetworkQueueSettings {
-    /// Outgoing packets per connection. `EcsConnection::send` reports `Full` on overflow.
+    /// Outgoing packets per connection. [`EcsConnection::send`] reports `Full` on overflow.
     pub send_capacity: usize,
     /// Incoming packets per plugin and capacity of each connection/event channel.
     pub receive_capacity: usize,
@@ -267,6 +244,17 @@ impl Default for NetworkQueueSettings {
             receive_capacity: 4096,
             events_per_frame: 256,
         }
+    }
+}
+
+#[cfg(any(feature = "client", feature = "server"))]
+impl NetworkQueueSettings {
+    pub(crate) fn outgoing_channel<T>(&self) -> (Sender<T>, Receiver<T>) {
+        tokio::sync::mpsc::channel(self.send_capacity.max(1))
+    }
+
+    pub(crate) fn incoming_channel<T>(&self) -> (Sender<T>, Receiver<T>) {
+        tokio::sync::mpsc::channel(self.receive_capacity.max(1))
     }
 }
 

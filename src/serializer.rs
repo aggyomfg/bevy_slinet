@@ -61,6 +61,23 @@ where
     ),
 }
 
+#[cfg(any(feature = "client", feature = "server"))]
+impl<ReceivingPacket, SendingPacket, EncErr, DecErr>
+    SerializerAdapter<ReceivingPacket, SendingPacket, EncErr, DecErr>
+where
+    EncErr: Error + Send + Sync,
+    DecErr: Error + Send + Sync,
+{
+    pub(crate) fn warn_if_stateful_over_datagrams<P: crate::protocol::Protocol>(
+        &self,
+        warned: &mut bool,
+    ) {
+        if P::DATAGRAM && matches!(self, Self::Mutable(_)) && !std::mem::replace(warned, true) {
+            bevy::log::warn!("A mutable serializer is used with a datagram protocol. Stateful serializers desynchronize when packets are lost or reordered.");
+        }
+    }
+}
+
 impl<ReceivingPacket, SendingPacket, EncErr, DecErr> Serializer<ReceivingPacket, SendingPacket>
     for SerializerAdapter<ReceivingPacket, SendingPacket, EncErr, DecErr>
 where
@@ -114,10 +131,10 @@ pub trait MutableSerializer<ReceivingPacket, SendingPacket>: Send + Sync + 'stat
     ///
     /// # Errors
     /// Returns the codec’s error when the packet cannot be represented.
-    fn serialize(&mut self, p: SendingPacket) -> Result<Vec<u8>, Self::EncodeError>;
+    fn serialize(&mut self, packet: SendingPacket) -> Result<Vec<u8>, Self::EncodeError>;
     /// Decodes a complete packet payload.
     ///
     /// # Errors
     /// Returns the codec’s error for invalid or unsupported payloads.
-    fn deserialize(&mut self, buf: &[u8]) -> Result<ReceivingPacket, Self::DecodeError>;
+    fn deserialize(&mut self, buffer: &[u8]) -> Result<ReceivingPacket, Self::DecodeError>;
 }

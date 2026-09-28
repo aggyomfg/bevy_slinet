@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
 
+use bevy::ecs::system::SystemParam;
 use bevy::log;
 use bevy::platform::time::Instant;
 use bevy::prelude::*;
@@ -14,8 +15,8 @@ use futures::StreamExt;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::connection::{
-    max_packet_size_warning_system, set_max_packet_size_system, warn_if_stateful_over_datagrams,
-    EcsConnection, NetworkQueueSettings, PacketForwarder, RawConnection,
+    max_packet_size_warning_system, set_max_packet_size_system, ConnectionId, EcsConnection,
+    NetworkQueueSettings, PacketForwarder, RawConnection,
 };
 use crate::protocol::ReadStream;
 use crate::protocol::WriteStream;
@@ -40,6 +41,15 @@ pub struct ClientConnections<Config: ClientConfig>(Vec<ClientConnection<Config>>
 impl<Config: ClientConfig> ClientConnections<Config> {
     fn new() -> Self {
         Self(Vec::new())
+    }
+
+    fn register(&mut self, connection: ClientConnection<Config>) {
+        self.0.push(connection);
+    }
+
+    fn remove_connection(&mut self, id: ConnectionId) -> Option<ClientConnection<Config>> {
+        self.0.retain(|connection| connection.id() != id);
+        self.0.last().cloned()
     }
 }
 
@@ -99,8 +109,7 @@ impl<Config: ClientConfig> Plugin for ClientPlugin<Config> {
             .add_systems(
                 Startup,
                 (
-                    create_setup_system::<Config>(idle_timeout)
-                        .before(AddInitialConnectionRequestEventLabel),
+                    Self::setup_system(idle_timeout).before(AddInitialConnectionRequestEventLabel),
                     (move |mut commands: Commands| {
                         if let Some(address) = address {
                             commands.trigger(ConnectionRequestEvent::<Config>::new(address));
@@ -182,293 +191,380 @@ impl<Config: ClientConfig> Clone for ConnectionRequestEvent<Config> {
 struct ConnectionRequestSender<Config: ClientConfig>(Sender<SocketAddr>, PhantomData<Config>);
 
 #[derive(Resource)]
-struct ConnectionReceiver<Config: ClientConfig>(Receiver<(SocketAddr, ClientConnection<Config>)>);
-
-#[allow(clippy::type_complexity)]
-#[derive(Resource)]
-
-struct DisconnectionReceiver<Config: ClientConfig>(
-    Receiver<(
-        ReceiveError<Config::DecodeError, Config::LengthSerializer>,
-        SocketAddr,
-        Option<crate::connection::ConnectionId>,
-    )>,
-    PhantomData<Config>,
-);
+struct ConnectionReceiver<Config: ClientConfig>(Receiver<ConnectionEstablishEvent<Config>>);
 
 #[derive(Resource)]
-struct PacketReceiver<Config: ClientConfig>(
-    Receiver<(ClientConnection<Config>, Config::ServerPacket, Instant)>,
-);
+struct DisconnectionReceiver<Config: ClientConfig>(Receiver<ConnectionClosed<Config>>);
 
-fn create_setup_system<Config: ClientConfig>(
-    idle_timeout: tokio::sync::watch::Receiver<std::time::Duration>,
-) -> impl Fn(Commands, Option<Res<NetworkQueueSettings>>) {
-    move |commands, queues| {
-        setup_system::<Config>(
-            commands,
-            idle_timeout.clone(),
-            queues.as_deref().copied().unwrap_or_default(),
-        )
+#[derive(Resource)]
+struct PacketReceiver<Config: ClientConfig>(Receiver<PacketReceiveEvent<Config>>);
+
+struct ConnectionClosed<Config: ClientConfig> {
+    event: DisconnectionEvent<Config>,
+    id: Option<ConnectionId>,
+}
+
+impl<Config: ClientConfig> ConnectionClosed<Config> {
+    fn new(
+        error: ReceiveError<Config::DecodeError, Config::LengthSerializer>,
+        address: SocketAddr,
+        id: Option<ConnectionId>,
+    ) -> Self {
+        Self {
+            event: DisconnectionEvent {
+                error,
+                address,
+                _marker: PhantomData,
+            },
+            id,
+        }
     }
 }
 
-fn setup_system<Config: ClientConfig>(
-    mut commands: Commands,
-    idle_timeout: tokio::sync::watch::Receiver<std::time::Duration>,
-    queues: NetworkQueueSettings,
-) {
-    let (req_tx, req_rx) = tokio::sync::mpsc::channel(queues.receive_capacity.max(1));
-    commands.insert_resource(ConnectionRequestSender::<Config>(req_tx, PhantomData));
+struct ConnectedTransport<Config: ClientConfig> {
+    connection: RawClientConnection<Config>,
+    ecs_connection: ClientConnection<Config>,
+}
 
-    let (conn_tx, conn_rx) = tokio::sync::mpsc::channel(queues.receive_capacity.max(1));
-    let (conn_tx2, mut conn_rx2) = tokio::sync::mpsc::channel(queues.receive_capacity.max(1));
-    let (disc_tx, disc_rx) = tokio::sync::mpsc::channel(queues.receive_capacity.max(1));
-    let (pack_tx, pack_rx) = tokio::sync::mpsc::channel(queues.receive_capacity.max(1));
-    commands.insert_resource(ConnectionReceiver::<Config>(conn_rx));
-    commands.insert_resource(DisconnectionReceiver::<Config>(disc_rx, PhantomData));
-    commands.insert_resource(PacketReceiver::<Config>(pack_rx));
-    commands.add_observer(connection_request_system::<Config>);
+struct ConnectionAttempt<Config: ClientConfig> {
+    address: SocketAddr,
+    packets: Sender<Config::ClientPacket>,
+    result: io::Result<RawClientConnection<Config>>,
+}
 
-    let disc_tx2 = disc_tx.clone();
-    run_async(async move {
-        let mut warned = false;
-        // Bound in-flight handshakes while allowing other endpoints to connect.
-        let requests = futures::stream::unfold(req_rx, |mut requests| async move {
-            requests.recv().await.map(|address| (address, requests))
-        });
-        let connections = requests
-            .map(|address| {
-                let (tx, rx) = tokio::sync::mpsc::channel(queues.send_capacity.max(1));
-                let serializer = Config::build_serializer();
-                warn_if_stateful_over_datagrams::<Config::Protocol, _, _, _, _>(
-                    &serializer,
-                    &mut warned,
-                );
-                async move {
-                    let result = create_connection::<Config>(
-                        address,
-                        Arc::new(serializer),
-                        Config::LengthSerializer::default(),
-                        rx,
-                    )
-                    .await;
-                    (address, tx, result)
-                }
-            })
-            .buffer_unordered(8);
-        futures::pin_mut!(connections);
-        while let Some((address, tx, result)) = connections.next().await {
-            match result {
-                Ok(connection) => {
-                    let ecs_conn = EcsConnection {
-                        disconnect_task: connection.disconnect_task.clone(),
-                        id: connection.id(),
-                        packet_tx: tx,
-                        local_addr: connection.local_addr(),
-                        peer_addr: connection.peer_addr(),
-                    };
-                    if let Err(err) = conn_tx.send((address, ecs_conn.clone())).await {
-                        log::error!("Failed to send connection establishment: {err:?}");
-                        return;
+impl<Config: ClientConfig> ClientPlugin<Config> {
+    fn setup_system(
+        idle_timeout: tokio::sync::watch::Receiver<std::time::Duration>,
+    ) -> impl Fn(Commands, Option<Res<NetworkQueueSettings>>) {
+        move |commands, queues| {
+            Self::setup(
+                commands,
+                idle_timeout.clone(),
+                queues.as_deref().copied().unwrap_or_default(),
+            )
+        }
+    }
+
+    fn setup(
+        mut commands: Commands,
+        idle_timeout: tokio::sync::watch::Receiver<std::time::Duration>,
+        queues: NetworkQueueSettings,
+    ) {
+        let (req_tx, req_rx) = queues.incoming_channel();
+        commands.insert_resource(ConnectionRequestSender::<Config>(req_tx, PhantomData));
+
+        let (conn_tx, conn_rx) = queues.incoming_channel();
+        let (conn_tx2, mut conn_rx2) = queues.incoming_channel();
+        let (disc_tx, disc_rx) = queues.incoming_channel();
+        let (pack_tx, pack_rx) = queues.incoming_channel();
+        commands.insert_resource(ConnectionReceiver::<Config>(conn_rx));
+        commands.insert_resource(DisconnectionReceiver::<Config>(disc_rx));
+        commands.insert_resource(PacketReceiver::<Config>(pack_rx));
+        commands.add_observer(ConnectionRequestSender::<Config>::observe);
+
+        let disc_tx2 = disc_tx.clone();
+        Self::run_async(async move {
+            let mut warned = false;
+            // Bound in-flight handshakes while allowing other endpoints to connect.
+            let requests = futures::stream::unfold(req_rx, |mut requests| async move {
+                requests.recv().await.map(|address| (address, requests))
+            });
+            let connections = requests
+                .map(|address| {
+                    let (tx, rx) = queues.outgoing_channel();
+                    let serializer = Config::build_serializer();
+                    serializer.warn_if_stateful_over_datagrams::<Config::Protocol>(&mut warned);
+                    async move {
+                        let result = Self::create_connection(
+                            address,
+                            Arc::new(serializer),
+                            Config::LengthSerializer::default(),
+                            rx,
+                        )
+                        .await;
+                        ConnectionAttempt::<Config> {
+                            address,
+                            packets: tx,
+                            result,
+                        }
                     }
-                    if let Err(err) = conn_tx2.send((connection, ecs_conn)).await {
-                        log::error!("Failed to send raw connection: {err:?}");
+                })
+                .buffer_unordered(8);
+            futures::pin_mut!(connections);
+            while let Some(ConnectionAttempt {
+                address,
+                packets,
+                result,
+            }) = connections.next().await
+            {
+                match result {
+                    Ok(connection) => {
+                        let ecs_conn = EcsConnection {
+                            disconnect_task: connection.disconnect_task.clone(),
+                            id: connection.id(),
+                            packet_tx: packets,
+                            local_addr: connection.local_addr(),
+                            peer_addr: connection.peer_addr(),
+                        };
+                        if let Err(err) = conn_tx
+                            .send(ConnectionEstablishEvent::<Config> {
+                                address,
+                                connection: ecs_conn.clone(),
+                            })
+                            .await
+                        {
+                            log::error!("Failed to send connection establishment: {err:?}");
+                            return;
+                        }
+                        if let Err(err) = conn_tx2
+                            .send(ConnectedTransport::<Config> {
+                                connection,
+                                ecs_connection: ecs_conn,
+                            })
+                            .await
+                        {
+                            log::error!("Failed to send raw connection: {err:?}");
+                        }
                     }
-                }
-                Err(err) => {
-                    log::warn!("Couldn't connect to server: {err:?}");
-                    if let Err(send_err) = disc_tx2
-                        .send((ReceiveError::NoConnection(err), address, None))
-                        .await
-                    {
-                        log::error!("Failed to send disconnection event: {send_err:?}");
+                    Err(err) => {
+                        log::warn!("Couldn't connect to server: {err:?}");
+                        if let Err(send_err) = disc_tx2
+                            .send(ConnectionClosed::<Config>::new(
+                                ReceiveError::NoConnection(err),
+                                address,
+                                None,
+                            ))
+                            .await
+                        {
+                            log::error!("Failed to send disconnection event: {send_err:?}");
+                        }
                     }
                 }
             }
-        }
-    });
+        });
 
-    run_async(async move {
-        while let Some((connection, ecs_conn)) = conn_rx2.recv().await {
-            let RawConnection {
-                disconnect_task,
-                stream,
-                serializer,
-                packet_length_serializer,
-                mut packets_rx,
-                id,
-            } = connection;
-            let pack_tx2 = pack_tx.clone();
-            let disc_tx2 = disc_tx.clone();
-            let serializer2 = Arc::clone(&serializer);
-            let packet_length_serializer2 = Arc::clone(&packet_length_serializer);
-            let peer_addr = stream.peer_addr();
+        Self::run_async(async move {
+            while let Some(ConnectedTransport {
+                connection,
+                ecs_connection: ecs_conn,
+            }) = conn_rx2.recv().await
+            {
+                let RawConnection {
+                    disconnect_task,
+                    stream,
+                    serializer,
+                    packet_length_serializer,
+                    mut packets_rx,
+                    id,
+                } = connection;
+                let pack_tx2 = pack_tx.clone();
+                let disc_tx2 = disc_tx.clone();
+                let serializer2 = Arc::clone(&serializer);
+                let packet_length_serializer2 = Arc::clone(&packet_length_serializer);
+                let peer_addr = stream.peer_addr();
 
-            let (mut read, mut write) = match stream.into_split().await {
-                Ok(split) => split,
-                Err(err) => {
-                    log::error!("({:?}) Couldn't split stream: {}", id, err);
-                    continue;
-                }
-            };
+                let (mut read, mut write) = match stream.into_split().await {
+                    Ok(split) => split,
+                    Err(err) => {
+                        log::error!("({:?}) Couldn't split stream: {}", id, err);
+                        continue;
+                    }
+                };
 
-            read.set_idle_timeout(idle_timeout.clone());
-            let write_cancel = disconnect_task.clone();
-            tokio::spawn(async move {
-                let _guard = disconnect_task.clone().drop_guard();
-                let packets = PacketForwarder::new(
-                    pack_tx2,
-                    Config::Protocol::DATAGRAM,
-                    disconnect_task.clone(),
-                );
-                let error = loop {
-                    tokio::select! {
-                        biased;
-                        _ = disconnect_task.cancelled() => break ReceiveError::IntentionalDisconnection,
-                        result = read.receive_with_timestamp(Arc::clone(&serializer2), &*packet_length_serializer2) => {
-                            match result {
-                                Ok((packet, received_at)) => {
-                                    log::trace!("({id:?}) Received packet {packet:?}");
-                                    if !packets.forward((ecs_conn.clone(), packet, received_at)).await {
-                                        break ReceiveError::IntentionalDisconnection;
+                read.set_idle_timeout(idle_timeout.clone());
+                let write_cancel = disconnect_task.clone();
+                tokio::spawn(async move {
+                    let _guard = disconnect_task.clone().drop_guard();
+                    let packets = PacketForwarder::new(
+                        pack_tx2,
+                        Config::Protocol::DATAGRAM,
+                        disconnect_task.clone(),
+                    );
+                    let error = loop {
+                        tokio::select! {
+                            biased;
+                            _ = disconnect_task.cancelled() => break ReceiveError::IntentionalDisconnection,
+                            result = read.receive_with_timestamp(Arc::clone(&serializer2), &*packet_length_serializer2) => {
+                                match result {
+                                    Ok((packet, received_at)) => {
+                                        log::trace!("({id:?}) Received packet {packet:?}");
+                                        if !packets.forward(PacketReceiveEvent::<Config> {
+                                            connection: ecs_conn.clone(),
+                                            packet,
+                                            received_at,
+                                        }).await {
+                                            break ReceiveError::IntentionalDisconnection;
+                                        }
                                     }
+                                    Err(err) => break err,
                                 }
-                                Err(err) => break err,
                             }
                         }
+                    };
+                    disconnect_task.cancel();
+                    read.close();
+                    if let Err(err) = disc_tx2
+                        .send(ConnectionClosed::<Config>::new(error, peer_addr, Some(id)))
+                        .await
+                    {
+                        log::debug!("({id:?}) Disconnection receiver closed: {err:?}");
                     }
-                };
-                disconnect_task.cancel();
-                read.close();
-                if let Err(err) = disc_tx2.send((error, peer_addr, Some(id))).await {
-                    log::debug!("({id:?}) Disconnection receiver closed: {err:?}");
-                }
-            });
-            tokio::spawn(async move {
-                let _guard = write_cancel.clone().drop_guard();
-                let sending = async {
-                    while let Some(packet) = packets_rx.recv().await {
-                        if write_cancel.is_cancelled() {
-                            break;
+                });
+                tokio::spawn(async move {
+                    let _guard = write_cancel.clone().drop_guard();
+                    let sending = async {
+                        while let Some(packet) = packets_rx.recv().await {
+                            if write_cancel.is_cancelled() {
+                                break;
+                            }
+                            log::trace!("({id:?}) Sending packet {packet:?}");
+                            if let Err(err) = write
+                                .send(packet, Arc::clone(&serializer), &*packet_length_serializer)
+                                .await
+                            {
+                                log::error!("({id:?}) Error sending packet: {err}");
+                                break;
+                            }
                         }
-                        log::trace!("({id:?}) Sending packet {packet:?}");
-                        if let Err(err) = write
-                            .send(packet, Arc::clone(&serializer), &*packet_length_serializer)
-                            .await
-                        {
-                            log::error!("({id:?}) Error sending packet: {err}");
-                            break;
-                        }
+                    };
+                    tokio::select! {
+                        biased;
+                        _ = write_cancel.cancelled() => {},
+                        _ = sending => {},
                     }
-                };
-                tokio::select! {
-                    biased;
-                    _ = write_cancel.cancelled() => {},
-                    _ = sending => {},
-                }
-            });
-        }
-    });
-}
+                });
+            }
+        });
+    }
 
-pub(crate) async fn create_connection<Config: ClientConfig>(
-    addr: SocketAddr,
-    serializer: Arc<
-        dyn Serializer<
-            Config::ServerPacket,
-            Config::ClientPacket,
-            EncodeError = Config::EncodeError,
-            DecodeError = Config::DecodeError,
+    async fn create_connection(
+        addr: SocketAddr,
+        serializer: Arc<
+            dyn Serializer<
+                Config::ServerPacket,
+                Config::ClientPacket,
+                EncodeError = Config::EncodeError,
+                DecodeError = Config::DecodeError,
+            >,
         >,
-    >,
-    packet_length_serializer: Config::LengthSerializer,
-    packet_rx: Receiver<Config::ClientPacket>,
-) -> io::Result<RawClientConnection<Config>> {
-    Ok(RawConnection::new(
-        Config::Protocol::connect_to_server(addr).await?,
-        serializer,
-        packet_length_serializer,
-        packet_rx,
-    ))
+        packet_length_serializer: Config::LengthSerializer,
+        packet_rx: Receiver<Config::ClientPacket>,
+    ) -> io::Result<RawClientConnection<Config>> {
+        Ok(RawConnection::new(
+            Config::Protocol::connect_to_server(addr).await?,
+            serializer,
+            packet_length_serializer,
+            packet_rx,
+        ))
+    }
 }
 
-fn connection_request_system<Config: ClientConfig>(
-    connection_request: On<ConnectionRequestEvent<Config>>,
-    requests: Res<ConnectionRequestSender<Config>>,
-) {
-    if let Err(err) = requests.0.try_send(connection_request.event().address) {
-        log::error!("Failed to send connection request: {err:?}");
+impl<Config: ClientConfig> ConnectionRequestSender<Config> {
+    fn request(&self, address: SocketAddr) {
+        if let Err(err) = self.0.try_send(address) {
+            log::error!("Failed to send connection request: {err:?}");
+        }
+    }
+
+    fn observe(connection_request: On<ConnectionRequestEvent<Config>>, requests: Res<Self>) {
+        requests.request(connection_request.event().address);
+    }
+}
+
+/// Received packets and the frame budget governing their delivery to observers.
+#[derive(SystemParam)]
+struct IncomingPackets<'w, Config: ClientConfig> {
+    packets: ResMut<'w, PacketReceiver<Config>>,
+    queues: Option<Res<'w, NetworkQueueSettings>>,
+}
+
+impl<Config: ClientConfig> IncomingPackets<'_, Config> {
+    fn drain(&mut self) -> impl Iterator<Item = PacketReceiveEvent<Config>> + '_ {
+        let limit = self
+            .queues
+            .as_deref()
+            .copied()
+            .unwrap_or_default()
+            .events_per_frame;
+        let receiver = &mut self.packets.0;
+        std::iter::from_fn(move || receiver.try_recv().ok()).take(limit)
+    }
+}
+
+/// Completed connection attempts and the frame budget for registering them.
+#[derive(SystemParam)]
+struct IncomingConnections<'w, Config: ClientConfig> {
+    connections: ResMut<'w, ConnectionReceiver<Config>>,
+    queues: Option<Res<'w, NetworkQueueSettings>>,
+}
+
+impl<Config: ClientConfig> IncomingConnections<'_, Config> {
+    fn drain(&mut self) -> impl Iterator<Item = ConnectionEstablishEvent<Config>> + '_ {
+        let limit = self
+            .queues
+            .as_deref()
+            .copied()
+            .unwrap_or_default()
+            .events_per_frame;
+        let receiver = &mut self.connections.0;
+        std::iter::from_fn(move || receiver.try_recv().ok()).take(limit)
+    }
+}
+
+/// Closed connections and the frame budget for notifying observers.
+#[derive(SystemParam)]
+struct IncomingDisconnections<'w, Config: ClientConfig> {
+    disconnections: ResMut<'w, DisconnectionReceiver<Config>>,
+    queues: Option<Res<'w, NetworkQueueSettings>>,
+}
+
+impl<Config: ClientConfig> IncomingDisconnections<'_, Config> {
+    fn drain(&mut self) -> impl Iterator<Item = ConnectionClosed<Config>> + '_ {
+        let limit = self
+            .queues
+            .as_deref()
+            .copied()
+            .unwrap_or_default()
+            .events_per_frame;
+        let receiver = &mut self.disconnections.0;
+        std::iter::from_fn(move || receiver.try_recv().ok()).take(limit)
     }
 }
 
 fn packet_receive_system<Config: ClientConfig>(
-    mut packets: ResMut<PacketReceiver<Config>>,
+    mut packets: IncomingPackets<Config>,
     mut commands: Commands,
-    queues: Option<Res<NetworkQueueSettings>>,
 ) {
-    for (connection, packet, received_at) in std::iter::from_fn(|| packets.0.try_recv().ok()).take(
-        queues
-            .as_deref()
-            .copied()
-            .unwrap_or_default()
-            .events_per_frame,
-    ) {
-        commands.trigger(PacketReceiveEvent::<Config> {
-            connection,
-            packet,
-            received_at,
-        });
+    for packet in packets.drain() {
+        commands.trigger(packet);
     }
 }
 
 fn connection_establish_system<Config: ClientConfig>(
     mut commands: Commands,
-    mut new_connections: ResMut<ConnectionReceiver<Config>>,
+    mut incoming: IncomingConnections<Config>,
     mut connections: ResMut<ClientConnections<Config>>,
-    queues: Option<Res<NetworkQueueSettings>>,
 ) {
-    for (address, connection) in std::iter::from_fn(|| new_connections.0.try_recv().ok()).take(
-        queues
-            .as_deref()
-            .copied()
-            .unwrap_or_default()
-            .events_per_frame,
-    ) {
-        commands.insert_resource(connection.clone());
-        connections.push(connection.clone());
-        commands.trigger(ConnectionEstablishEvent::<Config> {
-            address,
-            connection,
-        });
+    for event in incoming.drain() {
+        commands.insert_resource(event.connection.clone());
+        connections.register(event.connection.clone());
+        commands.trigger(event);
     }
 }
 
 fn connection_remove_system<Config: ClientConfig>(
     mut commands: Commands,
-    mut old_connections: ResMut<DisconnectionReceiver<Config>>,
+    mut incoming: IncomingDisconnections<Config>,
     mut connections: ResMut<ClientConnections<Config>>,
-    queues: Option<Res<NetworkQueueSettings>>,
 ) {
-    for (error, address, id) in std::iter::from_fn(|| old_connections.0.try_recv().ok()).take(
-        queues
-            .as_deref()
-            .copied()
-            .unwrap_or_default()
-            .events_per_frame,
-    ) {
-        if let Some(id) = id {
+    for closed in incoming.drain() {
+        if let Some(id) = closed.id {
             commands.remove_resource::<ClientConnection<Config>>();
-            connections.retain(|conn| conn.id() != id);
-            if let Some(connection) = connections.last() {
-                commands.insert_resource(connection.clone());
+            if let Some(connection) = connections.remove_connection(id) {
+                commands.insert_resource(connection);
             }
         }
-        commands.trigger(DisconnectionEvent::<Config> {
-            error,
-            address,
-            _marker: PhantomData,
-        });
+        commands.trigger(closed.event);
     }
 }
 
@@ -505,50 +601,52 @@ pub struct PacketReceiveEvent<Config: ClientConfig> {
     pub received_at: Instant,
 }
 
-#[cfg(not(target_family = "wasm"))]
-fn run_async<F>(future: F)
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    std::thread::spawn(move || {
-        let runtime_result = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build();
+impl<Config: ClientConfig> ClientPlugin<Config> {
+    #[cfg(not(target_family = "wasm"))]
+    fn run_async<F>(future: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        std::thread::spawn(move || {
+            let runtime_result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
 
-        let runtime = match runtime_result {
-            Ok(rt) => rt,
-            Err(err) => {
-                log::error!("Failed to create tokio runtime: {:?}", err);
-                return;
-            }
-        };
+            let runtime = match runtime_result {
+                Ok(rt) => rt,
+                Err(err) => {
+                    log::error!("Failed to create tokio runtime: {:?}", err);
+                    return;
+                }
+            };
 
-        runtime.block_on(async move {
+            runtime.block_on(async move {
+                let local = tokio::task::LocalSet::new();
+                local
+                    .run_until(async move {
+                        if let Err(err) = tokio::task::spawn_local(future).await {
+                            log::error!("Failed to run async task: {}", err);
+                        }
+                    })
+                    .await;
+            });
+        });
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn run_async<F>(future: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        wasm_bindgen_futures::spawn_local(async move {
             let local = tokio::task::LocalSet::new();
             local
                 .run_until(async move {
                     if let Err(err) = tokio::task::spawn_local(future).await {
-                        log::error!("Failed to run async task: {}", err);
+                        log::error!("Failed to run async task: {:?}", err);
                     }
                 })
                 .await;
         });
-    });
-}
-
-#[cfg(target_family = "wasm")]
-fn run_async<F>(future: F)
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    wasm_bindgen_futures::spawn_local(async move {
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async move {
-                if let Err(err) = tokio::task::spawn_local(future).await {
-                    log::error!("Failed to run async task: {:?}", err);
-                }
-            })
-            .await;
-    });
+    }
 }

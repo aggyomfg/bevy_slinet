@@ -4,38 +4,51 @@ use std::marker::PhantomData;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 
+use bevy::ecs::system::SystemParam;
 use bevy::platform::time::Instant;
 use bevy::{log, prelude::*};
 use tokio::select;
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::Receiver;
 
 use crate::connection::{
-    max_packet_size_warning_system, set_max_packet_size_system, warn_if_stateful_over_datagrams,
-    ConnectionId, DisconnectTask, EcsConnection, NetworkQueueSettings, PacketForwarder,
-    RawConnection,
+    max_packet_size_warning_system, set_max_packet_size_system, ConnectionId, DisconnectTask,
+    EcsConnection, NetworkQueueSettings, PacketForwarder, RawConnection,
 };
 use crate::protocol::{Listener, NetworkStream, Protocol, ReadStream, ReceiveError, WriteStream};
 use crate::{ServerConfig, SystemSets};
 
 /// Represents the server side of a client connection.
 pub type ServerConnection<Config> = EcsConnection<<Config as ServerConfig>::ServerPacket>;
-type RawServerConnection<Config> = (
-    RawConnection<
-        <Config as ServerConfig>::ClientPacket,
-        <Config as ServerConfig>::ServerPacket,
-        <<Config as ServerConfig>::Protocol as Protocol>::ServerStream,
-        <Config as ServerConfig>::EncodeError,
-        <Config as ServerConfig>::DecodeError,
-        <Config as ServerConfig>::LengthSerializer,
-    >,
-    ServerConnection<Config>,
-);
+type RawServerConnection<Config> = RawConnection<
+    <Config as ServerConfig>::ClientPacket,
+    <Config as ServerConfig>::ServerPacket,
+    <<Config as ServerConfig>::Protocol as Protocol>::ServerStream,
+    <Config as ServerConfig>::EncodeError,
+    <Config as ServerConfig>::DecodeError,
+    <Config as ServerConfig>::LengthSerializer,
+>;
+
+struct ConnectedTransport<Config: ServerConfig> {
+    connection: RawServerConnection<Config>,
+    ecs_connection: ServerConnection<Config>,
+}
+
 /// Tracks client connections registered with this server plugin.
 #[derive(Resource)]
 pub struct ServerConnections<Config: ServerConfig>(Vec<ServerConnection<Config>>);
 impl<Config: ServerConfig> ServerConnections<Config> {
     fn new() -> Self {
         Self(Vec::new())
+    }
+
+    fn register(new_connection: On<NewConnectionEvent<Config>>, mut connections: ResMut<Self>) {
+        connections
+            .0
+            .push(new_connection.event().connection.clone());
+    }
+
+    fn remove_connection(&mut self, id: ConnectionId) {
+        self.0.retain(|connection| connection.id() != id);
     }
 }
 impl<Config: ServerConfig> std::ops::Deref for ServerConnections<Config> {
@@ -67,7 +80,7 @@ impl<Config: ServerConfig> Plugin for ServerPlugin<Config> {
             .add_systems(
                 Startup,
                 (
-                    create_setup_system::<Config>(self.address, idle_timeout),
+                    Self::setup_system(self.address, idle_timeout),
                     max_packet_size_warning_system.in_set(SystemSets::MaxPacketSizeWarning),
                 ),
             )
@@ -88,7 +101,7 @@ impl<Config: ServerConfig> Plugin for ServerPlugin<Config> {
                 PostUpdate,
                 (remove_connections::<Config>.in_set(SystemSets::ServerRemoveConnections),),
             )
-            .add_observer(connection_add_system::<Config>);
+            .add_observer(ServerConnections::<Config>::register);
     }
 }
 
@@ -113,61 +126,51 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
 }
 
 #[derive(Resource)]
-struct ConnectionReceiver<Config: ServerConfig>(Receiver<(SocketAddr, ServerConnection<Config>)>);
-
-#[allow(clippy::type_complexity)]
-#[derive(Resource)]
-struct DisconnectionReceiver<Config: ServerConfig>(
-    Receiver<(
-        ReceiveError<Config::DecodeError, Config::LengthSerializer>,
-        ServerConnection<Config>,
-    )>,
-);
+struct ConnectionReceiver<Config: ServerConfig>(Receiver<NewConnectionEvent<Config>>);
 
 #[derive(Resource)]
-struct PacketReceiver<Config: ServerConfig>(
-    Receiver<(ServerConnection<Config>, Config::ClientPacket, Instant)>,
-);
+struct DisconnectionReceiver<Config: ServerConfig>(Receiver<DisconnectionEvent<Config>>);
 
-fn create_setup_system<Config: ServerConfig>(
-    address: SocketAddr,
-    idle_timeout: tokio::sync::watch::Receiver<std::time::Duration>,
-) -> impl Fn(Commands, Option<Res<NetworkQueueSettings>>) {
-    #[cfg(target_family = "wasm")]
-    compile_error!("Why would you run a bevy_slinet server on WASM? If you really need this, please open an issue (https://github.com/aggyomfg/bevy_slinet/issues/new)");
+#[derive(Resource)]
+struct PacketReceiver<Config: ServerConfig>(Receiver<PacketReceiveEvent<Config>>);
 
-    move |mut commands: Commands, queues: Option<Res<NetworkQueueSettings>>| {
-        let queues = queues.as_deref().copied().unwrap_or_default();
-        let (conn_tx, conn_rx) = tokio::sync::mpsc::channel(queues.receive_capacity.max(1));
-        let (conn_tx2, mut conn_rx2): (
-            Sender<RawServerConnection<Config>>,
-            Receiver<RawServerConnection<Config>>,
-        ) = tokio::sync::mpsc::channel(queues.receive_capacity.max(1));
-        let (disc_tx, disc_rx) = tokio::sync::mpsc::channel(queues.receive_capacity.max(1));
-        let (pack_tx, pack_rx) = tokio::sync::mpsc::channel(queues.receive_capacity.max(1));
-        let (disc_tx2, mut disc_rx2) = tokio::sync::mpsc::channel(queues.receive_capacity.max(1));
-        commands.insert_resource(ConnectionReceiver::<Config>(conn_rx));
-        commands.insert_resource(DisconnectionReceiver::<Config>(disc_rx));
-        commands.insert_resource(PacketReceiver::<Config>(pack_rx));
-        let (bound_tx, bound_rx) = std::sync::mpsc::sync_channel::<SocketAddr>(1);
-        let idle_timeout = idle_timeout.clone();
+impl<Config: ServerConfig> ServerPlugin<Config> {
+    fn setup_system(
+        address: SocketAddr,
+        idle_timeout: tokio::sync::watch::Receiver<std::time::Duration>,
+    ) -> impl Fn(Commands, Option<Res<NetworkQueueSettings>>) {
+        #[cfg(target_family = "wasm")]
+        compile_error!("Why would you run a bevy_slinet server on WASM? If you really need this, please open an issue (https://github.com/aggyomfg/bevy_slinet/issues/new)");
 
-        std::thread::spawn(move || {
-            let runtime_result = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build();
+        move |mut commands: Commands, queues: Option<Res<NetworkQueueSettings>>| {
+            let queues = queues.as_deref().copied().unwrap_or_default();
+            let (conn_tx, conn_rx) = queues.incoming_channel();
+            let (conn_tx2, mut conn_rx2) = queues.incoming_channel::<ConnectedTransport<Config>>();
+            let (disc_tx, disc_rx) = queues.incoming_channel();
+            let (pack_tx, pack_rx) = queues.incoming_channel();
+            let (disc_tx2, mut disc_rx2) = queues.incoming_channel();
+            commands.insert_resource(ConnectionReceiver::<Config>(conn_rx));
+            commands.insert_resource(DisconnectionReceiver::<Config>(disc_rx));
+            commands.insert_resource(PacketReceiver::<Config>(pack_rx));
+            let (bound_tx, bound_rx) = std::sync::mpsc::sync_channel::<SocketAddr>(1);
+            let idle_timeout = idle_timeout.clone();
 
-            let runtime = match runtime_result {
-                Ok(rt) => rt,
-                Err(err) => {
-                    log::error!("Failed to create tokio runtime: {}", err);
-                    return;
-                }
-            };
+            std::thread::spawn(move || {
+                let runtime_result = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build();
 
-            runtime.block_on(async move {
+                let runtime = match runtime_result {
+                    Ok(rt) => rt,
+                    Err(err) => {
+                        log::error!("Failed to create tokio runtime: {}", err);
+                        return;
+                    }
+                };
+
+                runtime.block_on(async move {
                 tokio::spawn(async move {
-                    while let Some((connection, ecs_conn)) = conn_rx2.recv().await {
+                    while let Some(ConnectedTransport { connection, ecs_connection: ecs_conn }) = conn_rx2.recv().await {
                         let RawConnection {
                             disconnect_task,
                             stream,
@@ -205,7 +208,11 @@ fn create_setup_system<Config: ServerConfig>(
                                         match result {
                                             Ok((packet, received_at)) => {
                                                 log::trace!("({id:?}) Received packet {packet:?}");
-                                                if !packets.forward((ecs_conn.clone(), packet, received_at)).await {
+                                                if !packets.forward(PacketReceiveEvent::<Config> {
+                                                    connection: ecs_conn.clone(),
+                                                    packet,
+                                                    received_at,
+                                                }).await {
                                                     break ReceiveError::IntentionalDisconnection;
                                                 }
                                             }
@@ -216,7 +223,10 @@ fn create_setup_system<Config: ServerConfig>(
                             };
                             disconnect_task.cancel();
                             read.close();
-                            if let Err(err) = disc_tx_2.send((error, ecs_conn.clone())).await {
+                            if let Err(err) = disc_tx_2.send(DisconnectionEvent::<Config> {
+                                error,
+                                connection: ecs_conn.clone(),
+                            }).await {
                                 log::debug!("({id:?}) Disconnection receiver closed: {err:?}");
                             }
                             if let Err(err) = disc_tx2_2.send(ecs_conn.peer_addr).await {
@@ -259,11 +269,12 @@ fn create_setup_system<Config: ServerConfig>(
                     select! {
                         Ok(connection) = listener.accept() => {
                             log::debug!("Accepting a connection from {:?}", connection.peer_addr());
-                            let (conn_tx_2, conn_tx2_2) = (conn_tx.clone(), conn_tx2.clone());
+                            let conn_tx_2 = conn_tx.clone();
+                            let conn_tx2_2 = conn_tx2.clone();
                             let serializer = Config::build_serializer();
-                            warn_if_stateful_over_datagrams::<Config::Protocol, _, _, _, _>(&serializer, &mut warned);
+                            serializer.warn_if_stateful_over_datagrams::<Config::Protocol>(&mut warned);
                             tokio::spawn(async move {
-                                let (tx, rx) = tokio::sync::mpsc::channel(queues.send_capacity.max(1));
+                                let (tx, rx) = queues.outgoing_channel();
                                 let disconnect_task = DisconnectTask::default();
                                 let connection = RawConnection {
                                     disconnect_task: disconnect_task.clone(),
@@ -280,11 +291,17 @@ fn create_setup_system<Config: ServerConfig>(
                                     local_addr: connection.local_addr(),
                                     peer_addr: connection.peer_addr(),
                                 };
-                                if let Err(err) = conn_tx_2.send((ecs_conn.peer_addr, ecs_conn.clone())).await {
+                                if let Err(err) = conn_tx_2.send(NewConnectionEvent::<Config> {
+                                    address: ecs_conn.peer_addr,
+                                    connection: ecs_conn.clone(),
+                                }).await {
                                     log::error!("Failed to send new connection to ECS: {}", err);
                                     return;
                                 }
-                                if let Err(err) = conn_tx2_2.send((connection, ecs_conn)).await {
+                                if let Err(err) = conn_tx2_2.send(ConnectedTransport::<Config> {
+                                    connection,
+                                    ecs_connection: ecs_conn,
+                                }).await {
                                     log::error!("Failed to send new raw connection: {}", err);
                                 }
                             });
@@ -298,14 +315,15 @@ fn create_setup_system<Config: ServerConfig>(
                     }
                 }
             });
-        });
-
-        // Clients may connect right after Startup, so the listener must exist by then.
-        if let Ok(local_addr) = bound_rx.recv() {
-            commands.insert_resource(ServerAddress::<Config> {
-                address: local_addr,
-                _marker: PhantomData,
             });
+
+            // Clients may connect right after Startup, so the listener must exist by then.
+            if let Ok(local_addr) = bound_rx.recv() {
+                commands.insert_resource(ServerAddress::<Config> {
+                    address: local_addr,
+                    _marker: PhantomData,
+                });
+            }
         }
     }
 }
@@ -358,66 +376,91 @@ pub struct PacketReceiveEvent<Config: ServerConfig> {
     pub received_at: Instant,
 }
 
-fn accept_new_connections<Config: ServerConfig>(
-    mut receiver: ResMut<ConnectionReceiver<Config>>,
-    mut commands: Commands,
-    queues: Option<Res<NetworkQueueSettings>>,
-) {
-    for (address, connection) in std::iter::from_fn(|| receiver.0.try_recv().ok()).take(
-        queues
+/// Accepted connections and the frame budget governing their delivery to observers.
+#[derive(SystemParam)]
+struct IncomingConnections<'w, Config: ServerConfig> {
+    connections: ResMut<'w, ConnectionReceiver<Config>>,
+    queues: Option<Res<'w, NetworkQueueSettings>>,
+}
+
+impl<Config: ServerConfig> IncomingConnections<'_, Config> {
+    fn drain(&mut self) -> impl Iterator<Item = NewConnectionEvent<Config>> + '_ {
+        let limit = self
+            .queues
             .as_deref()
             .copied()
             .unwrap_or_default()
-            .events_per_frame,
-    ) {
-        commands.trigger(NewConnectionEvent::<Config> {
-            connection,
-            address,
-        });
+            .events_per_frame;
+        let receiver = &mut self.connections.0;
+        std::iter::from_fn(move || receiver.try_recv().ok()).take(limit)
     }
 }
 
-fn connection_add_system<Config: ServerConfig>(
-    new_connection: On<NewConnectionEvent<Config>>,
-    mut connections: ResMut<ServerConnections<Config>>,
+fn accept_new_connections<Config: ServerConfig>(
+    mut incoming: IncomingConnections<Config>,
+    mut commands: Commands,
 ) {
-    connections.push(new_connection.event().connection.clone());
+    for connection in incoming.drain() {
+        commands.trigger(connection);
+    }
 }
 
-fn accept_new_packets<Config: ServerConfig>(
-    mut receiver: ResMut<PacketReceiver<Config>>,
-    mut commands: Commands,
-    queues: Option<Res<NetworkQueueSettings>>,
-) {
-    for (connection, packet, received_at) in std::iter::from_fn(|| receiver.0.try_recv().ok()).take(
-        queues
+/// Received packets and the frame budget governing their delivery to observers.
+#[derive(SystemParam)]
+struct IncomingPackets<'w, Config: ServerConfig> {
+    packets: ResMut<'w, PacketReceiver<Config>>,
+    queues: Option<Res<'w, NetworkQueueSettings>>,
+}
+
+impl<Config: ServerConfig> IncomingPackets<'_, Config> {
+    fn drain(&mut self) -> impl Iterator<Item = PacketReceiveEvent<Config>> + '_ {
+        let limit = self
+            .queues
             .as_deref()
             .copied()
             .unwrap_or_default()
-            .events_per_frame,
-    ) {
-        commands.trigger(PacketReceiveEvent::<Config> {
-            connection,
-            packet,
-            received_at,
-        });
+            .events_per_frame;
+        let receiver = &mut self.packets.0;
+        std::iter::from_fn(move || receiver.try_recv().ok()).take(limit)
+    }
+}
+
+fn accept_new_packets<Config: ServerConfig>(
+    mut incoming: IncomingPackets<Config>,
+    mut commands: Commands,
+) {
+    for packet in incoming.drain() {
+        commands.trigger(packet);
+    }
+}
+
+/// Closed connections and the frame budget for removing them from the registry.
+#[derive(SystemParam)]
+struct IncomingDisconnections<'w, Config: ServerConfig> {
+    disconnections: ResMut<'w, DisconnectionReceiver<Config>>,
+    queues: Option<Res<'w, NetworkQueueSettings>>,
+}
+
+impl<Config: ServerConfig> IncomingDisconnections<'_, Config> {
+    fn drain(&mut self) -> impl Iterator<Item = DisconnectionEvent<Config>> + '_ {
+        let limit = self
+            .queues
+            .as_deref()
+            .copied()
+            .unwrap_or_default()
+            .events_per_frame;
+        let receiver = &mut self.disconnections.0;
+        std::iter::from_fn(move || receiver.try_recv().ok()).take(limit)
     }
 }
 
 fn remove_connections<Config: ServerConfig>(
     mut connections: ResMut<ServerConnections<Config>>,
-    mut disconnections: ResMut<DisconnectionReceiver<Config>>,
+    mut incoming: IncomingDisconnections<Config>,
     mut commands: Commands,
-    queues: Option<Res<NetworkQueueSettings>>,
 ) {
-    for (error, connection) in std::iter::from_fn(|| disconnections.0.try_recv().ok()).take(
-        queues
-            .as_deref()
-            .copied()
-            .unwrap_or_default()
-            .events_per_frame,
-    ) {
-        connections.retain(|conn| conn.id() != connection.id());
-        commands.trigger(DisconnectionEvent::<Config> { error, connection });
+    for event in incoming.drain() {
+        connections.remove_connection(event.connection.id());
+        commands.trigger(event);
     }
 }
