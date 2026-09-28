@@ -1,6 +1,6 @@
 [package]
 name = "bevy_slinet"
-version = "0.16.1"
+version = "0.17.0"
 authors = [
     "Sliman4 <4sliman4@gmail.com>",
     "aggyomfg <aggyomfg@yandex.com>"
