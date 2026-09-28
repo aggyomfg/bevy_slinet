@@ -24,19 +24,10 @@ pub mod server;
     test,
     feature = "client",
     feature = "server",
-    feature = "protocol_tcp",
+    any(feature = "protocol_tcp", feature = "protocol_udp"),
     feature = "serializer_bitcode_serde"
 ))]
 mod tests;
-#[cfg(all(
-    test,
-    feature = "client",
-    feature = "server",
-    feature = "protocol_tcp",
-    feature = "serializer_bitcode",
-    feature = "serializer_bitcode_serde"
-))]
-mod tests_mut_serializer;
 
 /// Exposes networking phases so application systems can order their work around packet events.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, SystemSet)]
