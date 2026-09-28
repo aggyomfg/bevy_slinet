@@ -4,6 +4,9 @@
 //! is a connection probe; data datagrams contain a `1` byte followed by the serialized payload,
 //! which may be empty. The payload must fit in [`MAX_DATAGRAM_SIZE`] minus one byte (65,506
 //! bytes); larger packets are dropped. `MaxPacketSize` limits the payload, excluding the tag.
+//! The config's `LengthSerializer` is not used. Datagrams larger than the path MTU (about
+//! 1,472 bytes of payload on typical networks) are fragmented, and losing any fragment
+//! loses the whole packet.
 //!
 //! Delivery is unreliable and unordered: packets may be lost, duplicated or reordered.
 //! A lost or malformed datagram does not affect the framing of other packets. Serializers
@@ -351,9 +354,6 @@ impl ReadStream for UdpClientReadHalf {
                 .recv(&mut self.buffer)
                 .await
                 .map_err(ReceiveError::Io)?;
-            if len == 0 {
-                continue;
-            }
             if let Some(packet) = decode_datagram(
                 &self.buffer[..len],
                 &*serializer,
