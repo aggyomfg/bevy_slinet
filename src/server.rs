@@ -58,11 +58,15 @@ pub struct ServerPlugin<Config: ServerConfig> {
 
 impl<Config: ServerConfig> Plugin for ServerPlugin<Config> {
     fn build(&self, app: &mut App) {
+        #[cfg(feature = "protocol_udp")]
+        let idle_timeout = crate::protocols::udp::idle_timeout_receiver(app);
+        #[cfg(not(feature = "protocol_udp"))]
+        let idle_timeout = tokio::sync::watch::channel(std::time::Duration::MAX).1;
         app.insert_resource(ServerConnections::<Config>::new())
             .add_systems(
                 Startup,
                 (
-                    create_setup_system::<Config>(self.address),
+                    create_setup_system::<Config>(self.address, idle_timeout),
                     max_packet_size_warning_system.in_set(SystemSets::MaxPacketSizeWarning),
                 ),
             )
@@ -84,9 +88,6 @@ impl<Config: ServerConfig> Plugin for ServerPlugin<Config> {
                 (remove_connections::<Config>.in_set(SystemSets::ServerRemoveConnections),),
             )
             .add_observer(connection_add_system::<Config>);
-        #[cfg(feature = "protocol_udp")]
-        app.init_resource::<crate::protocols::udp::IdleTimeoutSettings>()
-            .add_systems(Update, crate::protocols::udp::set_idle_timeout_system);
     }
 }
 
@@ -126,11 +127,14 @@ struct PacketReceiver<Config: ServerConfig>(
     UnboundedReceiver<(ServerConnection<Config>, Config::ClientPacket, Instant)>,
 );
 
-fn create_setup_system<Config: ServerConfig>(address: SocketAddr) -> impl Fn(Commands, &World) {
+fn create_setup_system<Config: ServerConfig>(
+    address: SocketAddr,
+    idle_timeout: tokio::sync::watch::Receiver<std::time::Duration>,
+) -> impl Fn(Commands) {
     #[cfg(target_family = "wasm")]
     compile_error!("Why would you run a bevy_slinet server on WASM? If you really need this, please open an issue (https://github.com/aggyomfg/bevy_slinet/issues/new)");
 
-    move |mut commands: Commands, _world: &World| {
+    move |mut commands: Commands| {
         let (conn_tx, conn_rx) = tokio::sync::mpsc::unbounded_channel();
         let (conn_tx2, mut conn_rx2): (
             UnboundedSender<RawServerConnection<Config>>,
@@ -143,8 +147,7 @@ fn create_setup_system<Config: ServerConfig>(address: SocketAddr) -> impl Fn(Com
         commands.insert_resource(DisconnectionReceiver::<Config>(disc_rx));
         commands.insert_resource(PacketReceiver::<Config>(pack_rx));
         let (bound_tx, bound_rx) = std::sync::mpsc::sync_channel::<SocketAddr>(1);
-        #[cfg(feature = "protocol_udp")]
-        let idle_timeout = crate::protocols::udp::idle_timeout_receiver(_world);
+        let idle_timeout = idle_timeout.clone();
 
         std::thread::spawn(move || {
             let runtime_result = tokio::runtime::Builder::new_multi_thread()
@@ -183,7 +186,6 @@ fn create_setup_system<Config: ServerConfig>(address: SocketAddr) -> impl Fn(Com
                         let serializer2 = Arc::clone(&serializer);
                         let disc_tx2_2 = disc_tx2.clone();
                         let packet_length_serializer2 = Arc::clone(&packet_length_serializer);
-                        #[cfg(feature = "protocol_udp")]
                         read.set_idle_timeout(idle_timeout.clone());
                         tokio::spawn(async move {
                             loop {
@@ -254,16 +256,17 @@ fn create_setup_system<Config: ServerConfig>(address: SocketAddr) -> impl Fn(Com
                 };
                 let _ = bound_tx.send(listener.address());
 
+                let mut warned = false;
                 loop {
                     select! {
                         Ok(connection) = listener.accept() => {
                             log::debug!("Accepting a connection from {:?}", connection.peer_addr());
                             let (conn_tx_2, conn_tx2_2) = (conn_tx.clone(), conn_tx2.clone());
+                            let serializer = Config::build_serializer();
+                            warn_if_stateful_over_datagrams::<Config::Protocol, _, _, _, _>(&serializer, &mut warned);
                             tokio::spawn(async move {
                                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                                 let disconnect_task = DisconnectTask::default();
-                                let serializer = Config::build_serializer();
-                                warn_if_stateful_over_datagrams::<Config::Protocol, _, _, _, _>(&serializer);
                                 let connection = RawConnection {
                                     disconnect_task: disconnect_task.clone(),
                                     stream: connection,

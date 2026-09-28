@@ -93,19 +93,17 @@ impl Default for IdleTimeoutSettings {
     }
 }
 
+/// Adds the systems that forward [`UdpIdleTimeout`] to this app's connections.
 #[cfg(any(feature = "client", feature = "server"))]
-pub(crate) fn idle_timeout_receiver(
-    world: &bevy::prelude::World,
-) -> tokio::sync::watch::Receiver<Duration> {
-    let settings = world.resource::<IdleTimeoutSettings>();
-    settings.0.send_replace(
-        world
-            .get_resource::<UdpIdleTimeout>()
-            .copied()
-            .unwrap_or_default()
-            .0,
-    );
-    settings.0.subscribe()
+pub(crate) fn idle_timeout_receiver(app: &mut bevy::prelude::App) -> watch::Receiver<Duration> {
+    use bevy::prelude::{Startup, Update};
+
+    if !app.world().contains_resource::<IdleTimeoutSettings>() {
+        app.init_resource::<IdleTimeoutSettings>()
+            .add_systems(Startup, set_idle_timeout_system)
+            .add_systems(Update, set_idle_timeout_system);
+    }
+    app.world().resource::<IdleTimeoutSettings>().0.subscribe()
 }
 
 #[cfg(any(feature = "client", feature = "server"))]
@@ -116,11 +114,15 @@ pub(crate) fn set_idle_timeout_system(
     let timeout = timeout.map(|timeout| *timeout).unwrap_or_default().0;
     settings.0.send_if_modified(|current| {
         if *current == timeout {
-            false
-        } else {
-            *current = timeout;
-            true
+            return false;
         }
+        if timeout <= KEEPALIVE_INTERVAL {
+            log::warn!(
+                "UdpIdleTimeout ({timeout:?}) must be longer than the keep-alive interval ({KEEPALIVE_INTERVAL:?}), otherwise idle connections close"
+            );
+        }
+        *current = timeout;
+        true
     });
 }
 
@@ -1336,21 +1338,17 @@ mod tests {
     #[cfg(any(feature = "client", feature = "server"))]
     #[test]
     fn idle_timeout_settings_are_per_app() {
-        use bevy::prelude::{App, Update};
+        use bevy::prelude::App;
 
         let mut first = App::new();
-        first
-            .init_resource::<IdleTimeoutSettings>()
-            .insert_resource(UdpIdleTimeout(Duration::MAX))
-            .add_systems(Update, set_idle_timeout_system);
-        let first_timeout = idle_timeout_receiver(first.world());
+        first.insert_resource(UdpIdleTimeout(Duration::MAX));
+        let first_timeout = idle_timeout_receiver(&mut first);
+        first.update();
         assert_eq!(*first_timeout.borrow(), Duration::MAX);
 
         let mut second = App::new();
-        second
-            .init_resource::<IdleTimeoutSettings>()
-            .add_systems(Update, set_idle_timeout_system);
-        let second_timeout = idle_timeout_receiver(second.world());
+        let second_timeout = idle_timeout_receiver(&mut second);
+        second.update();
         assert_eq!(*second_timeout.borrow(), UdpIdleTimeout::default().0);
 
         second.insert_resource(UdpIdleTimeout(Duration::from_secs(3)));

@@ -255,6 +255,7 @@ pub(crate) fn set_max_packet_size_system(
     }
 }
 
+/// Warns once per `warned` flag, which callers keep per plugin.
 #[cfg(any(feature = "client", feature = "server"))]
 pub(crate) fn warn_if_stateful_over_datagrams<P, ReceivingPacket, SendingPacket, EncErr, DecErr>(
     serializer: &crate::serializer::SerializerAdapter<
@@ -263,15 +264,15 @@ pub(crate) fn warn_if_stateful_over_datagrams<P, ReceivingPacket, SendingPacket,
         EncErr,
         DecErr,
     >,
+    warned: &mut bool,
 ) where
     P: crate::protocol::Protocol,
     EncErr: Error + Send + Sync,
     DecErr: Error + Send + Sync,
 {
-    static WARNED: AtomicBool = AtomicBool::new(false);
     if P::DATAGRAM
         && matches!(serializer, crate::serializer::SerializerAdapter::Mutable(_))
-        && !WARNED.swap(true, Ordering::Relaxed)
+        && !std::mem::replace(warned, true)
     {
         bevy::log::warn!("A mutable serializer is used with a datagram protocol. Stateful serializers desynchronize when packets are lost or reordered.");
     }

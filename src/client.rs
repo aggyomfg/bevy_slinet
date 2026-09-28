@@ -69,6 +69,10 @@ struct AddInitialConnectionRequestEventLabel;
 impl<Config: ClientConfig> Plugin for ClientPlugin<Config> {
     fn build(&self, app: &mut App) {
         let address = self.address;
+        #[cfg(feature = "protocol_udp")]
+        let idle_timeout = crate::protocols::udp::idle_timeout_receiver(app);
+        #[cfg(not(feature = "protocol_udp"))]
+        let idle_timeout = tokio::sync::watch::channel(std::time::Duration::MAX).1;
 
         app.insert_resource(ClientConnections::<Config>::new())
             .add_systems(
@@ -94,7 +98,8 @@ impl<Config: ClientConfig> Plugin for ClientPlugin<Config> {
             .add_systems(
                 Startup,
                 (
-                    setup_system::<Config>.before(AddInitialConnectionRequestEventLabel),
+                    create_setup_system::<Config>(idle_timeout)
+                        .before(AddInitialConnectionRequestEventLabel),
                     (move |mut commands: Commands| {
                         if let Some(address) = address {
                             commands.trigger(ConnectionRequestEvent::<Config>::new(address));
@@ -103,9 +108,6 @@ impl<Config: ClientConfig> Plugin for ClientPlugin<Config> {
                     .in_set(AddInitialConnectionRequestEventLabel),
                 ),
             );
-        #[cfg(feature = "protocol_udp")]
-        app.init_resource::<crate::protocols::udp::IdleTimeoutSettings>()
-            .add_systems(Update, crate::protocols::udp::set_idle_timeout_system);
     }
 }
 
@@ -198,7 +200,16 @@ struct PacketReceiver<Config: ClientConfig>(
     UnboundedReceiver<(ClientConnection<Config>, Config::ServerPacket, Instant)>,
 );
 
-fn setup_system<Config: ClientConfig>(mut commands: Commands, _world: &World) {
+fn create_setup_system<Config: ClientConfig>(
+    idle_timeout: tokio::sync::watch::Receiver<std::time::Duration>,
+) -> impl Fn(Commands) {
+    move |commands| setup_system::<Config>(commands, idle_timeout.clone())
+}
+
+fn setup_system<Config: ClientConfig>(
+    mut commands: Commands,
+    idle_timeout: tokio::sync::watch::Receiver<std::time::Duration>,
+) {
     let (req_tx, mut req_rx) = tokio::sync::mpsc::unbounded_channel();
     commands.insert_resource(ConnectionRequestSender::<Config>(req_tx, PhantomData));
 
@@ -214,10 +225,14 @@ fn setup_system<Config: ClientConfig>(mut commands: Commands, _world: &World) {
     // Connection
     let disc_tx2 = disc_tx.clone();
     run_async(async move {
+        let mut warned = false;
         while let Some(address) = req_rx.recv().await {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let serializer = Config::build_serializer();
-            warn_if_stateful_over_datagrams::<Config::Protocol, _, _, _, _>(&serializer);
+            warn_if_stateful_over_datagrams::<Config::Protocol, _, _, _, _>(
+                &serializer,
+                &mut warned,
+            );
             match create_connection::<Config>(
                 address,
                 Arc::new(serializer),
@@ -253,8 +268,6 @@ fn setup_system<Config: ClientConfig>(mut commands: Commands, _world: &World) {
         }
     });
 
-    #[cfg(feature = "protocol_udp")]
-    let idle_timeout = crate::protocols::udp::idle_timeout_receiver(_world);
     run_async(async move {
         while let Some((connection, ecs_conn)) = conn_rx2.recv().await {
             let RawConnection {
@@ -279,7 +292,6 @@ fn setup_system<Config: ClientConfig>(mut commands: Commands, _world: &World) {
                 }
             };
 
-            #[cfg(feature = "protocol_udp")]
             read.set_idle_timeout(idle_timeout.clone());
             tokio::spawn(async move {
                 loop {
