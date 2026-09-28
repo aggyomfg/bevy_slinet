@@ -7,12 +7,18 @@
 //! Use [`ConfiguredUdpProtocol`] with [`UdpConfig`] for transport limits and [`UdpIdleTimeout`]
 //! for app-local liveness. Both endpoints must use the same wire version.
 
+mod diagnostics;
 mod handshake;
 mod listener;
+mod pacing;
 mod session;
 mod settings;
 mod stream;
 mod wire;
+
+#[cfg(any(feature = "client", feature = "server"))]
+pub(crate) use diagnostics::UdpDropReason;
+pub use diagnostics::{UdpConnectionHandle, UdpStatsSnapshot};
 
 pub use listener::UdpNetworkListener;
 pub use settings::{
@@ -31,3 +37,8 @@ pub(crate) use settings::IdleTimeoutSettings;
 pub(crate) mod test_support;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod data_tests;
+#[cfg(test)]
+mod handshake_tests;

@@ -1,6 +1,6 @@
 use super::wire::HEADER;
 use super::{ConfiguredUdpClientStream, UdpNetworkListener, UdpServerStream};
-use crate::Protocol;
+use crate::{connection::OverflowPolicy, Protocol};
 use async_trait::async_trait;
 use bevy::prelude::Resource;
 #[cfg(any(feature = "client", feature = "server"))]
@@ -9,6 +9,7 @@ use std::{
     io::{self, ErrorKind},
     marker::PhantomData,
     net::SocketAddr,
+    num::NonZeroU64,
     time::Duration,
 };
 #[cfg(any(feature = "client", feature = "server"))]
@@ -20,35 +21,73 @@ pub(super) const BUFFER_SIZE: usize = u16::MAX as usize;
 pub const MAX_DATAGRAM_SIZE: usize = 65_507;
 /// Default heartbeat interval.
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
-/// Retry interval for both handshake legs.
-pub const PROBE_INTERVAL: Duration = Duration::from_millis(250);
+/// Default initial retry interval for each handshake leg.
+pub const PROBE_INTERVAL: Duration = Duration::from_secs(1);
 /// Total timeout for the cookie handshake.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) const DISCONNECT_REPEATS: usize = 3;
 pub(super) const MAX_QUEUED_DATAGRAMS: usize = 1024;
 pub(super) const MAX_QUEUED_BYTES: usize = 1 << 20;
 
-/// UDP admission, outgoing packet size and heartbeat settings.
+/// UDP handshake, session traffic, pacing and raw queue settings.
 #[derive(Clone, Copy, Debug)]
 pub struct UdpOptions {
     /// Maximum registered peers, including accepted streams waiting to be split.
     pub max_peers: usize,
     /// Maximum HELLO/CONFIRM packets handled per second, shared by all addresses.
     pub max_handshake_packets_per_second: usize,
+    /// Maximum address replay watermarks retained until their cookies expire.
+    pub max_replay_entries: usize,
     /// Maximum outgoing data datagram size, including the 37-byte session header.
     /// Configure this for the path MTU; it does not perform PMTU discovery.
     pub max_datagram_size: usize,
+    /// Absolute deadline for both client handshake legs.
+    pub connect_timeout: Duration,
+    /// Delay before the first retry of each handshake leg.
+    pub initial_retry_interval: Duration,
+    /// Maximum base delay between handshake retries.
+    pub max_retry_interval: Duration,
+    /// Additional random delay in [0, `retry_jitter`] for each retry.
+    pub retry_jitter: Duration,
+    /// Maximum count of queued raw datagrams per accepted peer.
+    pub receive_queue_capacity: usize,
+    /// Maximum combined bytes in the raw datagram queue per accepted peer.
+    pub receive_queue_bytes: usize,
+    /// Overflow behavior for the raw datagram queue.
+    pub receive_queue_overflow: OverflowPolicy,
+    /// Optional byte rate limit for outgoing UDP data datagrams.
+    pub send_rate: Option<NonZeroU64>,
     /// Heartbeat interval while no application data is being sent.
     pub heartbeat_interval: Duration,
     /// Additional random delay in [0, `heartbeat_jitter`] for each heartbeat tick.
     pub heartbeat_jitter: Duration,
 }
 impl UdpOptions {
+    /// Maximum application payload that fits in a configured datagram.
+    /// Returns `None` when the datagram size is outside the supported range.
+    #[must_use]
+    pub const fn max_payload_size(self) -> Option<usize> {
+        if self.max_datagram_size < HEADER || self.max_datagram_size > MAX_DATAGRAM_SIZE {
+            None
+        } else {
+            Some(self.max_datagram_size - HEADER)
+        }
+    }
+
     /// Provides a starting point for compile-time overrides in [`UdpConfig::OPTIONS`].
     pub const DEFAULT: Self = Self {
         max_peers: 1024,
         max_handshake_packets_per_second: 256,
+        max_replay_entries: 16_384,
         max_datagram_size: 1200,
+        connect_timeout: CONNECT_TIMEOUT,
+        initial_retry_interval: PROBE_INTERVAL,
+        max_retry_interval: Duration::from_secs(4),
+        retry_jitter: Duration::from_millis(100),
+        receive_queue_capacity: MAX_QUEUED_DATAGRAMS,
+        receive_queue_bytes: MAX_QUEUED_BYTES,
+        receive_queue_overflow: OverflowPolicy::DropNewest,
+        send_rate: None,
         heartbeat_interval: KEEPALIVE_INTERVAL,
         heartbeat_jitter: Duration::from_millis(100),
     };
@@ -158,8 +197,17 @@ impl ValidatedOptions {
         let delay = options
             .heartbeat_interval
             .checked_add(options.heartbeat_jitter);
+        let retry_delay = options.max_retry_interval.checked_add(options.retry_jitter);
         if !(HEADER..=MAX_DATAGRAM_SIZE).contains(&options.max_datagram_size)
             || options.max_peers > Semaphore::MAX_PERMITS
+            || options.max_replay_entries == 0
+            || options.connect_timeout.is_zero()
+            || options.initial_retry_interval.is_zero()
+            || options.max_retry_interval < options.initial_retry_interval
+            || retry_delay
+                .and_then(|value| Clock::now().checked_add(value))
+                .is_none()
+            || Clock::now().checked_add(options.connect_timeout).is_none()
             || options.heartbeat_interval.is_zero()
             || delay
                 .and_then(|value| Clock::now().checked_add(value))
@@ -167,7 +215,7 @@ impl ValidatedOptions {
         {
             return Err(io::Error::new(
                 ErrorKind::InvalidInput,
-                "invalid UDP size or heartbeat settings",
+                "invalid UDP transport settings",
             ));
         }
         Ok(Self(options))
@@ -177,6 +225,33 @@ impl ValidatedOptions {
     }
     pub(super) const fn max_handshake_packets_per_second(self) -> usize {
         self.0.max_handshake_packets_per_second
+    }
+    pub(super) const fn max_replay_entries(self) -> usize {
+        self.0.max_replay_entries
+    }
+    pub(super) const fn connect_timeout(self) -> Duration {
+        self.0.connect_timeout
+    }
+    pub(super) const fn initial_retry_interval(self) -> Duration {
+        self.0.initial_retry_interval
+    }
+    pub(super) const fn max_retry_interval(self) -> Duration {
+        self.0.max_retry_interval
+    }
+    pub(super) const fn retry_jitter(self) -> Duration {
+        self.0.retry_jitter
+    }
+    pub(super) const fn receive_queue_capacity(self) -> usize {
+        self.0.receive_queue_capacity
+    }
+    pub(super) const fn receive_queue_bytes(self) -> usize {
+        self.0.receive_queue_bytes
+    }
+    pub(super) const fn receive_queue_overflow(self) -> OverflowPolicy {
+        self.0.receive_queue_overflow
+    }
+    pub(super) const fn send_rate(self) -> Option<NonZeroU64> {
+        self.0.send_rate
     }
     pub(super) const fn max_payload_size(self) -> usize {
         self.0.max_datagram_size - HEADER

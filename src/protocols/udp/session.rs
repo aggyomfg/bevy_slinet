@@ -1,5 +1,7 @@
-use super::settings::{ValidatedOptions, DISCONNECT_REPEATS, MAX_QUEUED_BYTES};
+use super::diagnostics::{UdpConnectionHandle, UdpDropReason};
+use super::settings::{ValidatedOptions, DISCONNECT_REPEATS};
 use super::wire::{Control, Cookie, Session};
+use crate::packet_queue::LossySender;
 use bevy::platform::time::Instant;
 use std::{
     collections::HashMap,
@@ -13,7 +15,7 @@ use std::{
 };
 use tokio::{
     net::UdpSocket,
-    sync::{mpsc, OwnedSemaphorePermit},
+    sync::{mpsc::error::TrySendError, OwnedSemaphorePermit},
     time::Instant as Clock,
 };
 use tokio_util::sync::CancellationToken;
@@ -58,12 +60,10 @@ pub(super) struct SessionState {
     id: Session,
     generation: u64,
     options: ValidatedOptions,
-    queued_bytes: AtomicUsize,
+    pub(super) handle: UdpConnectionHandle,
     responses: ResponseBudget,
     last_received: Mutex<Clock>,
     last_sent: Mutex<Clock>,
-    dropped_oversized: AtomicUsize,
-    dropped_send_errors: AtomicUsize,
     closed: CancellationToken,
 }
 impl SessionState {
@@ -75,6 +75,12 @@ impl SessionState {
     }
     pub(super) const fn options(&self) -> ValidatedOptions {
         self.options
+    }
+    pub(super) fn handle(&self) -> UdpConnectionHandle {
+        self.handle.clone()
+    }
+    pub(super) const fn closed_token(&self) -> &CancellationToken {
+        &self.closed
     }
     pub(super) fn close(&self) {
         self.closed.cancel();
@@ -97,36 +103,27 @@ impl SessionState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Clock::now();
     }
-    pub(super) fn dequeue(&self, bytes: usize) {
-        self.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
-    }
     pub(super) fn drop_oversized(&self) {
-        self.dropped_oversized.fetch_add(1, Ordering::Relaxed);
+        self.handle.count_drop(UdpDropReason::OversizedPayload);
     }
     pub(super) fn drop_send_error(&self) {
-        self.dropped_send_errors.fetch_add(1, Ordering::Relaxed);
+        self.handle.count_drop(UdpDropReason::SocketSendError);
     }
     pub(super) fn dropped_oversized(&self) -> usize {
-        self.dropped_oversized.load(Ordering::Relaxed)
+        usize::try_from(self.handle.stats().dropped_oversized_payload).unwrap_or(usize::MAX)
     }
     pub(super) fn dropped_send_errors(&self) -> usize {
-        self.dropped_send_errors.load(Ordering::Relaxed)
-    }
-    #[cfg(test)]
-    pub(super) fn queued_bytes(&self) -> usize {
-        self.queued_bytes.load(Ordering::Relaxed)
+        usize::try_from(self.handle.stats().dropped_socket_send_error).unwrap_or(usize::MAX)
     }
     pub(super) fn new(cookie: Cookie, options: ValidatedOptions) -> Arc<Self> {
         Arc::new(Self {
             id: cookie.mac,
             generation: cookie.generation,
             options,
-            queued_bytes: AtomicUsize::new(0),
+            handle: UdpConnectionHandle::new(options.max_payload_size(), options.send_rate()),
             responses: ResponseBudget::default(),
             last_received: Mutex::new(Clock::now()),
             last_sent: Mutex::new(Clock::now()),
-            dropped_oversized: AtomicUsize::new(0),
-            dropped_send_errors: AtomicUsize::new(0),
             closed: CancellationToken::new(),
         })
     }
@@ -136,6 +133,10 @@ impl SessionState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Clock::now();
         self.responses.received();
+    }
+    pub(super) fn received_datagram(&self, bytes: usize, data: bool) {
+        self.received();
+        self.handle.received(bytes, data);
     }
     fn heartbeat_due(&self) -> bool {
         self.last_sent
@@ -147,11 +148,11 @@ impl SessionState {
 }
 
 pub(super) struct Peer {
-    queue: mpsc::Sender<QueuedDatagram>,
+    queue: LossySender<QueuedDatagram>,
     state: Arc<SessionState>,
 }
 impl Peer {
-    pub(super) const fn new(queue: mpsc::Sender<QueuedDatagram>, state: Arc<SessionState>) -> Self {
+    pub(super) const fn new(queue: LossySender<QueuedDatagram>, state: Arc<SessionState>) -> Self {
         Self { queue, state }
     }
     pub(super) fn state(&self) -> &SessionState {
@@ -159,17 +160,29 @@ impl Peer {
     }
 
     pub(super) fn push(&self, bytes: &[u8], received_at: Instant) {
-        if self.state.queued_bytes.load(Ordering::Relaxed) + bytes.len() > MAX_QUEUED_BYTES {
+        if self.state.is_closed() {
+            self.state
+                .handle
+                .count_drop(UdpDropReason::ClosedBeforeDelivery);
             return;
         }
-        if let Ok(permit) = self.queue.try_reserve() {
-            self.state
-                .queued_bytes
-                .fetch_add(bytes.len(), Ordering::Relaxed);
-            permit.send(QueuedDatagram {
+        match self.queue.try_send(
+            QueuedDatagram {
                 bytes: bytes.into(),
                 received_at,
-            });
+            },
+            bytes.len(),
+        ) {
+            Ok(evicted) => {
+                for _ in evicted {
+                    self.state.handle.count_drop(UdpDropReason::RawQueueEvicted);
+                }
+            }
+            Err(TrySendError::Full(_)) => self.state.handle.count_drop(UdpDropReason::RawQueueFull),
+            Err(TrySendError::Closed(_)) => self
+                .state
+                .handle
+                .count_drop(UdpDropReason::ClosedBeforeDelivery),
         }
     }
 }
@@ -229,14 +242,20 @@ impl Heartbeat {
             state,
         }
     }
-    fn send_control(&self, control: Control) {
+    async fn send_control(&self, control: Control) {
         let bytes = control.encode(self.state.id);
-        let result = self.address.map_or_else(
-            || self.socket.try_send(&bytes),
-            |addr| self.socket.try_send_to(&bytes, addr),
-        );
-        if result.is_ok() {
+        let result = tokio::time::timeout(Duration::from_millis(250), async {
+            match self.address {
+                Some(addr) => self.socket.send_to(&bytes, addr).await,
+                None => self.socket.send(&bytes).await,
+            }
+        })
+        .await;
+        if matches!(result, Ok(Ok(sent)) if sent == bytes.len()) {
             self.state.sent();
+            self.state.handle.control_sent(bytes.len());
+        } else {
+            self.state.drop_send_error();
         }
     }
 
@@ -258,15 +277,22 @@ impl Heartbeat {
                 () = tokio::time::sleep(delay) => {
                     if !state.heartbeat_due() { continue; }
                     if self.address.is_some() && !state.responses.take_heartbeat() { continue; }
-                    self.send_control(Control::Keepalive);
+                    tokio::select! {
+                        biased;
+                        () = state.cancelled() => break,
+                        () = self.send_control(Control::Keepalive) => {}
+                    }
                 }
             }
         }
-        for _ in 0..DISCONNECT_REPEATS {
+        let disconnect_started = Clock::now();
+        for attempt in 0..DISCONNECT_REPEATS {
+            tokio::time::sleep_until(disconnect_started + Duration::from_secs(attempt as u64))
+                .await;
             if self.address.is_some() && !state.responses.take() {
                 break;
             }
-            self.send_control(Control::Disconnect);
+            self.send_control(Control::Disconnect).await;
         }
     }
 }

@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
+use crate::connection::ReceiveLimits;
 use crate::protocols::protocol::{
     ClientStream, FramedReader, Listener, NetworkStream, Protocol, ReadStream, ReceiveError,
     ServerStream, WriteStream,
@@ -90,6 +91,7 @@ impl ReadStream for OwnedReadHalf {
         &mut self,
         serializer: Arc<S>,
         length_serializer: &LS,
+        limits: &ReceiveLimits,
     ) -> Result<(ReceivingPacket, Instant), ReceiveError<S::DecodeError, LS>>
     where
         ReceivingPacket: Send + Sync + Debug + 'static,
@@ -98,7 +100,7 @@ impl ReadStream for OwnedReadHalf {
         LS: PacketLengthSerializer,
     {
         FramedReader::new(self)
-            .receive(serializer, length_serializer)
+            .receive(serializer, length_serializer, limits)
             .await
     }
 }

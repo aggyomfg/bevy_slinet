@@ -9,12 +9,11 @@ use std::error::Error;
 use std::fmt::{Debug, Formatter};
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::connection::MAX_PACKET_SIZE;
+use crate::connection::ReceiveLimits;
 use crate::serializers::packet_length_serializer::PacketLengthDeserializationError;
 use crate::serializers::serializer::Serializer;
 use crate::PacketLengthSerializer;
@@ -88,6 +87,12 @@ pub trait NetworkStream: Send + Sync + 'static {
 
     /// Returns the socket address of the local endpoint.
     fn local_addr(&self) -> SocketAddr;
+
+    /// Returns shared UDP diagnostics and pacing controls, when supported.
+    #[cfg(feature = "protocol_udp")]
+    fn udp(&self) -> Option<crate::protocols::udp::UdpConnectionHandle> {
+        None
+    }
 }
 
 /// A readable stream.
@@ -106,10 +111,12 @@ pub trait ReadStream: Send + Sync + 'static {
     /// Reads a single packet from this stream.
     ///
     /// The default uses length-prefixed framing; datagram transports override it.
+    /// `limits` is shared by one app and checked before allocating the packet payload.
     async fn receive<ReceivingPacket, SendingPacket, S, LS>(
         &mut self,
         serializer: Arc<S>,
         length_serializer: &LS,
+        limits: &ReceiveLimits,
     ) -> Result<ReceivingPacket, ReceiveError<S::DecodeError, LS>>
     where
         ReceivingPacket: Send + Sync + Debug + 'static,
@@ -118,7 +125,7 @@ pub trait ReadStream: Send + Sync + 'static {
         LS: PacketLengthSerializer,
     {
         FramedReader::new(self)
-            .receive(serializer, length_serializer)
+            .receive(serializer, length_serializer, limits)
             .await
             .map(|(packet, _)| packet)
     }
@@ -132,6 +139,7 @@ pub trait ReadStream: Send + Sync + 'static {
         &mut self,
         serializer: Arc<S>,
         length_serializer: &LS,
+        limits: &ReceiveLimits,
     ) -> Result<(ReceivingPacket, Instant), ReceiveError<S::DecodeError, LS>>
     where
         ReceivingPacket: Send + Sync + Debug + 'static,
@@ -139,7 +147,7 @@ pub trait ReadStream: Send + Sync + 'static {
         S: Serializer<ReceivingPacket, SendingPacket> + ?Sized,
         LS: PacketLengthSerializer,
     {
-        let packet = self.receive(serializer, length_serializer).await?;
+        let packet = self.receive(serializer, length_serializer, limits).await?;
         Ok((packet, Instant::now()))
     }
 }
@@ -155,6 +163,7 @@ impl<'a, R: ReadStream + ?Sized> FramedReader<'a, R> {
         mut self,
         serializer: Arc<S>,
         length_serializer: &LS,
+        limits: &ReceiveLimits,
     ) -> Result<(ReceivingPacket, Instant), ReceiveError<S::DecodeError, LS>>
     where
         ReceivingPacket: Send + Sync + Debug + 'static,
@@ -163,7 +172,7 @@ impl<'a, R: ReadStream + ?Sized> FramedReader<'a, R> {
         LS: PacketLengthSerializer,
     {
         let length = self.read_length(length_serializer).await?;
-        if length > MAX_PACKET_SIZE.load(Ordering::Relaxed) {
+        if length > limits.max_packet_size() {
             return Err(ReceiveError::PacketTooBig);
         }
 
@@ -228,7 +237,7 @@ where
     /// Stops framing because the prefix cannot be decoded.
     #[error("Failed to decode packet length: {0}")]
     LengthDeserialization(#[source] LS::Error),
-    /// Exceeds the process-wide [`MaxPacketSize`](crate::connection::MaxPacketSize).
+    /// Exceeds the app-local [`MaxPacketSize`](crate::connection::MaxPacketSize).
     #[error("Packet exceeds the configured size limit")]
     PacketTooBig,
     /// Reports a failed connection attempt before packet reception starts.
@@ -356,12 +365,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn receive_limits_are_independent_and_checked_before_payload_allocation() {
+        let narrow = ReceiveLimits::new(1);
+        let wide = ReceiveLimits::new(2);
+        let serializer = Arc::new(DecodeTime::default());
+        let mut rejected = BufferedRead(io::Cursor::new(vec![2, 7, 8]));
+        let error = rejected
+            .receive(Arc::clone(&serializer), &ExtendedLength, &narrow)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ReceiveError::PacketTooBig));
+        assert_eq!(rejected.0.position(), 1);
+        let mut allowed = BufferedRead(io::Cursor::new(vec![2, 7, 8, 1, 9]));
+        assert_eq!(
+            allowed
+                .receive(Arc::clone(&serializer), &ExtendedLength, &wide)
+                .await
+                .unwrap(),
+            vec![7, 8]
+        );
+        wide.set_max_packet_size(0);
+        let error = allowed
+            .receive(serializer, &ExtendedLength, &wide)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ReceiveError::PacketTooBig));
+        assert_eq!(allowed.0.position(), 4);
+        assert_eq!(narrow.max_packet_size(), 1);
+    }
+
+    #[tokio::test]
     async fn variable_prefixes_preserve_packet_boundaries() {
         let mut read = BufferedRead(io::Cursor::new(vec![255, 2, 0, 7, 8, 0, 1, 9]));
         let serializer = Arc::new(DecodeTime::default());
         for expected in [vec![7, 8], vec![], vec![9]] {
             let packet = read
-                .receive(Arc::clone(&serializer), &ExtendedLength)
+                .receive(
+                    Arc::clone(&serializer),
+                    &ExtendedLength,
+                    &ReceiveLimits::default(),
+                )
                 .await
                 .unwrap();
             assert_eq!(packet, expected);
@@ -373,7 +416,11 @@ mod tests {
     async fn incomplete_extended_prefix_reports_transport_error() {
         let mut read = BufferedRead(io::Cursor::new(vec![255, 2]));
         let error = read
-            .receive(Arc::new(DecodeTime::default()), &ExtendedLength)
+            .receive(
+                Arc::new(DecodeTime::default()),
+                &ExtendedLength,
+                &ReceiveLimits::default(),
+            )
             .await
             .unwrap_err();
         assert!(
@@ -396,7 +443,11 @@ mod tests {
                     .await
                     .unwrap();
                 let (packet, received_at) = read
-                    .receive_with_timestamp(Arc::clone(&serializer), &length)
+                    .receive_with_timestamp(
+                        Arc::clone(&serializer),
+                        &length,
+                        &ReceiveLimits::default(),
+                    )
                     .await
                     .unwrap();
                 assert_eq!(packet, payload);
@@ -418,6 +469,48 @@ mod tests {
         })
         .await
         .expect("timestamp test timed out");
+    }
+
+    #[cfg(feature = "protocol_tcp")]
+    #[tokio::test]
+    async fn tcp_receive_limit_rejects_header_without_waiting_for_payload() {
+        use crate::protocols::tcp::TcpProtocol;
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let listener = TcpProtocol::bind(([127, 0, 0, 1], 0).into()).await.unwrap();
+            let (client, server) = tokio::join!(
+                TcpProtocol::connect_to_server(listener.address()),
+                listener.accept()
+            );
+            let (_, mut writer) = client.unwrap().into_split().await.unwrap();
+            let (mut reader, _server_writer) = server.unwrap().into_split().await.unwrap();
+            let limits = ReceiveLimits::new(2);
+            let serializer = Arc::new(DecodeTime::default());
+            let lengths = LittleEndian::<u32>::default();
+            writer
+                .send(vec![7, 8], Arc::clone(&serializer), &lengths)
+                .await
+                .unwrap();
+            assert_eq!(
+                reader
+                    .receive_with_timestamp(Arc::clone(&serializer), &lengths, &limits)
+                    .await
+                    .unwrap()
+                    .0,
+                vec![7, 8]
+            );
+            limits.set_max_packet_size(1);
+            *serializer.0.lock().unwrap() = None;
+            writer.write_all(&2u32.to_le_bytes()).await.unwrap();
+            let error = reader
+                .receive_with_timestamp(Arc::clone(&serializer), &lengths, &limits)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ReceiveError::PacketTooBig));
+            assert!(serializer.0.lock().unwrap().is_none());
+        })
+        .await
+        .expect("TCP receive-limit test timed out");
     }
 
     #[cfg(feature = "protocol_tcp")]
@@ -446,6 +539,7 @@ mod tests {
                 &mut self,
                 serializer: Arc<S>,
                 _length_serializer: &LS,
+                _limits: &ReceiveLimits,
             ) -> Result<ReceivingPacket, ReceiveError<S::DecodeError, LS>>
             where
                 ReceivingPacket: Send + Sync + Debug + 'static,
@@ -461,7 +555,11 @@ mod tests {
 
         let serializer = Arc::new(DecodeTime::default());
         let (packet, received_at) = CustomRead
-            .receive_with_timestamp(Arc::clone(&serializer), &LittleEndian::<u32>::default())
+            .receive_with_timestamp(
+                Arc::clone(&serializer),
+                &LittleEndian::<u32>::default(),
+                &ReceiveLimits::default(),
+            )
             .await
             .unwrap();
         assert_eq!(packet, vec![7]);

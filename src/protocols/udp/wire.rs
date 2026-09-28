@@ -1,7 +1,7 @@
 //! SLN2 encoding and stateless, address-bound handshake cookies.
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use tokio::time::Instant;
 
 const MAGIC: &[u8; 4] = b"SLN2";
@@ -230,7 +230,7 @@ impl HandshakeFrame {
 pub(super) struct CookieJar {
     key: [u8; 32],
     started: Instant,
-    generation: AtomicU64,
+    generation: Mutex<u64>,
 }
 
 impl CookieJar {
@@ -238,12 +238,17 @@ impl CookieJar {
         Ok(Self {
             key: RandomBytes::generate()?,
             started: Instant::now(),
-            generation: AtomicU64::new(1),
+            generation: Mutex::new(1),
         })
     }
 
     fn epoch(&self) -> u64 {
         self.started.elapsed().as_secs() / 30
+    }
+
+    pub(super) fn epoch_is_live(&self, issued_epoch: u64) -> bool {
+        let current = self.epoch();
+        issued_epoch <= current && current - issued_epoch <= 1
     }
 
     fn sign(&self, address: SocketAddr, cookie: &Cookie) -> blake3::Hash {
@@ -267,20 +272,28 @@ impl CookieJar {
     }
 
     pub fn issue(&self, address: SocketAddr, nonce: Nonce) -> Cookie {
+        // Reserve the generation and observe the epoch together. Concurrent
+        // accept calls must never issue an older generation with a later expiry:
+        // replay watermarks rely on this ordering when they expire.
+        let mut generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut cookie = Cookie {
             nonce,
             epoch: self.epoch(),
-            generation: self.generation.fetch_add(1, Ordering::Relaxed),
+            generation: *generation,
             mac: Session::from_bytes([0; 32]),
         };
+        // Exhaustion fails closed for replacements rather than wrapping backwards.
+        *generation = generation.saturating_add(1);
+        drop(generation);
         cookie.mac = Session::from_bytes(*self.sign(address, &cookie).as_bytes());
         cookie
     }
 
     pub fn verify(&self, address: SocketAddr, cookie: &Cookie) -> bool {
-        let epoch = self.epoch();
-        cookie.epoch <= epoch
-            && epoch - cookie.epoch <= 1
+        self.epoch_is_live(cookie.epoch)
             && self.sign(address, cookie) == blake3::Hash::from(*cookie.mac.as_bytes())
     }
 }

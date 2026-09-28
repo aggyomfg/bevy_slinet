@@ -12,6 +12,8 @@ use serializers::serializer::SerializerAdapter;
 #[cfg(feature = "client")]
 pub mod client;
 pub mod connection;
+#[cfg(any(feature = "client", feature = "server", feature = "protocol_udp", test))]
+pub(crate) mod packet_queue;
 pub mod protocols;
 pub mod serializers;
 #[cfg(feature = "server")]
@@ -31,18 +33,31 @@ pub use serializers::{packet_length_serializer, serializer};
 mod tests;
 
 /// Exposes networking phases so application systems can order their work around packet events.
+///
+/// Each plugin processes establishment and removal in one FIFO system during `PreUpdate`.
+/// Its establishment and removal labels select that same system. Systems ordered around
+/// removal must therefore also run in `PreUpdate`; ordering does not cross schedules.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, SystemSet)]
-#[allow(missing_docs)]
 pub enum SystemSets {
+    /// Publishes client packet events during `PostUpdate`.
     ClientPacketReceive,
+    /// Processes client establishment and closure during `PreUpdate`.
     ClientConnectionEstablish,
+    /// The same lifecycle phase as [`Self::ClientConnectionEstablish`].
     ClientConnectionRemove,
+    /// Legacy label; built-in connection requests are handled by observers.
     ClientConnectionRequest,
+    /// Legacy label; use [`Self::ServerAcceptNewConnections`] for server lifecycle events.
     ServerConnectionAdd,
+    /// Processes server establishment and closure during `PreUpdate`.
     ServerAcceptNewConnections,
+    /// Publishes server packet events after lifecycle processing during `PreUpdate`.
     ServerAcceptNewPackets,
+    /// The same lifecycle phase as [`Self::ServerAcceptNewConnections`].
     ServerRemoveConnections,
+    /// Synchronizes app-local receive limits during `Startup` and `Update`.
     SetMaxPacketSize,
+    /// Reports a missing receive-size limit during `Startup`.
     MaxPacketSizeWarning,
 }
 

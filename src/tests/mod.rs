@@ -75,6 +75,8 @@ macro_rules! test_config {
     };
 }
 
+#[cfg(feature = "protocol_tcp")]
+mod ecs;
 #[cfg(all(feature = "protocol_tcp", feature = "serializer_bitcode"))]
 mod mut_serializer;
 #[cfg(feature = "protocol_tcp")]

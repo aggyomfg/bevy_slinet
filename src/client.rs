@@ -7,17 +7,19 @@ use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
 
-use bevy::ecs::system::SystemParam;
 use bevy::log;
 use bevy::platform::time::Instant;
 use bevy::prelude::*;
 use futures::StreamExt;
 use tokio::sync::mpsc::{Receiver, Sender};
 
+#[cfg(feature = "protocol_udp")]
+use crate::connection::PendingUdpPacket;
 use crate::connection::{
     ConnectionId, DisconnectTask, EcsConnection, MaxPacketSize, NetworkQueueSettings,
-    PacketForwarder, RawConnection,
+    OutgoingReceiver, OutgoingSender, PacketForwarder, RawConnection, ReceiveLimits,
 };
+use crate::packet_queue::{lossy_channel, LossyReceiver, LossySender};
 use crate::protocols::protocol::ReadStream;
 use crate::protocols::protocol::WriteStream;
 use crate::protocols::protocol::{NetworkStream, ReceiveError};
@@ -92,10 +94,15 @@ impl<Config: ClientConfig> Plugin for ClientPlugin<Config> {
         #[cfg(not(feature = "protocol_udp"))]
         let idle_timeout = tokio::sync::watch::channel(std::time::Duration::MAX).1;
 
-        app.insert_resource(ClientConnections::<Config>::new())
+        app.init_resource::<ReceiveLimits>()
+            .insert_resource(ClientConnections::<Config>::new())
             .add_systems(
                 Startup,
                 MaxPacketSize::warning_system.in_set(SystemSets::MaxPacketSizeWarning),
+            )
+            .add_systems(
+                Startup,
+                MaxPacketSize::set_system.in_set(SystemSets::SetMaxPacketSize),
             )
             .add_systems(
                 Update,
@@ -103,20 +110,20 @@ impl<Config: ClientConfig> Plugin for ClientPlugin<Config> {
             )
             .add_systems(
                 PreUpdate,
-                (connection_establish_system::<Config>
-                    .in_set(SystemSets::ClientConnectionEstablish),),
+                lifecycle_system::<Config>
+                    .in_set(SystemSets::ClientConnectionEstablish)
+                    .in_set(SystemSets::ClientConnectionRemove),
             )
             .add_systems(
                 PostUpdate,
-                (
-                    connection_remove_system::<Config>.in_set(SystemSets::ClientConnectionRemove),
-                    packet_receive_system::<Config>.in_set(SystemSets::ClientPacketReceive),
-                ),
+                packet_receive_system::<Config>.in_set(SystemSets::ClientPacketReceive),
             )
             .add_systems(
                 Startup,
                 (
-                    Self::setup_system(idle_timeout).before(AddInitialConnectionRequestEventLabel),
+                    Self::setup_system(idle_timeout)
+                        .after(SystemSets::SetMaxPacketSize)
+                        .before(AddInitialConnectionRequestEventLabel),
                     (move |mut commands: Commands| {
                         if let Some(address) = address {
                             commands.trigger(ConnectionRequestEvent::<Config>::new(address));
@@ -207,13 +214,17 @@ impl<Config: ClientConfig> Clone for ConnectionRequestEvent<Config> {
 struct ConnectionRequestSender<Config: ClientConfig>(Sender<SocketAddr>, PhantomData<Config>);
 
 #[derive(Resource)]
-struct ConnectionReceiver<Config: ClientConfig>(Receiver<ConnectionEstablishEvent<Config>>);
+struct LifecycleReceiver<Config: ClientConfig>(Receiver<ClientLifecycle<Config>>);
+
+enum ClientLifecycle<Config: ClientConfig> {
+    Established(ConnectionEstablishEvent<Config>),
+    Closed(ConnectionClosed<Config>),
+}
 
 #[derive(Resource)]
-struct DisconnectionReceiver<Config: ClientConfig>(Receiver<ConnectionClosed<Config>>);
-
-#[derive(Resource)]
-struct PacketReceiver<Config: ClientConfig>(Receiver<PacketReceiveEvent<Config>>);
+struct PacketReceiver<Config: ClientConfig> {
+    receiver: LossyReceiver<PacketReceiveEvent<Config>>,
+}
 
 struct ConnectionClosed<Config: ClientConfig> {
     event: DisconnectionEvent<Config>,
@@ -230,6 +241,7 @@ impl<Config: ClientConfig> ConnectionClosed<Config> {
             event: DisconnectionEvent {
                 error,
                 address,
+                connection_id: id,
                 _marker: PhantomData,
             },
             id,
@@ -244,19 +256,20 @@ struct ConnectedTransport<Config: ClientConfig> {
 
 struct ConnectionAttempt<Config: ClientConfig> {
     address: SocketAddr,
-    packets: Sender<Config::ClientPacket>,
+    packets: OutgoingSender<Config::ClientPacket>,
     result: io::Result<RawClientConnection<Config>>,
 }
 
 impl<Config: ClientConfig> ClientPlugin<Config> {
     fn setup_system(
         idle_timeout: tokio::sync::watch::Receiver<std::time::Duration>,
-    ) -> impl Fn(Commands, Option<Res<NetworkQueueSettings>>) {
-        move |commands, queues| {
+    ) -> impl Fn(Commands, Option<Res<NetworkQueueSettings>>, Res<ReceiveLimits>) {
+        move |commands, queues, limits: Res<ReceiveLimits>| {
             Self::setup(
                 commands,
                 idle_timeout.clone(),
                 queues.as_deref().copied().unwrap_or_default(),
+                limits.clone(),
             );
         }
     }
@@ -265,30 +278,33 @@ impl<Config: ClientConfig> ClientPlugin<Config> {
         mut commands: Commands,
         idle_timeout: tokio::sync::watch::Receiver<std::time::Duration>,
         queues: NetworkQueueSettings,
+        limits: ReceiveLimits,
     ) {
         let (req_tx, req_rx) = queues.incoming_channel();
         commands.insert_resource(ConnectionRequestSender::<Config>(req_tx, PhantomData));
 
-        let (conn_tx, conn_rx) = queues.incoming_channel();
+        let (lifecycle_tx, lifecycle_rx) = queues.incoming_channel();
         let (connection_sender, incoming_connections) = queues.incoming_channel();
-        let (disc_tx, disc_rx) = queues.incoming_channel();
-        let (pack_tx, pack_rx) = queues.incoming_channel();
-        commands.insert_resource(ConnectionReceiver::<Config>(conn_rx));
-        commands.insert_resource(DisconnectionReceiver::<Config>(disc_rx));
-        commands.insert_resource(PacketReceiver::<Config>(pack_rx));
+        let (pack_tx, pack_rx) = lossy_channel(
+            queues.receive_capacity.max(1),
+            usize::MAX,
+            queues.udp_receive_overflow,
+        );
+        commands.insert_resource(LifecycleReceiver::<Config>(lifecycle_rx));
+        commands.insert_resource(PacketReceiver::<Config> { receiver: pack_rx });
         commands.add_observer(ConnectionRequestSender::<Config>::observe);
 
         Self::run_async(Self::process_connection_requests(
             req_rx,
             queues,
-            conn_tx,
+            limits,
+            lifecycle_tx.clone(),
             connection_sender,
-            disc_tx.clone(),
         ));
         Self::run_async(Self::process_connections(
             incoming_connections,
             pack_tx,
-            disc_tx,
+            lifecycle_tx,
             idle_timeout,
         ));
     }
@@ -296,9 +312,9 @@ impl<Config: ClientConfig> ClientPlugin<Config> {
     async fn process_connection_requests(
         req_rx: Receiver<SocketAddr>,
         queues: NetworkQueueSettings,
-        conn_tx: Sender<ConnectionEstablishEvent<Config>>,
+        limits: ReceiveLimits,
+        lifecycle: Sender<ClientLifecycle<Config>>,
         connection_sender: Sender<ConnectedTransport<Config>>,
-        disconnect_sender: Sender<ConnectionClosed<Config>>,
     ) {
         let mut warned = false;
         // Bound in-flight handshakes while allowing other endpoints to connect.
@@ -307,7 +323,8 @@ impl<Config: ClientConfig> ClientPlugin<Config> {
         });
         let connections = requests
             .map(|address| {
-                let (tx, rx) = queues.outgoing_channel();
+                let (tx, rx) = queues.outgoing_channel(Config::Protocol::DATAGRAM);
+                let limits = limits.clone();
                 let serializer = Config::build_serializer();
                 serializer.warn_if_stateful_over_datagrams::<Config::Protocol>(&mut warned);
                 async move {
@@ -316,6 +333,7 @@ impl<Config: ClientConfig> ClientPlugin<Config> {
                         Arc::new(serializer),
                         Config::LengthSerializer::default(),
                         rx,
+                        limits,
                     )
                     .await;
                     ConnectionAttempt::<Config> {
@@ -328,10 +346,7 @@ impl<Config: ClientConfig> ClientPlugin<Config> {
             .buffer_unordered(8);
         futures::pin_mut!(connections);
         while let Some(attempt) = connections.next().await {
-            if !attempt
-                .publish(&conn_tx, &connection_sender, &disconnect_sender)
-                .await
-            {
+            if !attempt.publish(&lifecycle, &connection_sender).await {
                 return;
             }
         }
@@ -339,17 +354,13 @@ impl<Config: ClientConfig> ClientPlugin<Config> {
 
     async fn process_connections(
         mut incoming_connections: Receiver<ConnectedTransport<Config>>,
-        packets: Sender<PacketReceiveEvent<Config>>,
-        disconnections: Sender<ConnectionClosed<Config>>,
+        packets: LossySender<PacketReceiveEvent<Config>>,
+        lifecycle: Sender<ClientLifecycle<Config>>,
         idle_timeout: tokio::sync::watch::Receiver<std::time::Duration>,
     ) {
         while let Some(connection) = incoming_connections.recv().await {
             connection
-                .run(
-                    packets.clone(),
-                    disconnections.clone(),
-                    idle_timeout.clone(),
-                )
+                .run(packets.clone(), lifecycle.clone(), idle_timeout.clone())
                 .await;
         }
     }
@@ -358,13 +369,15 @@ impl<Config: ClientConfig> ClientPlugin<Config> {
         addr: SocketAddr,
         serializer: Arc<ClientSerializer<Config>>,
         packet_length_serializer: Config::LengthSerializer,
-        packet_rx: Receiver<Config::ClientPacket>,
+        packet_rx: OutgoingReceiver<Config::ClientPacket>,
+        limits: ReceiveLimits,
     ) -> io::Result<RawClientConnection<Config>> {
-        Ok(RawConnection::new(
+        Ok(RawConnection::with_limits(
             Config::Protocol::connect_to_server(addr).await?,
             serializer,
             packet_length_serializer,
             packet_rx,
+            limits,
         ))
     }
 }
@@ -373,9 +386,8 @@ impl<Config: ClientConfig> ConnectionAttempt<Config> {
     /// Returns false when the establishment receiver has closed and requests must stop.
     async fn publish(
         self,
-        conn_tx: &Sender<ConnectionEstablishEvent<Config>>,
+        lifecycle: &Sender<ClientLifecycle<Config>>,
         connection_sender: &Sender<ConnectedTransport<Config>>,
-        disconnect_sender: &Sender<ConnectionClosed<Config>>,
     ) -> bool {
         let Self {
             address,
@@ -384,18 +396,29 @@ impl<Config: ClientConfig> ConnectionAttempt<Config> {
         } = self;
         match result {
             Ok(connection) => {
+                #[cfg(feature = "protocol_udp")]
+                let mut connection = connection;
+                #[cfg(feature = "protocol_udp")]
+                let udp = connection.stream.udp();
+                #[cfg(feature = "protocol_udp")]
+                connection.packets_rx.set_udp_handle(udp.clone());
                 let ecs_conn = EcsConnection {
+                    #[cfg(feature = "protocol_udp")]
+                    udp,
                     disconnect_task: connection.disconnect_task.clone(),
                     id: connection.id(),
+                    published: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     packet_tx: packets,
                     local_addr: connection.local_addr(),
                     peer_addr: connection.peer_addr(),
                 };
-                if let Err(err) = conn_tx
-                    .send(ConnectionEstablishEvent::<Config> {
+                if let Err(err) = lifecycle
+                    .send(ClientLifecycle::Established(ConnectionEstablishEvent::<
+                        Config,
+                    > {
                         address,
                         connection: ecs_conn.clone(),
-                    })
+                    }))
                     .await
                 {
                     log::error!("Failed to send connection establishment: {err:?}");
@@ -413,12 +436,12 @@ impl<Config: ClientConfig> ConnectionAttempt<Config> {
             }
             Err(err) => {
                 log::warn!("Couldn't connect to server: {err:?}");
-                if let Err(send_err) = disconnect_sender
-                    .send(ConnectionClosed::<Config>::new(
+                if let Err(send_err) = lifecycle
+                    .send(ClientLifecycle::Closed(ConnectionClosed::<Config>::new(
                         ReceiveError::NoConnection(err),
                         address,
                         None,
-                    ))
+                    )))
                     .await
                 {
                     log::error!("Failed to send disconnection event: {send_err:?}");
@@ -432,8 +455,8 @@ impl<Config: ClientConfig> ConnectionAttempt<Config> {
 impl<Config: ClientConfig> ConnectedTransport<Config> {
     async fn run(
         self,
-        packets: Sender<PacketReceiveEvent<Config>>,
-        disconnections: Sender<ConnectionClosed<Config>>,
+        packets: LossySender<PacketReceiveEvent<Config>>,
+        lifecycle: Sender<ClientLifecycle<Config>>,
         idle_timeout: tokio::sync::watch::Receiver<std::time::Duration>,
     ) {
         let RawConnection {
@@ -442,6 +465,7 @@ impl<Config: ClientConfig> ConnectedTransport<Config> {
             serializer,
             packet_length_serializer,
             packets_rx,
+            receive_limits,
             id,
         } = self.connection;
         let peer_addr = stream.peer_addr();
@@ -449,18 +473,29 @@ impl<Config: ClientConfig> ConnectedTransport<Config> {
             Ok(split) => split,
             Err(err) => {
                 log::error!("({:?}) Couldn't split stream: {}", id, err);
+                self.ecs_connection.disconnect_task.cancel();
+                let _ = lifecycle
+                    .send(ClientLifecycle::Closed(ConnectionClosed::new(
+                        ReceiveError::Io(err),
+                        peer_addr,
+                        Some(id),
+                    )))
+                    .await;
                 return;
             }
         };
         read.set_idle_timeout(idle_timeout);
+        #[cfg(feature = "protocol_udp")]
+        let udp = self.ecs_connection.udp();
         tokio::spawn(Self::receive_packets(
             read,
             self.ecs_connection,
             Arc::clone(&serializer),
             Arc::clone(&packet_length_serializer),
             packets,
-            disconnections,
+            lifecycle,
             peer_addr,
+            receive_limits,
         ));
         tokio::spawn(Self::send_packets(
             write,
@@ -469,28 +504,40 @@ impl<Config: ClientConfig> ConnectedTransport<Config> {
             packet_length_serializer,
             disconnect_task,
             id,
+            #[cfg(feature = "protocol_udp")]
+            udp,
         ));
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Receive task needs transport, queue and lifecycle endpoints"
+    )]
     async fn receive_packets(
         mut read: impl ReadStream,
         ecs_conn: ClientConnection<Config>,
         serializer: Arc<ClientSerializer<Config>>,
         packet_length_serializer: Arc<Config::LengthSerializer>,
-        packets: Sender<PacketReceiveEvent<Config>>,
-        disconnect_sender: Sender<ConnectionClosed<Config>>,
+        packets: LossySender<PacketReceiveEvent<Config>>,
+        lifecycle: Sender<ClientLifecycle<Config>>,
         peer_addr: SocketAddr,
+        receive_limits: ReceiveLimits,
     ) {
         let disconnect_task = &ecs_conn.disconnect_task;
         let id = ecs_conn.id();
         let _guard = disconnect_task.clone().drop_guard();
-        let packets =
-            PacketForwarder::new(packets, Config::Protocol::DATAGRAM, disconnect_task.clone());
+        let packets = PacketForwarder::new(
+            packets,
+            Config::Protocol::DATAGRAM,
+            disconnect_task.clone(),
+            #[cfg(feature = "protocol_udp")]
+            ecs_conn.udp.clone(),
+        );
         let error = loop {
             tokio::select! {
                 biased;
                 () = disconnect_task.cancelled() => break ReceiveError::IntentionalDisconnection,
-                result = read.receive_with_timestamp(Arc::clone(&serializer), &*packet_length_serializer) => {
+                result = read.receive_with_timestamp(Arc::clone(&serializer), &*packet_length_serializer, &receive_limits) => {
                     match result {
                         Ok((packet, received_at)) => {
                             log::trace!("({id:?}) Received packet {packet:?}");
@@ -498,6 +545,13 @@ impl<Config: ClientConfig> ConnectedTransport<Config> {
                                 connection: ecs_conn.clone(),
                                 packet,
                                 received_at,
+                            }, |discarded| {
+                                #[cfg(feature = "protocol_udp")]
+                                if let Some(udp) = discarded.connection.udp() {
+                                    udp.count_drop(crate::protocols::udp::UdpDropReason::ReceiveQueueEvicted);
+                                }
+                                #[cfg(not(feature = "protocol_udp"))]
+                                drop(discarded);
                             }).await {
                                 break ReceiveError::IntentionalDisconnection;
                             }
@@ -509,8 +563,12 @@ impl<Config: ClientConfig> ConnectedTransport<Config> {
         };
         disconnect_task.cancel();
         read.close();
-        if let Err(err) = disconnect_sender
-            .send(ConnectionClosed::<Config>::new(error, peer_addr, Some(id)))
+        if let Err(err) = lifecycle
+            .send(ClientLifecycle::Closed(ConnectionClosed::<Config>::new(
+                error,
+                peer_addr,
+                Some(id),
+            )))
             .await
         {
             log::debug!("({id:?}) Disconnection receiver closed: {err:?}");
@@ -519,23 +577,31 @@ impl<Config: ClientConfig> ConnectedTransport<Config> {
 
     async fn send_packets(
         mut write: impl WriteStream,
-        mut packets_rx: Receiver<Config::ClientPacket>,
+        mut packets_rx: OutgoingReceiver<Config::ClientPacket>,
         serializer: Arc<ClientSerializer<Config>>,
         packet_length_serializer: Arc<Config::LengthSerializer>,
         disconnect_task: DisconnectTask,
         id: ConnectionId,
+        #[cfg(feature = "protocol_udp")] udp: Option<crate::protocols::udp::UdpConnectionHandle>,
     ) {
         let _guard = disconnect_task.clone().drop_guard();
         let sending = async {
             while let Some(packet) = packets_rx.recv().await {
+                #[cfg(feature = "protocol_udp")]
+                let mut pending = PendingUdpPacket::new(udp.clone());
                 if disconnect_task.is_cancelled() {
                     break;
                 }
                 log::trace!("({id:?}) Sending packet {packet:?}");
-                if let Err(err) = write
+                let result = write
                     .send(packet, Arc::clone(&serializer), &*packet_length_serializer)
-                    .await
+                    .await;
+                #[cfg(feature = "protocol_udp")]
+                if !matches!(&result, Err(err) if err.kind() == std::io::ErrorKind::ConnectionAborted)
                 {
+                    pending.disarm();
+                }
+                if let Err(err) = result {
                     log::error!("({id:?}) Error sending packet: {err}");
                     break;
                 }
@@ -561,100 +627,78 @@ impl<Config: ClientConfig> ConnectionRequestSender<Config> {
     }
 }
 
-/// Received packets and the frame budget governing their delivery to observers.
-#[derive(SystemParam)]
-struct IncomingPackets<'w, Config: ClientConfig> {
-    packets: ResMut<'w, PacketReceiver<Config>>,
-    queues: Option<Res<'w, NetworkQueueSettings>>,
-}
-
-impl<Config: ClientConfig> IncomingPackets<'_, Config> {
-    fn drain(&mut self) -> impl Iterator<Item = PacketReceiveEvent<Config>> + '_ {
-        let limit = self
-            .queues
-            .as_deref()
-            .copied()
-            .unwrap_or_default()
-            .events_per_frame;
-        let receiver = &mut self.packets.0;
-        std::iter::from_fn(move || receiver.try_recv().ok()).take(limit)
-    }
-}
-
-/// Completed connection attempts and the frame budget for registering them.
-#[derive(SystemParam)]
-struct IncomingConnections<'w, Config: ClientConfig> {
-    connections: ResMut<'w, ConnectionReceiver<Config>>,
-    queues: Option<Res<'w, NetworkQueueSettings>>,
-}
-
-impl<Config: ClientConfig> IncomingConnections<'_, Config> {
-    fn drain(&mut self) -> impl Iterator<Item = ConnectionEstablishEvent<Config>> + '_ {
-        let limit = self
-            .queues
-            .as_deref()
-            .copied()
-            .unwrap_or_default()
-            .events_per_frame;
-        let receiver = &mut self.connections.0;
-        std::iter::from_fn(move || receiver.try_recv().ok()).take(limit)
-    }
-}
-
-/// Closed connections and the frame budget for notifying observers.
-#[derive(SystemParam)]
-struct IncomingDisconnections<'w, Config: ClientConfig> {
-    disconnections: ResMut<'w, DisconnectionReceiver<Config>>,
-    queues: Option<Res<'w, NetworkQueueSettings>>,
-}
-
-impl<Config: ClientConfig> IncomingDisconnections<'_, Config> {
-    fn drain(&mut self) -> impl Iterator<Item = ConnectionClosed<Config>> + '_ {
-        let limit = self
-            .queues
-            .as_deref()
-            .copied()
-            .unwrap_or_default()
-            .events_per_frame;
-        let receiver = &mut self.disconnections.0;
-        std::iter::from_fn(move || receiver.try_recv().ok()).take(limit)
-    }
-}
-
 fn packet_receive_system<Config: ClientConfig>(
-    mut packets: IncomingPackets<Config>,
+    mut packets: ResMut<PacketReceiver<Config>>,
+    queues: Option<Res<NetworkQueueSettings>>,
     mut commands: Commands,
 ) {
-    for packet in packets.drain() {
-        commands.trigger(packet);
-    }
-}
-
-fn connection_establish_system<Config: ClientConfig>(
-    mut commands: Commands,
-    mut incoming: IncomingConnections<Config>,
-    mut connections: ResMut<ClientConnections<Config>>,
-) {
-    for event in incoming.drain() {
-        commands.insert_resource(event.connection.clone());
-        connections.register(event.connection.clone());
-        commands.trigger(event);
-    }
-}
-
-fn connection_remove_system<Config: ClientConfig>(
-    mut commands: Commands,
-    mut incoming: IncomingDisconnections<Config>,
-    mut connections: ResMut<ClientConnections<Config>>,
-) {
-    for closed in incoming.drain() {
-        if let Some(id) = closed.id {
-            commands.remove_resource::<ClientConnection<Config>>();
-            if let Some(connection) = connections.remove_connection(id) {
-                commands.insert_resource(connection);
+    let budget = queues
+        .as_deref()
+        .copied()
+        .unwrap_or_default()
+        .events_per_frame;
+    for _ in 0..budget {
+        let next = packets.receiver.try_recv_if(|packet| {
+            packet.connection.is_published()
+                || (Config::Protocol::DATAGRAM && packet.connection.disconnect_task.is_cancelled())
+        });
+        let Ok(packet) = next else { break };
+        if Config::Protocol::DATAGRAM && packet.connection.disconnect_task.is_cancelled() {
+            #[cfg(feature = "protocol_udp")]
+            if let Some(udp) = packet.connection.udp() {
+                udp.count_drop(crate::protocols::udp::UdpDropReason::ClosedBeforeDelivery);
+            }
+        } else if packet.connection.is_published() {
+            if Config::Protocol::DATAGRAM {
+                commands.queue(move |world: &mut World| {
+                    if packet.connection.disconnect_task.is_cancelled() {
+                        #[cfg(feature = "protocol_udp")]
+                        if let Some(udp) = packet.connection.udp() {
+                            udp.count_drop(
+                                crate::protocols::udp::UdpDropReason::ClosedBeforeDelivery,
+                            );
+                        }
+                    } else {
+                        world.trigger(packet);
+                    }
+                });
+            } else {
+                commands.trigger(packet);
             }
         }
-        commands.trigger(closed.event);
+    }
+}
+
+fn lifecycle_system<Config: ClientConfig>(
+    mut lifecycle: ResMut<LifecycleReceiver<Config>>,
+    mut connections: ResMut<ClientConnections<Config>>,
+    queues: Option<Res<NetworkQueueSettings>>,
+    mut commands: Commands,
+) {
+    let budget = queues
+        .as_deref()
+        .copied()
+        .unwrap_or_default()
+        .events_per_frame;
+    for _ in 0..budget {
+        match lifecycle.0.try_recv() {
+            Ok(ClientLifecycle::Established(event)) => {
+                commands.insert_resource(event.connection.clone());
+                event.connection.mark_published();
+                connections.register(event.connection.clone());
+                commands.trigger(event);
+            }
+            Ok(ClientLifecycle::Closed(closed)) => {
+                if let Some(id) = closed.id {
+                    commands.remove_resource::<ClientConnection<Config>>();
+                    if let Some(connection) = connections.remove_connection(id) {
+                        commands.insert_resource(connection);
+                    }
+                }
+                commands.trigger(closed.event);
+            }
+            Err(_) => break,
+        }
     }
 }
 
@@ -675,6 +719,8 @@ pub struct DisconnectionEvent<Config: ClientConfig> {
     pub error: ReceiveError<Config::DecodeError, Config::LengthSerializer>,
     /// A server's IP address.
     pub address: SocketAddr,
+    /// Local identity of the closed connection; absent for failed attempts.
+    pub connection_id: Option<ConnectionId>,
     _marker: PhantomData<Config>,
 }
 
@@ -738,5 +784,312 @@ impl<Config: ClientConfig> ClientPlugin<Config> {
                 })
                 .await;
         });
+    }
+}
+
+#[cfg(all(test, feature = "protocol_udp", feature = "serializer_bitcode_serde"))]
+mod udp_lifecycle_tests {
+    use super::*;
+    use crate::connection::OverflowPolicy;
+    use crate::packet_queue::lossy_channel;
+    use crate::protocols::udp::{UdpConnectionHandle, UdpProtocol};
+    use crate::serializers::bitcode_serde::BitcodeSerdeSerializer;
+    use crate::serializers::packet_length_serializer::LittleEndian;
+    use crate::serializers::serializer::SerializerAdapter;
+
+    struct Config;
+    impl ClientConfig for Config {
+        type ClientPacket = u8;
+        type ServerPacket = u8;
+        type Protocol = UdpProtocol;
+        type EncodeError = bitcode::Error;
+        type DecodeError = bitcode::Error;
+        type LengthSerializer = LittleEndian<u32>;
+        fn build_serializer() -> SerializerAdapter<u8, u8, bitcode::Error, bitcode::Error> {
+            SerializerAdapter::ReadOnly(Arc::new(BitcodeSerdeSerializer))
+        }
+    }
+
+    #[derive(Default, Resource)]
+    struct PacketEvents(usize);
+
+    #[test]
+    fn cancelled_udp_packet_is_dropped_while_close_waits_behind_establish() {
+        let settings = NetworkQueueSettings {
+            events_per_frame: 1,
+            ..Default::default()
+        };
+        let (lifecycle_tx, lifecycle_rx) = settings.incoming_channel();
+        let (packet_tx, packet_rx) = lossy_channel(1, usize::MAX, OverflowPolicy::DropNewest);
+        let (outgoing, _rx) = settings.outgoing_channel(true);
+        let udp = UdpConnectionHandle::new(128, None);
+        let address: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let connection = EcsConnection {
+            disconnect_task: DisconnectTask::new(),
+            id: ConnectionId::next(),
+            published: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            packet_tx: outgoing,
+            udp: Some(udp.clone()),
+            local_addr: address,
+            peer_addr: address,
+        };
+        assert!(lifecycle_tx
+            .try_send(ClientLifecycle::Established(ConnectionEstablishEvent {
+                address,
+                connection: connection.clone(),
+            }))
+            .is_ok());
+        assert!(lifecycle_tx
+            .try_send(ClientLifecycle::Closed(ConnectionClosed::new(
+                ReceiveError::IntentionalDisconnection,
+                address,
+                Some(connection.id()),
+            )))
+            .is_ok());
+        assert!(packet_tx
+            .try_send(
+                PacketReceiveEvent {
+                    connection: connection.clone(),
+                    packet: 7,
+                    received_at: Instant::now(),
+                },
+                1
+            )
+            .is_ok());
+        connection.disconnect();
+
+        let mut app = App::new();
+        app.insert_resource(settings);
+        app.insert_resource(ClientConnections::<Config>::new());
+        app.insert_resource(LifecycleReceiver::<Config>(lifecycle_rx));
+        app.insert_resource(PacketReceiver::<Config> {
+            receiver: packet_rx,
+        });
+        app.insert_resource(PacketEvents::default());
+        app.add_systems(PreUpdate, lifecycle_system::<Config>);
+        app.add_systems(PostUpdate, packet_receive_system::<Config>);
+        app.add_observer(
+            |_: On<PacketReceiveEvent<Config>>, mut events: ResMut<PacketEvents>| {
+                events.0 += 1;
+            },
+        );
+
+        app.update();
+        assert_eq!(app.world().resource::<ClientConnections<Config>>().len(), 1);
+        assert_eq!(app.world().resource::<PacketEvents>().0, 0);
+        assert_eq!(udp.stats().dropped_closed_before_delivery, 1);
+        app.update();
+        assert!(app
+            .world()
+            .resource::<ClientConnections<Config>>()
+            .is_empty());
+        assert_eq!(app.world().resource::<PacketEvents>().0, 0);
+    }
+
+    struct PendingWrite(Arc<std::sync::atomic::AtomicBool>);
+
+    #[async_trait::async_trait]
+    impl WriteStream for PendingWrite {
+        async fn write_all(&mut self, _buffer: &[u8]) -> io::Result<()> {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+            std::future::pending::<io::Result<()>>().await
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_paced_write_and_queued_packet_are_both_counted() {
+        let settings = NetworkQueueSettings {
+            send_capacity: 2,
+            ..Default::default()
+        };
+        let (packet_tx, mut packets_rx) = settings.outgoing_channel(true);
+        let udp = UdpConnectionHandle::new(128, None);
+        packets_rx.set_udp_handle(Some(udp.clone()));
+        let address: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let connection = EcsConnection {
+            disconnect_task: DisconnectTask::new(),
+            id: ConnectionId::next(),
+            published: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            packet_tx,
+            udp: Some(udp.clone()),
+            local_addr: address,
+            peer_addr: address,
+        };
+        connection.send(7).unwrap();
+        connection.send(8).unwrap();
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task = tokio::spawn(ConnectedTransport::<Config>::send_packets(
+            PendingWrite(Arc::clone(&entered)),
+            packets_rx,
+            Arc::new(Config::build_serializer()),
+            Arc::new(LittleEndian::<u32>::default()),
+            connection.disconnect_task.clone(),
+            connection.id(),
+            Some(udp.clone()),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !entered.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        connection.disconnect();
+        task.await.unwrap();
+        assert_eq!(udp.stats().dropped_closed_before_delivery, 2);
+    }
+
+    #[test]
+    fn udp_observer_disconnect_drops_later_buffered_packet() {
+        let settings = NetworkQueueSettings {
+            events_per_frame: 2,
+            ..Default::default()
+        };
+        let (lifecycle_tx, lifecycle_rx) = settings.incoming_channel();
+        let (packet_tx, packet_rx) = lossy_channel(2, usize::MAX, OverflowPolicy::DropNewest);
+        let (outgoing, _rx) = settings.outgoing_channel(true);
+        let udp = UdpConnectionHandle::new(128, None);
+        let address: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let connection = EcsConnection {
+            disconnect_task: DisconnectTask::new(),
+            id: ConnectionId::next(),
+            published: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            packet_tx: outgoing,
+            udp: Some(udp.clone()),
+            local_addr: address,
+            peer_addr: address,
+        };
+        assert!(lifecycle_tx
+            .try_send(ClientLifecycle::Established(ConnectionEstablishEvent {
+                address,
+                connection: connection.clone(),
+            }))
+            .is_ok());
+        for packet in [1, 2] {
+            assert!(packet_tx
+                .try_send(
+                    PacketReceiveEvent {
+                        connection: connection.clone(),
+                        packet,
+                        received_at: Instant::now(),
+                    },
+                    1
+                )
+                .is_ok());
+        }
+
+        let mut app = App::new();
+        app.insert_resource(settings);
+        app.insert_resource(ClientConnections::<Config>::new());
+        app.insert_resource(LifecycleReceiver::<Config>(lifecycle_rx));
+        app.insert_resource(PacketReceiver::<Config> {
+            receiver: packet_rx,
+        });
+        app.insert_resource(PacketEvents::default());
+        app.add_systems(PreUpdate, lifecycle_system::<Config>);
+        app.add_systems(PostUpdate, packet_receive_system::<Config>);
+        app.add_observer(
+            |event: On<PacketReceiveEvent<Config>>, mut events: ResMut<PacketEvents>| {
+                events.0 += 1;
+                event.event().connection.disconnect();
+            },
+        );
+        app.update();
+        assert_eq!(app.world().resource::<PacketEvents>().0, 1);
+        assert_eq!(udp.stats().dropped_closed_before_delivery, 1);
+    }
+}
+
+#[cfg(all(test, feature = "protocol_tcp", feature = "serializer_bitcode_serde"))]
+mod tcp_lifecycle_tests {
+    use super::*;
+    use crate::packet_queue::lossy_channel;
+    use crate::protocols::tcp::TcpProtocol;
+    use crate::serializers::bitcode_serde::BitcodeSerdeSerializer;
+    use crate::serializers::packet_length_serializer::LittleEndian;
+    use crate::serializers::serializer::SerializerAdapter;
+
+    struct Config;
+    impl ClientConfig for Config {
+        type ClientPacket = u8;
+        type ServerPacket = u8;
+        type Protocol = TcpProtocol;
+        type EncodeError = bitcode::Error;
+        type DecodeError = bitcode::Error;
+        type LengthSerializer = LittleEndian<u32>;
+        fn build_serializer() -> SerializerAdapter<u8, u8, bitcode::Error, bitcode::Error> {
+            SerializerAdapter::ReadOnly(Arc::new(BitcodeSerdeSerializer))
+        }
+    }
+
+    #[derive(Default, Resource)]
+    struct Packets(Vec<u8>);
+
+    #[test]
+    fn final_tcp_packet_survives_registry_removal_in_same_frame() {
+        let settings = NetworkQueueSettings {
+            events_per_frame: 2,
+            ..Default::default()
+        };
+        let (lifecycle_tx, lifecycle_rx) = settings.incoming_channel();
+        let (packet_tx, packet_rx) = lossy_channel(2, usize::MAX, settings.udp_receive_overflow);
+        let (outgoing, _rx) = settings.outgoing_channel(false);
+        let address: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let connection = EcsConnection {
+            disconnect_task: DisconnectTask::new(),
+            id: ConnectionId::next(),
+            published: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            packet_tx: outgoing,
+            #[cfg(feature = "protocol_udp")]
+            udp: None,
+            local_addr: address,
+            peer_addr: address,
+        };
+        assert!(lifecycle_tx
+            .try_send(ClientLifecycle::Established(ConnectionEstablishEvent {
+                address,
+                connection: connection.clone(),
+            }))
+            .is_ok());
+        assert!(lifecycle_tx
+            .try_send(ClientLifecycle::Closed(ConnectionClosed::new(
+                ReceiveError::IntentionalDisconnection,
+                address,
+                Some(connection.id()),
+            )))
+            .is_ok());
+        assert!(packet_tx
+            .try_send(
+                PacketReceiveEvent {
+                    connection: connection.clone(),
+                    packet: 9,
+                    received_at: Instant::now(),
+                },
+                1
+            )
+            .is_ok());
+        connection.disconnect();
+
+        let mut app = App::new();
+        app.insert_resource(settings);
+        app.insert_resource(ClientConnections::<Config>::new());
+        app.insert_resource(LifecycleReceiver::<Config>(lifecycle_rx));
+        app.insert_resource(PacketReceiver::<Config> {
+            receiver: packet_rx,
+        });
+        app.insert_resource(Packets::default());
+        app.add_systems(PreUpdate, lifecycle_system::<Config>);
+        app.add_systems(PostUpdate, packet_receive_system::<Config>);
+        app.add_observer(
+            |event: On<PacketReceiveEvent<Config>>, mut packets: ResMut<Packets>| {
+                packets.0.push(event.event().packet);
+            },
+        );
+        app.update();
+        assert!(app
+            .world()
+            .resource::<ClientConnections<Config>>()
+            .is_empty());
+        assert_eq!(app.world().resource::<Packets>().0, [9]);
     }
 }

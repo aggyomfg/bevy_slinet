@@ -36,7 +36,12 @@ impl Serializer<Vec<u8>, Vec<u8>> for Raw {
 }
 impl UdpReadHalf {
     async fn receive_raw(&mut self) -> Result<Vec<u8>, ReceiveError<io::Error, Ls>> {
-        self.receive(Arc::new(Raw), &Ls::default()).await
+        self.receive(
+            Arc::new(Raw),
+            &Ls::default(),
+            &crate::connection::ReceiveLimits::default(),
+        )
+        .await
     }
 }
 impl UdpWriteHalf {
@@ -202,7 +207,11 @@ async fn session_replacement_rejects_old_data_disconnect_and_confirmation() {
     let received_at = Instant::now();
     listener.dispatch(&Frame::data(new.mac, &[7]).encode(), address, received_at);
     let (packet, timestamp) = read
-        .receive_with_timestamp::<_, Vec<u8>, _, _>(Arc::new(Raw), &Ls::default())
+        .receive_with_timestamp::<_, Vec<u8>, _, _>(
+            Arc::new(Raw),
+            &Ls::default(),
+            &crate::connection::ReceiveLimits::default(),
+        )
         .await
         .unwrap();
     assert_eq!(packet, [7]);
@@ -314,10 +323,7 @@ async fn queue_limits_and_control_packets_under_overload() {
             Instant::now(),
         );
     }
-    assert_eq!(
-        read.session().queued_bytes(),
-        (HEADER + 1) * MAX_QUEUED_DATAGRAMS
-    );
+    assert_eq!(read.queued_bytes(), (HEADER + 1) * MAX_QUEUED_DATAGRAMS);
     assert_eq!(read.receive_raw().await.unwrap(), [7]);
     // Disconnect bypasses the saturated application queue.
     listener.dispatch(
@@ -345,9 +351,9 @@ async fn queue_byte_budget_is_bounded() {
     }
     let (mut read, _write) = stream.into_split().await.unwrap();
     let expected = MAX_QUEUED_BYTES / bytes.len() * bytes.len();
-    assert_eq!(read.session().queued_bytes(), expected);
+    assert_eq!(read.queued_bytes(), expected);
     read.receive_raw().await.unwrap();
-    assert_eq!(read.session().queued_bytes(), expected - bytes.len());
+    assert_eq!(read.queued_bytes(), expected - bytes.len());
 }
 
 #[tokio::test(start_paused = true)]
@@ -795,4 +801,68 @@ async fn receiving_disconnect_closes_a_retained_read_half_and_writer() {
         .send::<Vec<u8>, _, _, _>(vec![7], Arc::new(Raw), &Ls::default())
         .await
         .is_err());
+}
+
+#[tokio::test]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "The stream is consumed by into_split and both halves must stay alive during the exchange"
+)]
+async fn ipv6_sessions_exchange_data_and_expose_transport_handles() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let listener = Arc::new(UdpProtocol::bind("[::1]:0".parse().unwrap()).await.unwrap());
+        let (client, server) = tokio::join!(
+            UdpClientStream::connect(listener.address()),
+            listener.accept()
+        );
+        let client = client.unwrap();
+        let server = server.unwrap();
+        let client_handle = client.udp().unwrap();
+        let server_handle = server.udp().unwrap();
+        assert_eq!(client_handle.max_payload_size(), 1163);
+        assert_eq!(server_handle.max_payload_size(), 1163);
+        let (mut client_read, mut client_write) = client.into_split().await.unwrap();
+        let (mut server_read, mut server_write) = server.into_split().await.unwrap();
+        let pump = tokio::spawn(async move { while listener.accept().await.is_ok() {} });
+        client_write.send_raw(vec![1, 2]).await;
+        assert_eq!(server_read.receive_raw().await.unwrap(), [1, 2]);
+        server_write.send_raw(vec![3]).await;
+        assert_eq!(client_read.receive_raw().await.unwrap(), [3]);
+        assert_eq!(client_handle.stats().sent_data_bytes, (HEADER + 2) as u64);
+        assert_eq!(server_handle.stats().received_data_packets, 1);
+        drop(client_read);
+        drop(server_read);
+        assert_eq!(client_handle.stats().sent_data_packets, 1);
+        pump.abort();
+    })
+    .await
+    .expect("IPv6 session test timed out");
+}
+
+#[tokio::test(start_paused = true)]
+async fn loss_of_all_close_notifications_falls_back_to_idle_timeout() {
+    let AcceptedPeer {
+        listener: _listener,
+        peer,
+        cookie: _,
+        stream,
+    } = AcceptedPeer::new(UdpOptions::DEFAULT).await;
+    let handle = stream.udp().unwrap();
+    let (mut read, mut write) = stream.into_split().await.unwrap();
+    // The peer disappears without delivering any DISCONNECT notification.
+    drop(peer);
+    let mut waiting = Box::pin(read.receive_raw());
+    assert!(futures::poll!(&mut waiting).is_pending());
+    tokio::time::advance(Duration::from_secs(9)).await;
+    assert!(futures::poll!(&mut waiting).is_pending());
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(
+        matches!(waiting.await, Err(ReceiveError::Io(err)) if err.kind() == ErrorKind::TimedOut)
+    );
+    assert!(write
+        .send::<Vec<u8>, _, _, _>(vec![7], Arc::new(Raw), &Ls::default())
+        .await
+        .is_err());
+    drop(read);
+    assert_eq!(handle.stats().received_data_packets, 0);
 }
