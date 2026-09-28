@@ -1,9 +1,15 @@
 //! UDP protocol implementation based on [`tokio::net`]. You can enable it by adding `protocol_udp` feature.
 //!
-//! Every packet is sent as exactly one datagram, without a length prefix, so delivery is
-//! unreliable and unordered: packets may be lost, duplicated or reordered, but a lost or
-//! malformed datagram never affects other packets. Serialized packets must be non-empty and
-//! fit into a single datagram ([`MAX_DATAGRAM_SIZE`] bytes); other packets are dropped.
+//! Every packet is sent as exactly one datagram, without a length prefix. An empty datagram
+//! is a connection probe; data datagrams contain a `1` byte followed by the serialized payload,
+//! which may be empty. The payload must fit in [`MAX_DATAGRAM_SIZE`] minus one byte (65,506
+//! bytes); larger packets are dropped. `MaxPacketSize` limits the payload, excluding the tag.
+//!
+//! Delivery is unreliable and unordered: packets may be lost, duplicated or reordered.
+//! A lost or malformed datagram does not affect the framing of other packets. Serializers
+//! must decode each datagram independently and remain usable after a decoding error.
+//! Serializers that depend on previous packets, such as the example `CustomCryptEngine`
+//! stream cipher, are not suitable for UDP.
 
 use std::collections::VecDeque;
 use std::fmt::Debug;
@@ -31,6 +37,7 @@ use crate::{PacketLengthSerializer, Protocol};
 const BUFFER_SIZE: usize = u16::MAX as usize;
 /// The largest UDP payload that can be sent over IPv4.
 pub const MAX_DATAGRAM_SIZE: usize = 65_507;
+const DATA_DATAGRAM: u8 = 1;
 /// Datagrams received from a peer beyond this many unread ones are dropped.
 const MAX_QUEUED_DATAGRAMS: usize = 1024;
 
@@ -181,7 +188,11 @@ impl ReadStream for UdpServerReadHalf {
     {
         loop {
             let datagram = self.0.pop().await;
-            if let Some(packet) = decode_datagram(&datagram, &*serializer) {
+            if let Some(packet) = decode_datagram(
+                &datagram,
+                &*serializer,
+                MAX_PACKET_SIZE.load(Ordering::Relaxed),
+            ) {
                 return Ok(packet);
             }
         }
@@ -316,7 +327,11 @@ impl ReadStream for UdpClientReadHalf {
             if len == 0 {
                 continue;
             }
-            if let Some(packet) = decode_datagram(&self.buffer[..len], &*serializer) {
+            if let Some(packet) = decode_datagram(
+                &self.buffer[..len],
+                &*serializer,
+                MAX_PACKET_SIZE.load(Ordering::Relaxed),
+            ) {
                 return Ok(packet);
             }
         }
@@ -375,20 +390,25 @@ fn datagram_only_error() -> io::Error {
 fn decode_datagram<ReceivingPacket, SendingPacket, S>(
     datagram: &[u8],
     serializer: &S,
+    max_packet_size: usize,
 ) -> Option<ReceivingPacket>
 where
     ReceivingPacket: Send + Sync + Debug + 'static,
     SendingPacket: Send + Sync + Debug + 'static,
     S: Serializer<ReceivingPacket, SendingPacket> + ?Sized,
 {
-    if datagram.len() > MAX_PACKET_SIZE.load(Ordering::Relaxed) {
+    let (&tag, payload) = datagram.split_first()?;
+    if tag != DATA_DATAGRAM || datagram.len() > MAX_DATAGRAM_SIZE {
+        return None;
+    }
+    if payload.len() > max_packet_size {
         log::debug!(
-            "Dropping a {}-byte datagram larger than MaxPacketSize",
-            datagram.len()
+            "Dropping a {}-byte payload larger than MaxPacketSize",
+            payload.len()
         );
         return None;
     }
-    match serializer.deserialize(datagram) {
+    match serializer.deserialize(payload) {
         Ok(packet) => Some(packet),
         Err(err) => {
             log::debug!("Dropping a malformed datagram: {err}");
@@ -406,16 +426,19 @@ where
     SendingPacket: Send + Sync + Debug + 'static,
     S: Serializer<ReceivingPacket, SendingPacket> + ?Sized,
 {
-    let datagram = serializer
+    let payload = serializer
         .serialize(packet)
         .expect("Error serializing packet");
-    if datagram.is_empty() || datagram.len() > MAX_DATAGRAM_SIZE {
+    if payload.len() >= MAX_DATAGRAM_SIZE {
         log::warn!(
-            "Dropping a {}-byte packet: UDP packets must be 1..={MAX_DATAGRAM_SIZE} bytes",
-            datagram.len()
+            "Dropping a {}-byte packet: UDP payloads must be smaller than {MAX_DATAGRAM_SIZE} bytes",
+            payload.len()
         );
         return None;
     }
+    let mut datagram = Vec::with_capacity(payload.len() + 1);
+    datagram.push(DATA_DATAGRAM);
+    datagram.extend_from_slice(&payload);
     Some(datagram)
 }
 
@@ -423,8 +446,10 @@ where
 mod tests {
     use super::*;
     use crate::packet_length_serializer::LittleEndian;
+    use std::future::Future;
+    use std::time::Duration;
 
-    /// Passes bytes through as-is; datagrams starting with `0xFF` are treated as malformed.
+    /// Passes bytes through as-is; payloads starting with `0xFF` are treated as malformed.
     struct RawSerializer;
 
     impl Serializer<Vec<u8>, Vec<u8>> for RawSerializer {
@@ -445,10 +470,18 @@ mod tests {
 
     type Ls = LittleEndian<u32>;
 
-    #[tokio::test]
-    async fn each_datagram_is_one_packet() {
-        let serializer = Arc::new(RawSerializer);
-        let ls = Ls::default();
+    async fn with_timeout<T>(future: impl Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(5), future)
+            .await
+            .expect("UDP test timed out")
+    }
+
+    async fn connected_pair() -> (
+        UdpClientReadHalf,
+        UdpClientWriteHalf,
+        UdpServerReadHalf,
+        UdpServerWriteHalf,
+    ) {
         let listener = Arc::new(UdpProtocol::bind(([127, 0, 0, 1], 0).into()).await.unwrap());
         let client = UdpProtocol::connect_to_server(listener.address())
             .await
@@ -459,52 +492,261 @@ mod tests {
         let pump = Arc::clone(&listener);
         tokio::spawn(async move { while pump.accept().await.is_ok() {} });
 
-        let (mut client_read, mut client_write) = client.into_split().await.unwrap();
-        let (mut server_read, mut server_write) = server.into_split().await.unwrap();
+        let (client_read, client_write) = client.into_split().await.unwrap();
+        let (server_read, server_write) = server.into_split().await.unwrap();
+        (client_read, client_write, server_read, server_write)
+    }
 
-        // The oversized packet is dropped on send, the 0xFF one on receive.
-        for packet in [vec![1], vec![0; MAX_DATAGRAM_SIZE + 1], vec![2, 3]] {
+    #[tokio::test]
+    async fn each_datagram_is_one_packet() {
+        with_timeout(async {
+            let serializer = Arc::new(RawSerializer);
+            let ls = Ls::default();
+            let (mut client_read, mut client_write, mut server_read, mut server_write) =
+                connected_pair().await;
+
+            // The oversized packet is dropped on send, the 0xFF one on receive.
+            for packet in [vec![1], vec![], vec![0; MAX_DATAGRAM_SIZE], vec![2, 3]] {
+                client_write
+                    .send::<Vec<u8>, _, _, _>(packet, Arc::clone(&serializer), &ls)
+                    .await
+                    .unwrap();
+            }
             client_write
-                .send::<Vec<u8>, _, _, _>(packet, Arc::clone(&serializer), &ls)
+                .write_all(&[DATA_DATAGRAM, 0xFF, 9])
                 .await
                 .unwrap();
-        }
-        client_write.write_all(&[0xFF, 9]).await.unwrap();
-        client_write
-            .send::<Vec<u8>, _, _, _>(vec![4], Arc::clone(&serializer), &ls)
-            .await
-            .unwrap();
-
-        for expected in [vec![1], vec![2, 3], vec![4]] {
-            let packet = server_read
-                .receive::<_, Vec<u8>, _, _>(Arc::clone(&serializer), &ls)
+            client_write
+                .send::<Vec<u8>, _, _, _>(vec![4], Arc::clone(&serializer), &ls)
                 .await
                 .unwrap();
-            assert_eq!(packet, expected);
-        }
 
-        server_write
-            .send::<Vec<u8>, _, _, _>(vec![5], Arc::clone(&serializer), &ls)
-            .await
-            .unwrap();
-        let packet = client_read
-            .receive::<_, Vec<u8>, _, _>(Arc::clone(&serializer), &ls)
-            .await
-            .unwrap();
-        assert_eq!(packet, vec![5]);
+            for expected in [vec![1], vec![], vec![2, 3], vec![4]] {
+                let packet = server_read
+                    .receive::<_, Vec<u8>, _, _>(Arc::clone(&serializer), &ls)
+                    .await
+                    .unwrap();
+                assert_eq!(packet, expected);
+            }
+
+            for expected in [vec![], vec![5]] {
+                server_write
+                    .send::<Vec<u8>, _, _, _>(expected.clone(), Arc::clone(&serializer), &ls)
+                    .await
+                    .unwrap();
+                let packet = client_read
+                    .receive::<_, Vec<u8>, _, _>(Arc::clone(&serializer), &ls)
+                    .await
+                    .unwrap();
+                assert_eq!(packet, expected);
+            }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn first_datagram_is_not_lost() {
-        let listener = UdpProtocol::bind(([127, 0, 0, 1], 0).into()).await.unwrap();
-        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        peer.send_to(&[7], listener.address()).await.unwrap();
+        with_timeout(async {
+            let listener = UdpProtocol::bind(([127, 0, 0, 1], 0).into()).await.unwrap();
+            let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            peer.send_to(&[DATA_DATAGRAM, 7], listener.address())
+                .await
+                .unwrap();
 
-        let (mut read, _) = listener.accept().await.unwrap().into_split().await.unwrap();
-        let packet = read
-            .receive::<_, Vec<u8>, _, _>(Arc::new(RawSerializer), &Ls::default())
-            .await
-            .unwrap();
-        assert_eq!(packet, vec![7]);
+            let (mut read, _) = listener.accept().await.unwrap().into_split().await.unwrap();
+            let packet = read
+                .receive::<_, Vec<u8>, _, _>(Arc::new(RawSerializer), &Ls::default())
+                .await
+                .unwrap();
+            assert_eq!(packet, vec![7]);
+        })
+        .await;
+    }
+
+    #[test]
+    fn datagram_size_limits() {
+        let payload = vec![7; MAX_DATAGRAM_SIZE - 1];
+        let datagram = encode_datagram(payload.clone(), &RawSerializer).unwrap();
+        assert_eq!(datagram.len(), MAX_DATAGRAM_SIZE);
+        assert_eq!(datagram[0], DATA_DATAGRAM);
+        assert_eq!(
+            decode_datagram(&datagram, &RawSerializer, payload.len()),
+            Some(payload.clone())
+        );
+        assert_eq!(
+            decode_datagram(&datagram, &RawSerializer, payload.len() - 1),
+            None
+        );
+        assert!(encode_datagram(vec![7; MAX_DATAGRAM_SIZE], &RawSerializer).is_none());
+        assert_eq!(
+            decode_datagram(
+                &vec![DATA_DATAGRAM; MAX_DATAGRAM_SIZE + 1],
+                &RawSerializer,
+                usize::MAX
+            ),
+            None
+        );
+        assert_eq!(
+            encode_datagram(vec![], &RawSerializer),
+            Some(vec![DATA_DATAGRAM])
+        );
+        assert_eq!(
+            decode_datagram(&[DATA_DATAGRAM], &RawSerializer, 0),
+            Some(vec![])
+        );
+        assert_eq!(
+            decode_datagram(&[DATA_DATAGRAM, 7], &RawSerializer, 0),
+            None
+        );
+        assert_eq!(decode_datagram(&[], &RawSerializer, 0), None);
+        assert_eq!(decode_datagram(&[2, 7], &RawSerializer, usize::MAX), None);
+    }
+
+    #[test]
+    fn packet_size_limit_drops_only_oversized_payloads() {
+        let datagrams = [
+            vec![DATA_DATAGRAM, 1],
+            vec![DATA_DATAGRAM, 2, 3, 4],
+            vec![DATA_DATAGRAM],
+            vec![DATA_DATAGRAM, 5, 6],
+        ];
+        let received: Vec<_> = datagrams
+            .iter()
+            .filter_map(|datagram| decode_datagram(datagram, &RawSerializer, 2))
+            .collect();
+        assert_eq!(received, [vec![1], vec![], vec![5, 6]]);
+    }
+
+    #[tokio::test]
+    async fn invalid_datagrams_do_not_affect_following_packets() {
+        async fn check(read: &mut impl ReadStream, write: &mut impl WriteStream) {
+            for invalid in [vec![], vec![0], vec![2, 7], vec![DATA_DATAGRAM, 0xFF, 9]] {
+                write.write_all(&invalid).await.unwrap();
+            }
+            write
+                .send::<Vec<u8>, _, _, _>(vec![7], Arc::new(RawSerializer), &Ls::default())
+                .await
+                .unwrap();
+            let received = read
+                .receive::<_, Vec<u8>, _, _>(Arc::new(RawSerializer), &Ls::default())
+                .await
+                .unwrap();
+            assert_eq!(received, vec![7]);
+        }
+
+        with_timeout(async {
+            let (mut client_read, mut client_write, mut server_read, mut server_write) =
+                connected_pair().await;
+            check(&mut server_read, &mut client_write).await;
+            check(&mut client_read, &mut server_write).await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn loss_reordering_and_duplicates_do_not_affect_decoding() {
+        async fn check(read: &mut impl ReadStream, write: &mut impl WriteStream) {
+            for sequence in [3, 1, 3, 5] {
+                let packet = vec![sequence; usize::from(sequence)];
+                write
+                    .send::<Vec<u8>, _, _, _>(
+                        packet.clone(),
+                        Arc::new(RawSerializer),
+                        &Ls::default(),
+                    )
+                    .await
+                    .unwrap();
+                let received = read
+                    .receive::<_, Vec<u8>, _, _>(Arc::new(RawSerializer), &Ls::default())
+                    .await
+                    .unwrap();
+                assert_eq!(received, packet);
+            }
+        }
+
+        with_timeout(async {
+            let (mut client_read, mut client_write, mut server_read, mut server_write) =
+                connected_pair().await;
+            check(&mut server_read, &mut client_write).await;
+            check(&mut client_read, &mut server_write).await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn queue_overflow_drops_only_excess_datagrams() {
+        with_timeout(async {
+            let queue = UdpRead::default();
+            queue.push(&[]);
+            assert!(queue.0.datagrams.lock().unwrap().is_empty());
+            for _ in 0..MAX_QUEUED_DATAGRAMS {
+                queue.push(&[DATA_DATAGRAM, 7]);
+            }
+            queue.push(&[DATA_DATAGRAM, 8]);
+            assert_eq!(
+                queue.0.datagrams.lock().unwrap().len(),
+                MAX_QUEUED_DATAGRAMS
+            );
+            assert_eq!(&*queue.pop().await, &[DATA_DATAGRAM, 7]);
+            queue.push(&[DATA_DATAGRAM, 9]);
+            for _ in 1..MAX_QUEUED_DATAGRAMS {
+                assert_eq!(&*queue.pop().await, &[DATA_DATAGRAM, 7]);
+            }
+            assert_eq!(&*queue.pop().await, &[DATA_DATAGRAM, 9]);
+            assert!(queue.0.datagrams.lock().unwrap().is_empty());
+            let mut pending = Box::pin(queue.pop());
+            assert!(futures::poll!(pending.as_mut()).is_pending());
+            queue.push(&[DATA_DATAGRAM]);
+            assert_eq!(&*pending.await, &[DATA_DATAGRAM]);
+        })
+        .await;
+    }
+
+    #[cfg(feature = "serializer_bitcode")]
+    #[tokio::test]
+    async fn bitcode_packets_include_empty_payloads() {
+        use crate::serializer::SerializerAdapter;
+        use crate::serializers::bitcode::BitcodeSerializer;
+
+        async fn roundtrip<Packet>(packet: Packet)
+        where
+            Packet: bitcode::Encode
+                + bitcode::DecodeOwned
+                + Clone
+                + Debug
+                + PartialEq
+                + Send
+                + Sync
+                + 'static,
+        {
+            let serializer = Arc::new(SerializerAdapter::ReadOnly(Arc::new(BitcodeSerializer)));
+            let (mut client_read, mut client_write, mut server_read, mut server_write) =
+                connected_pair().await;
+            client_write
+                .send::<Packet, _, _, _>(packet.clone(), Arc::clone(&serializer), &Ls::default())
+                .await
+                .unwrap();
+            let received = server_read
+                .receive::<_, Packet, _, _>(Arc::clone(&serializer), &Ls::default())
+                .await
+                .unwrap();
+            assert_eq!(received, packet);
+            server_write
+                .send::<Packet, _, _, _>(received, Arc::clone(&serializer), &Ls::default())
+                .await
+                .unwrap();
+            let received = client_read
+                .receive::<_, Packet, _, _>(serializer, &Ls::default())
+                .await
+                .unwrap();
+            assert_eq!(received, packet);
+        }
+
+        with_timeout(async {
+            assert!(bitcode::encode(&()).is_empty());
+            roundtrip(()).await;
+            roundtrip((42_u32, "hello".to_owned())).await;
+        })
+        .await;
     }
 }

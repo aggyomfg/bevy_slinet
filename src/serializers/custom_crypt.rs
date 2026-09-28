@@ -57,6 +57,8 @@ pub trait CryptEngine<ReceivingPacket, SendingPacket>: Default {
 pub struct ExampleKeyPair(u64, u64);
 
 /// A cryptographic engine implementing XOR encryption, typically not secure but used for demonstration.
+/// Requires reliable, ordered delivery: a lost, duplicated, reordered or malformed packet
+/// can desynchronize the key state. This stream-cipher example must not be used with UDP.
 #[derive(Clone, Default)]
 pub struct CustomCryptEngine {
     key_pair: ExampleKeyPair,

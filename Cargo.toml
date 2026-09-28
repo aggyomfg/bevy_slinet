@@ -1,6 +1,6 @@
 [package]
 name = "bevy_slinet"
-version = "0.18.1"
+version = "0.19.0"
 authors = [
     "Sliman4 <4sliman4@gmail.com>",
     "aggyomfg <aggyomfg@yandex.com>"
@@ -43,6 +43,9 @@ tokio = { version = "1", features = [
 ] }
 async-trait = "0.1"
 futures = { version = "0.3" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["time"] }
 
 [features]
 serializer_bitcode = ["bitcode"]
