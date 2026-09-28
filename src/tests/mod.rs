@@ -5,9 +5,9 @@
 )]
 use crate::client;
 use crate::client::{ClientConnection, ClientPlugin, ConnectionEstablishEvent};
-use crate::packet_length_serializer::LittleEndian;
-use crate::serializer::SerializerAdapter;
 use crate::serializers::bitcode_serde::BitcodeSerdeSerializer;
+use crate::serializers::packet_length_serializer::LittleEndian;
+use crate::serializers::serializer::SerializerAdapter;
 use crate::server::{NewConnectionEvent, ServerAddress, ServerConnections, ServerPlugin};
 use crate::{server, ClientConfig, ServerConfig};
 use bevy::app::App;

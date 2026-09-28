@@ -10,9 +10,9 @@ use bevy::prelude::Resource;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::packet_length_serializer::PacketLengthSerializer;
-use crate::protocol::NetworkStream;
-use crate::serializer::Serializer;
+use crate::protocols::protocol::NetworkStream;
+use crate::serializers::packet_length_serializer::PacketLengthSerializer;
+use crate::serializers::serializer::Serializer;
 
 /// Provides a cloneable ECS handle to a transport task through a bounded packet queue.
 #[derive(Resource)]

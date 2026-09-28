@@ -3,10 +3,12 @@ use super::settings::{ValidatedOptions, MAX_QUEUED_BYTES, MAX_QUEUED_DATAGRAMS};
 use super::test_support::RawPeer;
 use super::wire::*;
 use super::*;
-use crate::packet_length_serializer::LittleEndian;
+use crate::serializers::packet_length_serializer::LittleEndian;
 use crate::{
-    protocol::{ClientStream, Listener, NetworkStream, ReadStream, ReceiveError, WriteStream},
-    serializer::Serializer,
+    protocols::protocol::{
+        ClientStream, Listener, NetworkStream, ReadStream, ReceiveError, WriteStream,
+    },
+    serializers::serializer::Serializer,
     Protocol,
 };
 use bevy::platform::time::Instant;

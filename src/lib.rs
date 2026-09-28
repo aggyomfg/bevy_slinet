@@ -4,21 +4,22 @@
 
 use std::{error::Error, fmt::Debug};
 
-use crate::packet_length_serializer::PacketLengthSerializer;
-use crate::protocol::Protocol;
+use crate::protocols::protocol::Protocol;
+use crate::serializers::packet_length_serializer::PacketLengthSerializer;
 use bevy::prelude::SystemSet;
-use serializer::SerializerAdapter;
+use serializers::serializer::SerializerAdapter;
 
 #[cfg(feature = "client")]
 pub mod client;
 pub mod connection;
-pub mod packet_length_serializer;
-pub mod protocol;
 pub mod protocols;
-pub mod serializer;
 pub mod serializers;
 #[cfg(feature = "server")]
 pub mod server;
+
+// Preserve the original public module paths.
+pub use protocols::protocol;
+pub use serializers::{packet_length_serializer, serializer};
 
 #[cfg(all(
     test,

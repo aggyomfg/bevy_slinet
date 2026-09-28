@@ -14,7 +14,9 @@ use crate::connection::{
     max_packet_size_warning_system, set_max_packet_size_system, ConnectionId, DisconnectTask,
     EcsConnection, NetworkQueueSettings, PacketForwarder, RawConnection,
 };
-use crate::protocol::{Listener, NetworkStream, Protocol, ReadStream, ReceiveError, WriteStream};
+use crate::protocols::protocol::{
+    Listener, NetworkStream, Protocol, ReadStream, ReceiveError, WriteStream,
+};
 use crate::{ServerConfig, SystemSets};
 
 /// Represents the server side of a client connection.

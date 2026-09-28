@@ -1,6 +1,6 @@
 //! A [`bitcode`]-based packet serializer with serde support.
 
-use crate::serializer::ReadOnlySerializer;
+use crate::serializers::serializer::ReadOnlySerializer;
 use serde::{Deserialize, Serialize};
 
 /// Encodes packets through [`serde`] using the bitcode format.

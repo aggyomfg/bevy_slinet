@@ -2,7 +2,7 @@
 
 use std::convert::Infallible;
 
-use crate::serializer::ReadOnlySerializer;
+use crate::serializers::serializer::ReadOnlySerializer;
 
 /// Encodes packets using native [`bitcode::Encode`]/[`bitcode::Decode`] traits.
 #[derive(Clone, Default)]
@@ -101,9 +101,9 @@ mod tests {
     #[test]
     fn test_tcp_echo() {
         use crate::client::{self, ClientPlugin, ConnectionEstablishEvent};
-        use crate::packet_length_serializer::LittleEndian;
         use crate::protocols::tcp::TcpProtocol;
-        use crate::serializer::SerializerAdapter;
+        use crate::serializers::packet_length_serializer::LittleEndian;
+        use crate::serializers::serializer::SerializerAdapter;
         use crate::server::{self, ServerAddress, ServerPlugin};
         use crate::{ClientConfig, ServerConfig};
         use bevy::prelude::*;

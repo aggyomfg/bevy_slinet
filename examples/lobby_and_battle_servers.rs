@@ -13,17 +13,17 @@ use bevy::ecs::system::SystemParam;
 use bevy::log::{self, LogPlugin};
 use bevy::prelude::*;
 use bevy::time::common_conditions::on_timer;
-use bevy_slinet::serializer::SerializerAdapter;
+use bevy_slinet::serializers::serializer::SerializerAdapter;
 
 use bevy_slinet::client::{
     ClientConnection, ClientPlugin, ConnectionEstablishEvent, ConnectionRequestEvent,
 };
 use bevy_slinet::connection::ConnectionId;
-use bevy_slinet::packet_length_serializer::LittleEndian;
-use bevy_slinet::protocol::ReceiveError;
+use bevy_slinet::protocols::protocol::ReceiveError;
 use bevy_slinet::protocols::tcp::TcpProtocol;
 use bevy_slinet::protocols::udp::UdpProtocol;
 use bevy_slinet::serializers::bitcode::BitcodeSerializer;
+use bevy_slinet::serializers::packet_length_serializer::LittleEndian;
 use bevy_slinet::server::{NewConnectionEvent, ServerConnections, ServerPlugin};
 use bevy_slinet::{client, server, ClientConfig, ServerConfig};
 use bitcode::{Decode, Encode};

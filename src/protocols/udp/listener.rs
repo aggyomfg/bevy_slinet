@@ -2,7 +2,7 @@ use super::session::{Peer, PeerRegistration, Peers, SessionState};
 use super::settings::{UdpOptions, ValidatedOptions, BUFFER_SIZE, MAX_QUEUED_DATAGRAMS};
 use super::stream::UdpServerStream;
 use super::wire::{Control, CookieJar, Frame, HandshakeFrame, HandshakeKind, Payload};
-use crate::protocol::Listener;
+use crate::protocols::protocol::Listener;
 use async_trait::async_trait;
 use bevy::platform::time::Instant;
 use std::{

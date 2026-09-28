@@ -7,8 +7,10 @@ use super::settings::{
 use super::wire::{Control, Frame, Payload};
 use crate::{
     connection::MAX_PACKET_SIZE,
-    protocol::{ClientStream, NetworkStream, ReadStream, ReceiveError, ServerStream, WriteStream},
-    serializer::Serializer,
+    protocols::protocol::{
+        ClientStream, NetworkStream, ReadStream, ReceiveError, ServerStream, WriteStream,
+    },
+    serializers::serializer::Serializer,
     PacketLengthSerializer,
 };
 use async_trait::async_trait;

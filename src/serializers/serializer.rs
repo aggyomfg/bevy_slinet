@@ -68,7 +68,7 @@ where
     EncErr: Error + Send + Sync,
     DecErr: Error + Send + Sync,
 {
-    pub(crate) fn warn_if_stateful_over_datagrams<P: crate::protocol::Protocol>(
+    pub(crate) fn warn_if_stateful_over_datagrams<P: crate::protocols::protocol::Protocol>(
         &self,
         warned: &mut bool,
     ) {

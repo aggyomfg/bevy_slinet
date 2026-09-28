@@ -2,7 +2,7 @@
 //!
 //! Kept for compatibility only: bincode is unmaintained upstream. Prefer `serializer_bitcode`.
 
-use crate::serializer::ReadOnlySerializer;
+use crate::serializers::serializer::ReadOnlySerializer;
 pub use bincode::config;
 use bincode::config::Configuration;
 

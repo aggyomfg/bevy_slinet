@@ -1,4 +1,4 @@
-//! Implemented serializers:
+//! Packet serialization traits, stream length prefixes, and implemented serializers:
 #![cfg_attr(
     feature = "serializer_bitcode",
     doc = "- [`bitcode`] - Native bitcode (fastest and most compact, use `serializer_bitcode` feature)"
@@ -52,3 +52,6 @@ pub mod bitcode;
 pub mod bitcode_serde;
 #[cfg(feature = "serializer_bitcode")]
 pub mod custom_crypt;
+
+pub mod packet_length_serializer;
+pub mod serializer;

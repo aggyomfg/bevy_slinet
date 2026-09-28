@@ -15,8 +15,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::connection::MAX_PACKET_SIZE;
-use crate::packet_length_serializer::PacketLengthDeserializationError;
-use crate::serializer::Serializer;
+use crate::serializers::packet_length_serializer::PacketLengthDeserializationError;
+use crate::serializers::serializer::Serializer;
 use crate::PacketLengthSerializer;
 
 /// In order to simplify protocol switching and implementation, there is a [`Protocol`] trait.
@@ -298,7 +298,7 @@ pub trait WriteStream: Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packet_length_serializer::LittleEndian;
+    use crate::serializers::packet_length_serializer::LittleEndian;
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -472,7 +472,7 @@ mod tests {
 #[cfg(test)]
 mod send_tests {
     use super::*;
-    use crate::packet_length_serializer::LittleEndian;
+    use crate::serializers::packet_length_serializer::LittleEndian;
 
     #[derive(Default)]
     struct RecordingWriter {

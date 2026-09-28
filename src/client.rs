@@ -18,10 +18,10 @@ use crate::connection::{
     max_packet_size_warning_system, set_max_packet_size_system, ConnectionId, EcsConnection,
     NetworkQueueSettings, PacketForwarder, RawConnection,
 };
-use crate::protocol::ReadStream;
-use crate::protocol::WriteStream;
-use crate::protocol::{NetworkStream, ReceiveError};
-use crate::serializer::Serializer;
+use crate::protocols::protocol::ReadStream;
+use crate::protocols::protocol::WriteStream;
+use crate::protocols::protocol::{NetworkStream, ReceiveError};
+use crate::serializers::serializer::Serializer;
 use crate::{ClientConfig, Protocol, SystemSets};
 
 /// Client-side connection to a server.

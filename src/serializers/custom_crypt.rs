@@ -2,7 +2,7 @@
 
 use std::marker::PhantomData;
 
-use crate::serializer::MutableSerializer;
+use crate::serializers::serializer::MutableSerializer;
 use bevy::log;
 use bitcode::{Decode, Encode};
 

@@ -6,13 +6,13 @@ use std::time::Duration;
 use bevy::ecs::error::{ResultSeverityExt, Severity};
 use bevy::log::LogPlugin;
 use bevy::prelude::*;
-use bevy_slinet::serializer::SerializerAdapter;
+use bevy_slinet::serializers::serializer::SerializerAdapter;
 
 use bevy_slinet::client::ClientPlugin;
 use bevy_slinet::connection::ConnectionId;
-use bevy_slinet::packet_length_serializer::LittleEndian;
 use bevy_slinet::protocols::udp::UdpProtocol;
 use bevy_slinet::serializers::bitcode::BitcodeSerializer;
+use bevy_slinet::serializers::packet_length_serializer::LittleEndian;
 use bevy_slinet::server::{NewConnectionEvent, ServerPlugin};
 use bevy_slinet::{client, server, ClientConfig, ServerConfig};
 use bitcode::{Decode, Encode};

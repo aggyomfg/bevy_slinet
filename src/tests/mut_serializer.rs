@@ -7,13 +7,13 @@ use bevy::app::App;
 use bevy::prelude::*;
 
 use crate::client::{self, ClientConnection, ClientPlugin, ConnectionEstablishEvent};
-use crate::packet_length_serializer::LittleEndian;
 use crate::protocols::tcp::TcpProtocol;
-use crate::serializer::SerializerAdapter;
 use crate::serializers::custom_crypt::{
     CustomCryptClientPacket, CustomCryptEngine, CustomCryptSerializer, CustomCryptServerPacket,
     CustomSerializationError,
 };
+use crate::serializers::packet_length_serializer::LittleEndian;
+use crate::serializers::serializer::SerializerAdapter;
 use crate::server::{self, NewConnectionEvent, ServerAddress, ServerConnections, ServerPlugin};
 use crate::tests::wait_until;
 use crate::{ClientConfig, ServerConfig};

@@ -11,11 +11,11 @@ use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
-use crate::protocol::{
+use crate::protocols::protocol::{
     ClientStream, FramedReader, Listener, NetworkStream, Protocol, ReadStream, ReceiveError,
     ServerStream, WriteStream,
 };
-use crate::serializer::Serializer;
+use crate::serializers::serializer::Serializer;
 use crate::PacketLengthSerializer;
 
 /// TCP protocol.
