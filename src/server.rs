@@ -9,8 +9,8 @@ use tokio::select;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::connection::{
-    max_packet_size_warning_system, set_max_packet_size_system, ConnectionId, DisconnectTask,
-    EcsConnection, RawConnection,
+    max_packet_size_warning_system, set_max_packet_size_system, warn_if_stateful_over_datagrams,
+    ConnectionId, DisconnectTask, EcsConnection, RawConnection,
 };
 use crate::protocol::{Listener, NetworkStream, Protocol, ReadStream, ReceiveError, WriteStream};
 use crate::{ServerConfig, SystemSets};
@@ -254,10 +254,12 @@ fn create_setup_system<Config: ServerConfig>(address: SocketAddr) -> impl Fn(Com
                             tokio::spawn(async move {
                                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                                 let disconnect_task = DisconnectTask::default();
+                                let serializer = Config::build_serializer();
+                                warn_if_stateful_over_datagrams::<Config::Protocol, _, _, _, _>(&serializer);
                                 let connection = RawConnection {
                                     disconnect_task: disconnect_task.clone(),
                                     stream: connection,
-                                    serializer: Arc::new(Config::build_serializer()),
+                                    serializer: Arc::new(serializer),
                                     packet_length_serializer: Arc::new(Default::default()),
                                     id: ConnectionId::next(),
                                     packets_rx: rx,

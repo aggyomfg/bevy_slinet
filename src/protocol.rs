@@ -30,6 +30,9 @@ pub trait Protocol: Send + Sync + 'static {
     /// A client-side network stream. It can be different from [`Self::ServerStream`]
     type ClientStream: ClientStream;
 
+    /// `true` if packets may be lost, duplicated or reordered, as with UDP.
+    const DATAGRAM: bool = false;
+
     /// Creates a [Listener](Self::Listener).
     async fn bind(addr: SocketAddr) -> io::Result<Self::Listener>;
 

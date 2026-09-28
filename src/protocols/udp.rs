@@ -55,6 +55,8 @@ impl Protocol for UdpProtocol {
     type ServerStream = UdpServerStream;
     type ClientStream = UdpClientStream;
 
+    const DATAGRAM: bool = true;
+
     async fn bind(addr: SocketAddr) -> std::io::Result<Self::Listener> {
         Ok(UdpNetworkListener {
             socket: Arc::new(UdpSocket::bind(addr).await?),

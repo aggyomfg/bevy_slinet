@@ -12,7 +12,8 @@ use bevy::prelude::*;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::connection::{
-    max_packet_size_warning_system, set_max_packet_size_system, EcsConnection, RawConnection,
+    max_packet_size_warning_system, set_max_packet_size_system, warn_if_stateful_over_datagrams,
+    EcsConnection, RawConnection,
 };
 use crate::protocol::ReadStream;
 use crate::protocol::WriteStream;
@@ -211,9 +212,11 @@ fn setup_system<Config: ClientConfig>(mut commands: Commands) {
     run_async(async move {
         while let Some(address) = req_rx.recv().await {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let serializer = Config::build_serializer();
+            warn_if_stateful_over_datagrams::<Config::Protocol, _, _, _, _>(&serializer);
             match create_connection::<Config>(
                 address,
-                Arc::new(Config::build_serializer()),
+                Arc::new(serializer),
                 Config::LengthSerializer::default(),
                 rx,
             )
