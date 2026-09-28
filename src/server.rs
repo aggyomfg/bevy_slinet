@@ -4,6 +4,7 @@ use std::marker::PhantomData;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 
+use bevy::platform::time::Instant;
 use bevy::{log, prelude::*};
 use tokio::select;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -119,7 +120,7 @@ struct DisconnectionReceiver<Config: ServerConfig>(
 
 #[derive(Resource)]
 struct PacketReceiver<Config: ServerConfig>(
-    UnboundedReceiver<(ServerConnection<Config>, Config::ClientPacket)>,
+    UnboundedReceiver<(ServerConnection<Config>, Config::ClientPacket, Instant)>,
 );
 
 fn create_setup_system<Config: ServerConfig>(address: SocketAddr) -> impl Fn(Commands) {
@@ -186,7 +187,7 @@ fn create_setup_system<Config: ServerConfig>(address: SocketAddr) -> impl Fn(Com
                                         match result {
                                             Ok(packet) => {
                                                 log::trace!("({id:?}) Received packet {:?}", packet);
-                                                if let Err(err) = pack_tx2.send((ecs_conn.clone(), packet)) {
+                                                if let Err(err) = pack_tx2.send((ecs_conn.clone(), packet, Instant::now())) {
                                                     log::error!("({id:?}) Failed to forward received packet: {err}");
                                                 }
                                             }
@@ -319,6 +320,7 @@ impl<Config: ServerConfig> ServerAddress<Config> {
 
 /// A new client has connected.
 #[derive(Event)]
+#[non_exhaustive]
 pub struct NewConnectionEvent<Config: ServerConfig> {
     /// The connection.
     pub connection: ServerConnection<Config>,
@@ -328,6 +330,7 @@ pub struct NewConnectionEvent<Config: ServerConfig> {
 
 /// A client disconnected.
 #[derive(Event)]
+#[non_exhaustive]
 pub struct DisconnectionEvent<Config: ServerConfig> {
     /// The error.
     pub error: ReceiveError<Config::DecodeError, Config::LengthSerializer>,
@@ -337,11 +340,14 @@ pub struct DisconnectionEvent<Config: ServerConfig> {
 
 /// Sent for every packet received.
 #[derive(Event)]
+#[non_exhaustive]
 pub struct PacketReceiveEvent<Config: ServerConfig> {
     /// The connection.
     pub connection: ServerConnection<Config>,
     /// The packet.
     pub packet: Config::ClientPacket,
+    /// When the network task received the packet, before it waited for the next ECS update.
+    pub received_at: Instant,
 }
 
 fn accept_new_connections<Config: ServerConfig>(
@@ -367,8 +373,12 @@ fn accept_new_packets<Config: ServerConfig>(
     mut receiver: ResMut<PacketReceiver<Config>>,
     mut commands: Commands,
 ) {
-    while let Ok((connection, packet)) = receiver.0.try_recv() {
-        commands.trigger(PacketReceiveEvent::<Config> { connection, packet });
+    while let Ok((connection, packet, received_at)) = receiver.0.try_recv() {
+        commands.trigger(PacketReceiveEvent::<Config> {
+            connection,
+            packet,
+            received_at,
+        });
     }
 }
 

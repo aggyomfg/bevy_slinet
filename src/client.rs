@@ -8,6 +8,7 @@ use std::net::ToSocketAddrs;
 use std::sync::Arc;
 
 use bevy::log;
+use bevy::platform::time::Instant;
 use bevy::prelude::*;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -191,7 +192,7 @@ struct DisconnectionReceiver<Config: ClientConfig>(
 
 #[derive(Resource)]
 struct PacketReceiver<Config: ClientConfig>(
-    UnboundedReceiver<(ClientConnection<Config>, Config::ServerPacket)>,
+    UnboundedReceiver<(ClientConnection<Config>, Config::ServerPacket, Instant)>,
 );
 
 fn setup_system<Config: ClientConfig>(mut commands: Commands) {
@@ -280,7 +281,7 @@ fn setup_system<Config: ClientConfig>(mut commands: Commands) {
                             match result {
                                 Ok(packet) => {
                                     log::trace!("({id:?}) Received packet {packet:?}");
-                                    if pack_tx2.send((ecs_conn.clone(), packet)).is_err() {
+                                    if pack_tx2.send((ecs_conn.clone(), packet, Instant::now())).is_err() {
                                         break
                                     }
                                 }
@@ -359,8 +360,12 @@ fn packet_receive_system<Config: ClientConfig>(
     mut packets: ResMut<PacketReceiver<Config>>,
     mut commands: Commands,
 ) {
-    while let Ok((connection, packet)) = packets.0.try_recv() {
-        commands.trigger(PacketReceiveEvent::<Config> { connection, packet });
+    while let Ok((connection, packet, received_at)) = packets.0.try_recv() {
+        commands.trigger(PacketReceiveEvent::<Config> {
+            connection,
+            packet,
+            received_at,
+        });
     }
 }
 
@@ -400,6 +405,7 @@ fn connection_remove_system<Config: ClientConfig>(
 
 /// Indicates that a connection was successfully established.
 #[derive(Event)]
+#[non_exhaustive]
 pub struct ConnectionEstablishEvent<Config: ClientConfig> {
     /// A server address.
     pub address: SocketAddr,
@@ -419,11 +425,14 @@ pub struct DisconnectionEvent<Config: ClientConfig> {
 
 /// Sent for every packet received.
 #[derive(Event)]
+#[non_exhaustive]
 pub struct PacketReceiveEvent<Config: ClientConfig> {
     /// The connection.
     pub connection: ClientConnection<Config>,
     /// The packet.
     pub packet: Config::ServerPacket,
+    /// When the network task received the packet, before it waited for the next ECS update.
+    pub received_at: Instant,
 }
 
 #[cfg(not(target_family = "wasm"))]
