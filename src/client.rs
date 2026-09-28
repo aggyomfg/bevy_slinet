@@ -12,23 +12,25 @@ use bevy::platform::time::Instant;
 use bevy::prelude::*;
 use futures::StreamExt;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio_util::sync::CancellationToken;
 
-use crate::connection::transport::{
-    install_idle_timeout, ConnectionDiagnostics, PendingPacket, QueueDropReason,
-};
+use crate::connection::transport::{install_idle_timeout, PendingPacket};
 use crate::connection::{
-    ConnectionId, DisconnectTask, EcsConnection, MaxPacketSize, NetworkQueueSettings,
-    OutgoingReceiver, OutgoingSender, PacketForwarder, RawConnection, ReceiveLimits,
+    ConnectionId, EcsConnection, MaxPacketSize, NetworkQueueSettings, OutgoingReceiver,
+    OutgoingSender, PacketForwarder, RawConnection, ReceiveLimits,
 };
 use crate::packet_queue::{lossy_channel, LossyReceiver, LossySender};
-use crate::protocols::protocol::ReadStream;
-use crate::protocols::protocol::WriteStream;
-use crate::protocols::protocol::{NetworkStream, ReceiveError};
+use crate::protocols::protocol::{
+    NetworkStream, PacketReader, PacketWriter, QueueDropReason, ReceiveError,
+};
 use crate::serializers::serializer::Serializer;
 use crate::{ClientConfig, Protocol, SystemSets};
 
 /// Client-side connection to a server.
-pub type ClientConnection<Config> = EcsConnection<<Config as ClientConfig>::ClientPacket>;
+pub type ClientConnection<Config> = EcsConnection<
+    <Config as ClientConfig>::ClientPacket,
+    <<Config as ClientConfig>::Protocol as Protocol>::Handle,
+>;
 type RawClientConnection<Config> = RawConnection<
     <Config as ClientConfig>::ServerPacket,
     <Config as ClientConfig>::ClientPacket,
@@ -286,7 +288,7 @@ impl<Config: ClientConfig> ClientPlugin<Config> {
         let (pack_tx, pack_rx) = lossy_channel(
             queues.receive_capacity.max(1),
             usize::MAX,
-            queues.udp_receive_overflow,
+            queues.datagram_receive_overflow,
         );
         commands.insert_resource(LifecycleReceiver::<Config>(lifecycle_rx));
         commands.insert_resource(PacketReceiver::<Config> { receiver: pack_rx });
@@ -367,7 +369,7 @@ impl<Config: ClientConfig> ClientPlugin<Config> {
         addr: SocketAddr,
         serializer: Arc<ClientSerializer<Config>>,
         packet_length_serializer: Config::LengthSerializer,
-        packet_rx: OutgoingReceiver<Config::ClientPacket>,
+        packet_rx: OutgoingReceiver<Config::ClientPacket, <Config::Protocol as Protocol>::Handle>,
         limits: ReceiveLimits,
     ) -> io::Result<RawClientConnection<Config>> {
         Ok(RawConnection::with_limits(
@@ -393,18 +395,8 @@ impl<Config: ClientConfig> ConnectionAttempt<Config> {
             result,
         } = self;
         match result {
-            Ok(mut connection) => {
-                let diagnostics = ConnectionDiagnostics::from_stream(&connection.stream);
-                connection.packets_rx.set_diagnostics(diagnostics.clone());
-                let ecs_conn = EcsConnection {
-                    diagnostics,
-                    disconnect_task: connection.disconnect_task.clone(),
-                    id: connection.id(),
-                    published: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                    packet_tx: packets,
-                    local_addr: connection.local_addr(),
-                    peer_addr: connection.peer_addr(),
-                };
+            Ok(connection) => {
+                let ecs_conn = connection.ecs_connection(packets);
                 if let Err(err) = lifecycle
                     .send(ClientLifecycle::Established(ConnectionEstablishEvent::<
                         Config,
@@ -478,7 +470,7 @@ impl<Config: ClientConfig> ConnectedTransport<Config> {
             }
         };
         read.set_idle_timeout(idle_timeout);
-        let diagnostics = self.ecs_connection.diagnostics.clone();
+        let transport = self.ecs_connection.transport().clone();
         tokio::spawn(Self::receive_packets(
             read,
             self.ecs_connection,
@@ -496,7 +488,7 @@ impl<Config: ClientConfig> ConnectedTransport<Config> {
             packet_length_serializer,
             disconnect_task,
             id,
-            diagnostics,
+            transport,
         ));
     }
 
@@ -505,7 +497,7 @@ impl<Config: ClientConfig> ConnectedTransport<Config> {
         reason = "Receive task needs transport, queue and lifecycle endpoints"
     )]
     async fn receive_packets(
-        mut read: impl ReadStream,
+        mut read: impl PacketReader,
         ecs_conn: ClientConnection<Config>,
         serializer: Arc<ClientSerializer<Config>>,
         packet_length_serializer: Arc<Config::LengthSerializer>,
@@ -521,7 +513,7 @@ impl<Config: ClientConfig> ConnectedTransport<Config> {
             packets,
             Config::Protocol::DATAGRAM,
             disconnect_task.clone(),
-            ecs_conn.diagnostics.clone(),
+            ecs_conn.transport().clone(),
         );
         let error = loop {
             tokio::select! {
@@ -561,18 +553,21 @@ impl<Config: ClientConfig> ConnectedTransport<Config> {
     }
 
     async fn send_packets(
-        mut write: impl WriteStream,
-        mut packets_rx: OutgoingReceiver<Config::ClientPacket>,
+        mut write: impl PacketWriter,
+        mut packets_rx: OutgoingReceiver<
+            Config::ClientPacket,
+            <Config::Protocol as Protocol>::Handle,
+        >,
         serializer: Arc<ClientSerializer<Config>>,
         packet_length_serializer: Arc<Config::LengthSerializer>,
-        disconnect_task: DisconnectTask,
+        disconnect_task: CancellationToken,
         id: ConnectionId,
-        diagnostics: ConnectionDiagnostics,
+        transport: <Config::Protocol as Protocol>::Handle,
     ) {
         let _guard = disconnect_task.clone().drop_guard();
         let sending = async {
             while let Some(packet) = packets_rx.recv().await {
-                let mut pending = PendingPacket::new(diagnostics.clone());
+                let mut pending = PendingPacket::new(transport.clone());
                 if disconnect_task.is_cancelled() {
                     break;
                 }
@@ -709,7 +704,7 @@ pub struct PacketReceiveEvent<Config: ClientConfig> {
     /// The packet.
     pub packet: Config::ServerPacket,
     /// When the built-in transport finished reading the packet, before decoding or queueing.
-    /// Custom protocols use [`ReadStream::receive_with_timestamp`] semantics.
+    /// Custom protocols use [`PacketReader::receive_with_timestamp`] semantics.
     pub received_at: Instant,
 }
 
@@ -768,6 +763,7 @@ mod udp_lifecycle_tests {
     use super::*;
     use crate::connection::OverflowPolicy;
     use crate::packet_queue::lossy_channel;
+    use crate::protocols::protocol::{FramedWriter, WriteStream};
     use crate::protocols::udp::{UdpConnectionHandle, UdpProtocol};
     use crate::serializers::bitcode_serde::BitcodeSerdeSerializer;
     use crate::serializers::packet_length_serializer::LittleEndian;
@@ -797,15 +793,15 @@ mod udp_lifecycle_tests {
         };
         let (lifecycle_tx, lifecycle_rx) = settings.incoming_channel();
         let (packet_tx, packet_rx) = lossy_channel(1, usize::MAX, OverflowPolicy::DropNewest);
-        let (outgoing, _rx) = settings.outgoing_channel(true);
+        let (outgoing, _rx) = settings.outgoing_channel::<_, UdpConnectionHandle>(true);
         let udp = UdpConnectionHandle::new(128, None);
         let address: SocketAddr = "127.0.0.1:1234".parse().unwrap();
         let connection = EcsConnection {
-            disconnect_task: DisconnectTask::new(),
+            disconnect_task: CancellationToken::new(),
             id: ConnectionId::next(),
             published: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             packet_tx: outgoing,
-            diagnostics: ConnectionDiagnostics::from_udp(Some(udp.clone())),
+            transport: udp.clone(),
             local_addr: address,
             peer_addr: address,
         };
@@ -878,16 +874,16 @@ mod udp_lifecycle_tests {
             send_capacity: 2,
             ..Default::default()
         };
-        let (packet_tx, mut packets_rx) = settings.outgoing_channel(true);
+        let (packet_tx, mut packets_rx) = settings.outgoing_channel::<_, UdpConnectionHandle>(true);
         let udp = UdpConnectionHandle::new(128, None);
-        packets_rx.set_diagnostics(ConnectionDiagnostics::from_udp(Some(udp.clone())));
+        packets_rx.set_transport(udp.clone());
         let address: SocketAddr = "127.0.0.1:1234".parse().unwrap();
         let connection = EcsConnection {
-            disconnect_task: DisconnectTask::new(),
+            disconnect_task: CancellationToken::new(),
             id: ConnectionId::next(),
             published: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             packet_tx,
-            diagnostics: ConnectionDiagnostics::from_udp(Some(udp.clone())),
+            transport: udp.clone(),
             local_addr: address,
             peer_addr: address,
         };
@@ -895,13 +891,13 @@ mod udp_lifecycle_tests {
         connection.send(8).unwrap();
         let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let task = tokio::spawn(ConnectedTransport::<Config>::send_packets(
-            PendingWrite(Arc::clone(&entered)),
+            FramedWriter::new(PendingWrite(Arc::clone(&entered))),
             packets_rx,
             Arc::new(Config::build_serializer()),
             Arc::new(LittleEndian::<u32>::default()),
             connection.disconnect_task.clone(),
             connection.id(),
-            ConnectionDiagnostics::from_udp(Some(udp.clone())),
+            udp.clone(),
         ));
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while !entered.load(std::sync::atomic::Ordering::Acquire) {
@@ -923,15 +919,15 @@ mod udp_lifecycle_tests {
         };
         let (lifecycle_tx, lifecycle_rx) = settings.incoming_channel();
         let (packet_tx, packet_rx) = lossy_channel(2, usize::MAX, OverflowPolicy::DropNewest);
-        let (outgoing, _rx) = settings.outgoing_channel(true);
+        let (outgoing, _rx) = settings.outgoing_channel::<_, UdpConnectionHandle>(true);
         let udp = UdpConnectionHandle::new(128, None);
         let address: SocketAddr = "127.0.0.1:1234".parse().unwrap();
         let connection = EcsConnection {
-            disconnect_task: DisconnectTask::new(),
+            disconnect_task: CancellationToken::new(),
             id: ConnectionId::next(),
             published: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             packet_tx: outgoing,
-            diagnostics: ConnectionDiagnostics::from_udp(Some(udp.clone())),
+            transport: udp.clone(),
             local_addr: address,
             peer_addr: address,
         };
@@ -1008,15 +1004,16 @@ mod tcp_lifecycle_tests {
             ..Default::default()
         };
         let (lifecycle_tx, lifecycle_rx) = settings.incoming_channel();
-        let (packet_tx, packet_rx) = lossy_channel(2, usize::MAX, settings.udp_receive_overflow);
-        let (outgoing, _rx) = settings.outgoing_channel(false);
+        let (packet_tx, packet_rx) =
+            lossy_channel(2, usize::MAX, settings.datagram_receive_overflow);
+        let (outgoing, _rx) = settings.outgoing_channel::<_, ()>(false);
         let address: SocketAddr = "127.0.0.1:1234".parse().unwrap();
         let connection = EcsConnection {
-            disconnect_task: DisconnectTask::new(),
+            disconnect_task: CancellationToken::new(),
             id: ConnectionId::next(),
             published: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             packet_tx: outgoing,
-            diagnostics: ConnectionDiagnostics::default(),
+            transport: (),
             local_addr: address,
             peer_addr: address,
         };

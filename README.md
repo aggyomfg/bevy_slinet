@@ -20,7 +20,8 @@ Note: with TCP, you should implement keep-alive and disconnection systems yourse
 
 ## Documentation
 
-- [Queue limits, receive limits, and API migration](docs/configuration.md)
+- [Queue and receive limits](docs/configuration.md)
+- [API migration: typed transport handles and connection APIs](docs/migration.md)
 - [UDP: configuration, diagnostics, pacing, and sessions](docs/udp.md)
 - [API reference](https://docs.rs/bevy_slinet)
 

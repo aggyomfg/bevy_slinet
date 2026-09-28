@@ -81,7 +81,7 @@ fn main() -> std::thread::Result<()> {
         App::new()
             .insert_resource(MaxPacketSize(1163))
             .insert_resource(NetworkQueueSettings {
-                udp_receive_overflow: OverflowPolicy::DropOldest,
+                datagram_receive_overflow: OverflowPolicy::DropOldest,
                 ..NetworkQueueSettings::default()
             })
             .add_plugins((
@@ -99,7 +99,7 @@ fn main() -> std::thread::Result<()> {
         App::new()
             .insert_resource(MaxPacketSize(1163))
             .insert_resource(NetworkQueueSettings {
-                udp_receive_overflow: OverflowPolicy::DropOldest,
+                datagram_receive_overflow: OverflowPolicy::DropOldest,
                 ..NetworkQueueSettings::default()
             })
             .add_plugins(MinimalPlugins)
@@ -113,12 +113,11 @@ fn main() -> std::thread::Result<()> {
 }
 
 fn server_new_connection_system(new_connection: On<NewConnectionEvent<Config>>) -> Result {
-    if let Some(udp) = new_connection.event().connection.udp() {
-        println!("UDP payload budget: {} bytes", udp.max_payload_size());
-        // The same handle supports live rate updates and survives disconnects.
-        udp.set_send_rate(NonZeroU64::new(16 * 1024));
-        println!("Local UDP statistics: {:?}", udp.stats());
-    }
+    let udp = new_connection.event().connection.transport();
+    println!("UDP payload budget: {} bytes", udp.max_payload_size());
+    // Clone the handle to retain its statistics after the connection is removed.
+    udp.set_send_rate(NonZeroU64::new(16 * 1024));
+    println!("Local UDP statistics: {:?}", udp.stats());
     new_connection
         .event()
         .connection

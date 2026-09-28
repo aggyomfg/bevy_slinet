@@ -1,8 +1,17 @@
 # UDP transport
 
-[Back to README](../README.md) · [Queue and receive limits](configuration.md)
+[Back to README](../README.md) · [Queue and receive limits](configuration.md) · [API migration](migration.md)
 
 UDP preserves packet boundaries and supports empty payloads. Delivery is unreliable and unordered; serializers must decode packets independently. A cookie handshake validates return addresses before allocating connections, and session identifiers isolate reconnects.
+
+## Packet I/O
+
+`UdpReadHalf` implements `protocol::PacketReader`; `UdpWriteHalf` implements
+`protocol::PacketWriter`. Low-level callers use `receive` /
+`receive_with_timestamp` and `send` with their packet serializer. UDP ignores
+the length-serializer argument because each DATA datagram carries one packet.
+Receive calls also take [`ReceiveLimits`](configuration.md#receive-limits).
+The halves provide no byte-stream operations or public raw-datagram send API.
 
 ## UDP configuration
 
@@ -53,8 +62,20 @@ together with `max_peers` to budget aggregate memory.
 
 ## UDP diagnostics and pacing
 
-`EcsConnection::udp()` returns a cloneable `UdpConnectionHandle` for UDP and
-`None` for TCP. It provides:
+For a UDP connection, `EcsConnection::transport()` returns
+`&UdpConnectionHandle`. Its type is selected by the configured protocol, so UDP
+controls are available directly, without an `Option` check:
+
+```rust,ignore
+// `connection` is a ClientConnection<Config> or ServerConnection<Config>
+// whose Config::Protocol is UdpProtocol or ConfiguredUdpProtocol<_>.
+let udp = connection.transport();
+let stats = udp.stats();
+udp.set_send_rate(std::num::NonZeroU64::new(16 * 1024));
+let retained_handle = udp.clone();
+```
+
+The handle provides:
 
 - `stats()`: cumulative data/control packet and byte counters, plus local drop
   reasons for outgoing, raw receive and ECS queues, malformed payloads, size
@@ -65,9 +86,11 @@ together with `max_peers` to budget aggregate memory.
 
 The writer serializes once, then spaces DATA sends without accumulating a burst
 allowance while idle. A changed rate or disconnection wakes a pending pacing wait.
-Control traffic uses its own handshake timers and response budget. The snapshot
-remains readable after disconnection while a handle is retained. Shared ECS queue
+Control traffic uses its own handshake timers and response budget. Statistics
+remain readable after disconnection while a handle is retained. Shared ECS queue
 evictions are charged to the connection whose packet was discarded.
+`RawConnection::transport()` and `NetworkStream::transport()` return an owned
+handle sharing the same state. TCP uses `()` as its transport handle.
 
 Sent counters mean **accepted by the local socket**. They are not remote delivery
 acknowledgments or measurements of network loss or RTT. Traffic that cannot be
@@ -90,9 +113,10 @@ confirmations cannot resurrect a completed session or replace a newer one.
 Failed replacements preserve the current connection. Peer limits also count
 accepted and superseded streams until their read side is released.
 
-Data, heartbeat and disconnect packets carry a session identifier. This release
-keeps the SLN2 wire format; older empty-probe/tag-only and length-prefixed UDP
-implementations remain incompatible. Cookies validate reachability, not user
-identity; payloads are not encrypted and an on-path observer can forge traffic.
+Data, heartbeat and disconnect packets carry a session identifier. Both
+endpoints must use SLN2; the previous empty-probe, length-prefixed UDP transport
+is incompatible. Upgrade both endpoints together; see the
+[migration guide](migration.md#udp-compatibility). Cookies validate reachability,
+not user identity; payloads are not encrypted and an on-path observer can forge traffic.
 The transport provides no application retransmission, delivery ordering,
 authentication, automatic congestion control, or address migration.

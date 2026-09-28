@@ -1,85 +1,16 @@
-//! Adapts optional transport diagnostics to the shared connection machinery.
+//! Shared send cancellation accounting and optional app timeout setup.
 
-#[cfg(feature = "protocol_udp")]
-use crate::protocols::udp::UdpConnectionHandle;
-
-/// Shared diagnostics survive connection closure alongside retained ECS handles.
-#[derive(Clone, Default)]
-pub struct ConnectionDiagnostics {
-    #[cfg(feature = "protocol_udp")]
-    udp: Option<UdpConnectionHandle>,
-}
-
-impl ConnectionDiagnostics {
-    #[cfg(any(feature = "client", feature = "server"))]
-    pub fn from_stream(stream: &impl crate::protocols::protocol::NetworkStream) -> Self {
-        #[cfg(feature = "protocol_udp")]
-        {
-            Self::from_udp(stream.udp())
-        }
-        #[cfg(not(feature = "protocol_udp"))]
-        {
-            let _ = stream;
-            Self::default()
-        }
-    }
-
-    #[cfg(all(feature = "protocol_udp", any(feature = "client", feature = "server")))]
-    pub const fn from_udp(udp: Option<UdpConnectionHandle>) -> Self {
-        Self { udp }
-    }
-
-    #[cfg(feature = "protocol_udp")]
-    pub fn udp(&self) -> Option<UdpConnectionHandle> {
-        self.udp.clone()
-    }
-
-    #[cfg(any(feature = "client", feature = "server"))]
-    #[cfg_attr(
-        not(feature = "protocol_udp"),
-        expect(
-            clippy::unused_self,
-            clippy::missing_const_for_fn,
-            reason = "The same interface updates shared counters when UDP diagnostics are enabled"
-        )
-    )]
-    pub fn record_drop(&self, reason: QueueDropReason) {
-        #[cfg(feature = "protocol_udp")]
-        if let Some(udp) = &self.udp {
-            use crate::protocols::udp::UdpDropReason;
-
-            let reason = match reason {
-                QueueDropReason::OutgoingQueueFull => UdpDropReason::OutgoingQueueFull,
-                QueueDropReason::OutgoingQueueEvicted => UdpDropReason::OutgoingQueueEvicted,
-                QueueDropReason::ReceiveQueueFull => UdpDropReason::ReceiveQueueFull,
-                QueueDropReason::ReceiveQueueEvicted => UdpDropReason::ReceiveQueueEvicted,
-                QueueDropReason::ClosedBeforeDelivery => UdpDropReason::ClosedBeforeDelivery,
-            };
-            udp.count_drop(reason);
-        }
-        #[cfg(not(feature = "protocol_udp"))]
-        let _ = reason;
-    }
-}
-
-/// Losses in the outgoing or decoded packet queues, independent of wire format.
 #[cfg(any(feature = "client", feature = "server"))]
-pub enum QueueDropReason {
-    OutgoingQueueFull,
-    OutgoingQueueEvicted,
-    ReceiveQueueFull,
-    ReceiveQueueEvicted,
-    ClosedBeforeDelivery,
-}
+use crate::protocols::protocol::{QueueDropReason, TransportHandle};
 
 /// Counts a dequeued packet if its send is interrupted before completion.
 #[cfg(any(feature = "client", feature = "server"))]
-pub struct PendingPacket(Option<ConnectionDiagnostics>);
+pub struct PendingPacket<H: TransportHandle>(Option<H>);
 
 #[cfg(any(feature = "client", feature = "server"))]
-impl PendingPacket {
-    pub const fn new(diagnostics: ConnectionDiagnostics) -> Self {
-        Self(Some(diagnostics))
+impl<H: TransportHandle> PendingPacket<H> {
+    pub const fn new(transport: H) -> Self {
+        Self(Some(transport))
     }
 
     pub fn finish(&mut self, result: &std::io::Result<()>) {
@@ -92,10 +23,10 @@ impl PendingPacket {
 }
 
 #[cfg(any(feature = "client", feature = "server"))]
-impl Drop for PendingPacket {
+impl<H: TransportHandle> Drop for PendingPacket<H> {
     fn drop(&mut self) {
-        if let Some(diagnostics) = self.0.take() {
-            diagnostics.record_drop(QueueDropReason::ClosedBeforeDelivery);
+        if let Some(transport) = self.0.take() {
+            transport.record_drop(QueueDropReason::ClosedBeforeDelivery);
         }
     }
 }

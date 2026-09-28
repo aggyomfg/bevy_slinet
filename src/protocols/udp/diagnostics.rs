@@ -1,3 +1,4 @@
+use crate::protocols::protocol::{QueueDropReason, TransportHandle};
 use std::{
     num::NonZeroU64,
     sync::{
@@ -52,20 +53,12 @@ pub struct UdpStatsSnapshot {
 }
 
 #[derive(Clone, Copy, Debug)]
-#[expect(
-    clippy::redundant_pub_crate,
-    reason = "Re-exported to ECS transport code"
-)]
-pub(crate) enum UdpDropReason {
-    #[cfg(any(feature = "client", feature = "server"))]
+pub(super) enum UdpDropReason {
     OutgoingQueueFull,
-    #[cfg(any(feature = "client", feature = "server"))]
     OutgoingQueueEvicted,
     RawQueueFull,
     RawQueueEvicted,
-    #[cfg(any(feature = "client", feature = "server"))]
     ReceiveQueueFull,
-    #[cfg(any(feature = "client", feature = "server"))]
     ReceiveQueueEvicted,
     ClosedBeforeDelivery,
     OversizedPayload,
@@ -192,17 +185,13 @@ impl UdpConnectionHandle {
         wire_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
-    pub(crate) fn count_drop(&self, reason: UdpDropReason) {
+    pub(super) fn count_drop(&self, reason: UdpDropReason) {
         let counter = match reason {
-            #[cfg(any(feature = "client", feature = "server"))]
             UdpDropReason::OutgoingQueueFull => &self.counters.dropped_outgoing_queue_full,
-            #[cfg(any(feature = "client", feature = "server"))]
             UdpDropReason::OutgoingQueueEvicted => &self.counters.dropped_outgoing_queue_evicted,
             UdpDropReason::RawQueueFull => &self.counters.dropped_raw_queue_full,
             UdpDropReason::RawQueueEvicted => &self.counters.dropped_raw_queue_evicted,
-            #[cfg(any(feature = "client", feature = "server"))]
             UdpDropReason::ReceiveQueueFull => &self.counters.dropped_receive_queue_full,
-            #[cfg(any(feature = "client", feature = "server"))]
             UdpDropReason::ReceiveQueueEvicted => &self.counters.dropped_receive_queue_evicted,
             UdpDropReason::ClosedBeforeDelivery => &self.counters.dropped_closed_before_delivery,
             UdpDropReason::OversizedPayload => &self.counters.dropped_oversized_payload,
@@ -211,5 +200,51 @@ impl UdpConnectionHandle {
             UdpDropReason::SocketSendError => &self.counters.dropped_socket_send_error,
         };
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl TransportHandle for UdpConnectionHandle {
+    fn record_drop(&self, reason: QueueDropReason) {
+        self.count_drop(match reason {
+            QueueDropReason::OutgoingQueueFull => UdpDropReason::OutgoingQueueFull,
+            QueueDropReason::OutgoingQueueEvicted => UdpDropReason::OutgoingQueueEvicted,
+            QueueDropReason::ReceiveQueueFull => UdpDropReason::ReceiveQueueFull,
+            QueueDropReason::ReceiveQueueEvicted => UdpDropReason::ReceiveQueueEvicted,
+            QueueDropReason::ClosedBeforeDelivery => UdpDropReason::ClosedBeforeDelivery,
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cloned_handles_record_each_generic_queue_drop_in_shared_counters() {
+        let handle = UdpConnectionHandle::new(1024, None);
+        let clone = handle.clone();
+        for reason in [
+            QueueDropReason::OutgoingQueueFull,
+            QueueDropReason::OutgoingQueueEvicted,
+            QueueDropReason::ReceiveQueueFull,
+            QueueDropReason::ReceiveQueueEvicted,
+            QueueDropReason::ClosedBeforeDelivery,
+        ] {
+            clone.record_drop(reason);
+        }
+        assert_eq!(
+            handle.stats(),
+            UdpStatsSnapshot {
+                dropped_outgoing_queue_full: 1,
+                dropped_outgoing_queue_evicted: 1,
+                dropped_receive_queue_full: 1,
+                dropped_receive_queue_evicted: 1,
+                dropped_closed_before_delivery: 1,
+                ..UdpStatsSnapshot::default()
+            }
+        );
+        drop(handle);
+        clone.record_drop(QueueDropReason::ClosedBeforeDelivery);
+        assert_eq!(clone.stats().dropped_closed_before_delivery, 2);
     }
 }

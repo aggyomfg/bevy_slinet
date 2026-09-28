@@ -1,5 +1,5 @@
 use super::wire::HEADER;
-use super::{ConfiguredUdpClientStream, UdpNetworkListener, UdpServerStream};
+use super::{ConfiguredUdpClientStream, UdpConnectionHandle, UdpNetworkListener, UdpServerStream};
 use crate::{connection::OverflowPolicy, Protocol};
 use async_trait::async_trait;
 use bevy::prelude::Resource;
@@ -113,6 +113,7 @@ pub type UdpProtocol = ConfiguredUdpProtocol<DefaultUdpConfig>;
 
 #[async_trait]
 impl<C: UdpConfig> Protocol for ConfiguredUdpProtocol<C> {
+    type Handle = UdpConnectionHandle;
     type Listener = UdpNetworkListener;
     type ServerStream = UdpServerStream;
     type ClientStream = ConfiguredUdpClientStream<C>;

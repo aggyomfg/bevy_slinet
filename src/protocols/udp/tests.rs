@@ -6,7 +6,7 @@ use super::*;
 use crate::serializers::packet_length_serializer::LittleEndian;
 use crate::{
     protocols::protocol::{
-        ClientStream, Listener, NetworkStream, ReadStream, ReceiveError, WriteStream,
+        ClientStream, Listener, NetworkStream, PacketReader, PacketWriter, ReceiveError,
     },
     serializers::serializer::Serializer,
     Protocol,
@@ -817,8 +817,8 @@ async fn ipv6_sessions_exchange_data_and_expose_transport_handles() {
         );
         let client = client.unwrap();
         let server = server.unwrap();
-        let client_handle = client.udp().unwrap();
-        let server_handle = server.udp().unwrap();
+        let client_handle = client.transport();
+        let server_handle = server.transport();
         assert_eq!(client_handle.max_payload_size(), 1163);
         assert_eq!(server_handle.max_payload_size(), 1163);
         let (mut client_read, mut client_write) = client.into_split().await.unwrap();
@@ -847,7 +847,7 @@ async fn loss_of_all_close_notifications_falls_back_to_idle_timeout() {
         cookie: _,
         stream,
     } = AcceptedPeer::new(UdpOptions::DEFAULT).await;
-    let handle = stream.udp().unwrap();
+    let handle = stream.transport();
     let (mut read, mut write) = stream.into_split().await.unwrap();
     // The peer disappears without delivering any DISCONNECT notification.
     drop(peer);

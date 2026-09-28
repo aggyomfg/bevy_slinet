@@ -1,29 +1,24 @@
 //! TCP [`Protocol`] implementation based on [`tokio::net`]. You can enable it by adding `protocol_tcp` feature.
 
-use bevy::platform::time::Instant;
-use std::fmt::Debug;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
-use crate::connection::ReceiveLimits;
 use crate::protocols::protocol::{
-    ClientStream, FramedReader, Listener, NetworkStream, Protocol, ReadStream, ReceiveError,
+    ClientStream, FramedReader, FramedWriter, Listener, NetworkStream, Protocol, ReadStream,
     ServerStream, WriteStream,
 };
-use crate::serializers::serializer::Serializer;
-use crate::PacketLengthSerializer;
 
 /// TCP protocol.
 pub struct TcpProtocol;
 
 #[async_trait]
 impl Protocol for TcpProtocol {
+    type Handle = ();
     type Listener = TcpNetworkListener;
     type ServerStream = TcpNetworkStream;
     type ClientStream = TcpNetworkStream;
@@ -65,11 +60,13 @@ impl TcpNetworkStream {
 
 #[async_trait]
 impl NetworkStream for TcpNetworkStream {
-    type ReadHalf = OwnedReadHalf;
-    type WriteHalf = OwnedWriteHalf;
+    type Handle = ();
+    type ReadHalf = FramedReader<OwnedReadHalf>;
+    type WriteHalf = FramedWriter<OwnedWriteHalf>;
 
     async fn into_split(self) -> io::Result<(Self::ReadHalf, Self::WriteHalf)> {
-        Ok(self.0.into_split())
+        let (read, write) = self.0.into_split();
+        Ok((FramedReader::new(read), FramedWriter::new(write)))
     }
 
     fn peer_addr(&self) -> SocketAddr {
@@ -79,29 +76,14 @@ impl NetworkStream for TcpNetworkStream {
     fn local_addr(&self) -> SocketAddr {
         self.2
     }
+
+    fn transport(&self) -> Self::Handle {}
 }
 
 #[async_trait]
 impl ReadStream for OwnedReadHalf {
     async fn read_exact(&mut self, buffer: &mut [u8]) -> io::Result<()> {
         AsyncReadExt::read_exact(self, buffer).await.map(|_| ())
-    }
-
-    async fn receive_with_timestamp<ReceivingPacket, SendingPacket, S, LS>(
-        &mut self,
-        serializer: Arc<S>,
-        length_serializer: &LS,
-        limits: &ReceiveLimits,
-    ) -> Result<(ReceivingPacket, Instant), ReceiveError<S::DecodeError, LS>>
-    where
-        ReceivingPacket: Send + Sync + Debug + 'static,
-        SendingPacket: Send + Sync + Debug + 'static,
-        S: Serializer<ReceivingPacket, SendingPacket> + ?Sized,
-        LS: PacketLengthSerializer,
-    {
-        FramedReader::new(self)
-            .receive(serializer, length_serializer, limits)
-            .await
     }
 }
 

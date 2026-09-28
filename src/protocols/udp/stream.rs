@@ -10,7 +10,7 @@ use crate::{
     connection::ReceiveLimits,
     packet_queue::LossyReceiver,
     protocols::protocol::{
-        ClientStream, NetworkStream, ReadStream, ReceiveError, ServerStream, WriteStream,
+        ClientStream, NetworkStream, PacketReader, PacketWriter, ReceiveError, ServerStream,
     },
     serializers::serializer::Serializer,
     PacketLengthSerializer,
@@ -125,8 +125,9 @@ impl UdpServerStream {
 }
 #[async_trait]
 impl NetworkStream for UdpServerStream {
-    type ReadHalf = UdpServerReadHalf;
-    type WriteHalf = UdpServerWriteHalf;
+    type Handle = UdpConnectionHandle;
+    type ReadHalf = UdpReadHalf;
+    type WriteHalf = UdpWriteHalf;
     async fn into_split(self) -> io::Result<(Self::ReadHalf, Self::WriteHalf)> {
         let incoming = Incoming::Queue {
             queue: self.incoming,
@@ -147,8 +148,8 @@ impl NetworkStream for UdpServerStream {
     fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
-    fn udp(&self) -> Option<UdpConnectionHandle> {
-        Some(self.state.handle())
+    fn transport(&self) -> Self::Handle {
+        self.state.handle()
     }
 }
 impl ServerStream for UdpServerStream {}
@@ -198,8 +199,9 @@ impl<C: UdpConfig> ClientStream for ConfiguredUdpClientStream<C> {
 }
 #[async_trait]
 impl<C: UdpConfig> NetworkStream for ConfiguredUdpClientStream<C> {
-    type ReadHalf = UdpClientReadHalf;
-    type WriteHalf = UdpClientWriteHalf;
+    type Handle = UdpConnectionHandle;
+    type ReadHalf = UdpReadHalf;
+    type WriteHalf = UdpWriteHalf;
     async fn into_split(self) -> io::Result<(Self::ReadHalf, Self::WriteHalf)> {
         let incoming = Incoming::Socket {
             socket: Arc::clone(&self.socket),
@@ -219,8 +221,8 @@ impl<C: UdpConfig> NetworkStream for ConfiguredUdpClientStream<C> {
     fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
-    fn udp(&self) -> Option<UdpConnectionHandle> {
-        Some(self.state.handle())
+    fn transport(&self) -> Self::Handle {
+        self.state.handle()
     }
 }
 
@@ -263,10 +265,6 @@ pub struct UdpReadHalf {
     idle_timeout: watch::Receiver<Duration>,
     timeout_updates_open: bool,
 }
-/// Reads datagrams routed by the listener for an accepted session.
-pub type UdpServerReadHalf = UdpReadHalf;
-/// Reads datagrams directly from a connected client socket.
-pub type UdpClientReadHalf = UdpReadHalf;
 impl Drop for UdpReadHalf {
     fn drop(&mut self) {
         self.state.close();
@@ -274,7 +272,7 @@ impl Drop for UdpReadHalf {
 }
 
 #[async_trait]
-impl ReadStream for UdpReadHalf {
+impl PacketReader for UdpReadHalf {
     fn close(&mut self) {
         self.state.close();
     }
@@ -282,12 +280,6 @@ impl ReadStream for UdpReadHalf {
     fn set_idle_timeout(&mut self, timeout: watch::Receiver<Duration>) {
         self.idle_timeout = timeout;
         self.timeout_updates_open = true;
-    }
-    async fn read_exact(&mut self, _: &mut [u8]) -> io::Result<()> {
-        Err(io::Error::new(
-            ErrorKind::Unsupported,
-            "use ReadStream::receive for UDP",
-        ))
     }
     async fn receive<R, S, Ser, LS>(
         &mut self,
@@ -402,16 +394,8 @@ impl UdpWriteHalf {
     pub fn dropped_send_errors(&self) -> usize {
         self.state.dropped_send_errors()
     }
-}
 
-/// Sends datagrams to an accepted peer through the listener's shared socket.
-pub type UdpServerWriteHalf = UdpWriteHalf;
-/// Sends datagrams through a connected client socket.
-pub type UdpClientWriteHalf = UdpWriteHalf;
-#[async_trait]
-impl WriteStream for UdpWriteHalf {
-    /// Sends raw wire bytes. Prefer `send`, which adds the session header.
-    async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+    async fn send_datagram(&self, bytes: &[u8]) -> io::Result<()> {
         if self.state.is_closed() {
             return Err(SessionState::disconnected_error());
         }
@@ -437,6 +421,10 @@ impl WriteStream for UdpWriteHalf {
         }
         Ok(())
     }
+}
+
+#[async_trait]
+impl PacketWriter for UdpWriteHalf {
     async fn send<R, S, Ser, LS>(
         &mut self,
         packet: S,
@@ -459,7 +447,7 @@ impl WriteStream for UdpWriteHalf {
         }
         let frame = Frame::data(self.state.id(), &payload).encode();
         self.pacer.wait(self.state.closed_token()).await?;
-        let result = self.write_all(&frame).await;
+        let result = self.send_datagram(&frame).await;
         self.pacer.sent(frame.len());
         if let Err(err) = result {
             if self.state.is_closed() {

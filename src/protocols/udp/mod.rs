@@ -16,8 +16,6 @@ mod settings;
 mod stream;
 mod wire;
 
-#[cfg(any(feature = "client", feature = "server"))]
-pub(crate) use diagnostics::UdpDropReason;
 pub use diagnostics::{UdpConnectionHandle, UdpStatsSnapshot};
 
 pub use listener::UdpNetworkListener;
@@ -26,8 +24,7 @@ pub use settings::{
     CONNECT_TIMEOUT, KEEPALIVE_INTERVAL, MAX_DATAGRAM_SIZE, PROBE_INTERVAL,
 };
 pub use stream::{
-    ConfiguredUdpClientStream, UdpClientReadHalf, UdpClientStream, UdpClientWriteHalf, UdpReadHalf,
-    UdpServerReadHalf, UdpServerStream, UdpServerWriteHalf, UdpWriteHalf,
+    ConfiguredUdpClientStream, UdpClientStream, UdpReadHalf, UdpServerStream, UdpWriteHalf,
 };
 
 #[cfg(any(feature = "client", feature = "server"))]

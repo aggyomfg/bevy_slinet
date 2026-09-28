@@ -7,24 +7,25 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use bevy::prelude::Resource;
-use tokio::sync::mpsc::error::TrySendError;
-#[cfg(feature = "client")]
 use tokio::sync::mpsc::Receiver;
+use tokio_util::sync::CancellationToken;
 
-use crate::protocols::protocol::NetworkStream;
+#[cfg(any(feature = "client", feature = "server"))]
+use crate::protocols::protocol::QueueDropReason;
+use crate::protocols::protocol::{NetworkStream, TransportHandle};
 use crate::serializers::packet_length_serializer::PacketLengthSerializer;
 use crate::serializers::serializer::Serializer;
 
 mod queue;
+#[cfg(test)]
+mod raw_tests;
+mod send_error;
 pub(crate) mod transport;
 
 #[cfg(any(feature = "client", feature = "server"))]
 pub(crate) use queue::PacketForwarder;
 pub use queue::{NetworkQueueSettings, OutgoingReceiver, OutgoingSender, OverflowPolicy};
-
-use transport::ConnectionDiagnostics;
-#[cfg(any(feature = "client", feature = "server"))]
-use transport::QueueDropReason;
+pub use send_error::SendError;
 
 /// A live packet size limit shared by receive tasks in one Bevy app.
 #[derive(Clone, Debug, Resource)]
@@ -57,20 +58,20 @@ impl ReceiveLimits {
 
 /// Provides a cloneable ECS handle to a transport task through a bounded packet queue.
 #[derive(Resource)]
-pub struct EcsConnection<SendingPacket>
+pub struct EcsConnection<SendingPacket, H: TransportHandle>
 where
     SendingPacket: Send + Sync + Debug + 'static,
 {
-    pub(crate) disconnect_task: DisconnectTask,
+    pub(crate) disconnect_task: CancellationToken,
     pub(crate) id: ConnectionId,
     pub(crate) published: Arc<AtomicBool>,
     pub(crate) packet_tx: OutgoingSender<SendingPacket>,
-    pub(crate) diagnostics: ConnectionDiagnostics,
+    pub(crate) transport: H,
     pub(crate) local_addr: SocketAddr,
     pub(crate) peer_addr: SocketAddr,
 }
 
-impl<SendingPacket> Clone for EcsConnection<SendingPacket>
+impl<SendingPacket, H: TransportHandle> Clone for EcsConnection<SendingPacket, H>
 where
     SendingPacket: Send + Sync + Debug + 'static,
 {
@@ -80,14 +81,14 @@ where
             id: self.id,
             published: Arc::clone(&self.published),
             packet_tx: self.packet_tx.clone(),
-            diagnostics: self.diagnostics.clone(),
+            transport: self.transport.clone(),
             local_addr: self.local_addr,
             peer_addr: self.peer_addr,
         }
     }
 }
 
-impl<SendingPacket> Debug for EcsConnection<SendingPacket>
+impl<SendingPacket, H: TransportHandle> Debug for EcsConnection<SendingPacket, H>
 where
     SendingPacket: Send + Sync + Debug + 'static,
 {
@@ -96,7 +97,7 @@ where
     }
 }
 
-impl<SendingPacket> EcsConnection<SendingPacket>
+impl<SendingPacket, H: TransportHandle> EcsConnection<SendingPacket, H>
 where
     SendingPacket: Send + Sync + Debug + 'static,
 {
@@ -132,23 +133,23 @@ where
     ///
     /// # Errors
     /// Returns the unsent packet if the connection is closed or its outgoing queue is full.
-    pub fn send(&self, packet: SendingPacket) -> Result<(), TrySendError<SendingPacket>> {
+    pub fn send(&self, packet: SendingPacket) -> Result<(), SendError<SendingPacket>> {
         if self.disconnect_task.is_cancelled() {
-            return Err(TrySendError::Closed(packet));
+            return Err(SendError::Closed(packet));
         }
-        self.packet_tx.try_send(packet, &self.diagnostics)
+        self.packet_tx.try_send(packet, &self.transport)
     }
 
     #[cfg(any(feature = "client", feature = "server"))]
     pub(crate) fn record_drop(&self, reason: QueueDropReason) {
-        self.diagnostics.record_drop(reason);
+        self.transport.record_drop(reason);
     }
 
-    /// Returns the UDP session handle, including counters retained after disconnect.
-    #[cfg(feature = "protocol_udp")]
+    /// Returns this connection's typed transport controls and diagnostics.
+    /// Clone the handle to retain access after the connection is dropped.
     #[must_use]
-    pub fn udp(&self) -> Option<crate::protocols::udp::UdpConnectionHandle> {
-        self.diagnostics.udp()
+    pub const fn transport(&self) -> &H {
+        &self.transport
     }
 
     /// Closes the connection.
@@ -157,6 +158,14 @@ where
     }
 }
 
+/// Owns the low-level transport and packet queue consumed by a connection task.
+#[cfg_attr(
+    not(any(feature = "client", feature = "server")),
+    expect(
+        dead_code,
+        reason = "Endpoint tasks consume the private serializer and queue fields"
+    )
+)]
 pub struct RawConnection<ReceivingPacket, SendingPacket, NS, EncErr, DecErr, LS>
 where
     ReceivingPacket: Send + Sync + Debug + 'static,
@@ -166,15 +175,15 @@ where
     DecErr: Error + Send + Sync,
     LS: PacketLengthSerializer,
 {
-    pub disconnect_task: DisconnectTask,
-    pub stream: NS,
-    pub serializer: Arc<
+    pub(crate) disconnect_task: CancellationToken,
+    pub(crate) stream: NS,
+    pub(crate) serializer: Arc<
         dyn Serializer<ReceivingPacket, SendingPacket, EncodeError = EncErr, DecodeError = DecErr>,
     >,
-    pub packet_length_serializer: Arc<LS>,
-    pub packets_rx: OutgoingReceiver<SendingPacket>,
-    pub receive_limits: ReceiveLimits,
-    pub id: ConnectionId,
+    pub(crate) packet_length_serializer: Arc<LS>,
+    pub(crate) packets_rx: OutgoingReceiver<SendingPacket, NS::Handle>,
+    pub(crate) receive_limits: ReceiveLimits,
+    pub(crate) id: ConnectionId,
 }
 
 impl<ReceivingPacket, SendingPacket, NS, EncErr, DecErr, LS> Debug
@@ -249,8 +258,9 @@ where
     DecErr: Error + Send + Sync,
     LS: PacketLengthSerializer,
 {
-    /// Creates a client-side connection with the default unlimited receive size.
-    #[cfg(feature = "client")]
+    /// Creates a connection with the default unlimited receive size.
+    /// Use [`Self::receive_limits`] to configure a bound before starting reception.
+    #[must_use]
     pub fn new(
         stream: NS,
         serializer: Arc<
@@ -273,7 +283,6 @@ where
         )
     }
 
-    #[cfg(feature = "client")]
     pub(crate) fn with_limits(
         stream: NS,
         serializer: Arc<
@@ -285,11 +294,12 @@ where
             >,
         >,
         packet_length_serializer: LS,
-        packets_rx: OutgoingReceiver<SendingPacket>,
+        mut packets_rx: OutgoingReceiver<SendingPacket, NS::Handle>,
         receive_limits: ReceiveLimits,
     ) -> Self {
+        packets_rx.set_transport(stream.transport());
         Self {
-            disconnect_task: DisconnectTask::default(),
+            disconnect_task: CancellationToken::default(),
             stream,
             serializer,
             packet_length_serializer: Arc::new(packet_length_serializer),
@@ -299,18 +309,66 @@ where
         }
     }
 
+    #[cfg(any(feature = "client", feature = "server"))]
+    pub(crate) fn ecs_connection(
+        &self,
+        packet_tx: OutgoingSender<SendingPacket>,
+    ) -> EcsConnection<SendingPacket, NS::Handle> {
+        EcsConnection {
+            disconnect_task: self.disconnect_task.clone(),
+            id: self.id,
+            published: Arc::new(AtomicBool::new(false)),
+            packet_tx,
+            transport: self.stream.transport(),
+            local_addr: self.local_addr(),
+            peer_addr: self.peer_addr(),
+        }
+    }
+
+    /// Borrows the underlying stream without replacing its session state.
+    #[must_use]
+    pub const fn stream(&self) -> &NS {
+        &self.stream
+    }
+
+    /// Takes ownership of the stream, dropping the outgoing queue and raw wrapper.
+    #[must_use]
+    pub fn into_stream(self) -> NS {
+        self.stream
+    }
+
+    /// Returns the live receive limits used by this connection.
+    #[must_use]
+    pub const fn receive_limits(&self) -> &ReceiveLimits {
+        &self.receive_limits
+    }
+
+    /// Clones this stream's shared transport controls and diagnostics.
+    #[must_use]
+    pub fn transport(&self) -> NS::Handle {
+        self.stream.transport()
+    }
+
+    /// Signals cancellation to the tasks using this connection.
+    pub fn disconnect(&self) {
+        self.disconnect_task.cancel();
+    }
+
+    /// Identifies this connection independently of its peer address.
+    #[must_use]
     pub const fn id(&self) -> ConnectionId {
         self.id
     }
 
+    /// Returns the socket address of the local endpoint.
+    #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
         self.stream.local_addr()
     }
 
+    /// Returns the socket address of the remote peer.
+    #[must_use]
     pub fn peer_addr(&self) -> SocketAddr {
         self.stream.peer_addr()
     }
 }
-
-/// Shared cancellation signal for all tasks belonging to a connection.
-pub type DisconnectTask = tokio_util::sync::CancellationToken;

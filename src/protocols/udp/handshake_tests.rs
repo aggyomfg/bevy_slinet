@@ -4,7 +4,7 @@ use super::wire::{Control, CookieJar, Frame, HandshakeFrame, HandshakeKind, Nonc
 use super::{UdpNetworkListener, UdpOptions};
 use crate::{
     connection::ReceiveLimits,
-    protocols::protocol::{NetworkStream, ReadStream},
+    protocols::protocol::{NetworkStream, PacketReader},
     serializers::{packet_length_serializer::LittleEndian, serializer::Serializer},
 };
 use bevy::platform::time::Instant;

@@ -3,7 +3,7 @@ use super::wire::{Frame, HandshakeFrame, Nonce};
 use super::{UdpNetworkListener, UdpOptions};
 use crate::{
     connection::ReceiveLimits,
-    protocols::protocol::{NetworkStream, ReadStream},
+    protocols::protocol::{NetworkStream, PacketReader},
     serializers::{packet_length_serializer::LittleEndian, serializer::Serializer},
 };
 use bevy::platform::time::Instant;
@@ -69,7 +69,7 @@ async fn receive_limit_and_malformed_payloads_are_counted_per_session() {
                 Instant::now(),
             )
             .unwrap();
-        let handle = stream.udp().unwrap();
+        let handle = stream.transport();
         assert_eq!(
             handle.max_payload_size(),
             UdpOptions::DEFAULT.max_payload_size().unwrap()
@@ -222,7 +222,7 @@ async fn initial_accept_is_counted_as_received_control() {
         })
         .await
         .unwrap();
-        let handle = client.unwrap().udp().unwrap();
+        let handle = client.unwrap().transport();
         let stats = handle.stats();
         assert_eq!(stats.received_control_packets, 1);
         assert_eq!(stats.received_control_bytes, HEADER as u64);
@@ -253,7 +253,7 @@ async fn closing_server_read_counts_undelivered_raw_datagrams() {
                 Instant::now(),
             )
             .unwrap();
-        let handle = stream.udp().unwrap();
+        let handle = stream.transport();
         let (read, _write) = stream.into_split().await.unwrap();
         for _ in 0..2 {
             listener.dispatch(
@@ -275,7 +275,7 @@ async fn closing_server_read_counts_undelivered_raw_datagrams() {
 )]
 async fn handle_updates_live_writer_rate_and_read_close_cancels_wait() {
     super::test_support::wall_timeout(async {
-        use crate::protocols::protocol::WriteStream;
+        use crate::protocols::protocol::PacketWriter;
 
         let listener = UdpNetworkListener::bind(
             "127.0.0.1:0".parse().unwrap(),
@@ -296,7 +296,7 @@ async fn handle_updates_live_writer_rate_and_read_close_cancels_wait() {
                 Instant::now(),
             )
             .unwrap();
-        let handle = stream.udp().unwrap();
+        let handle = stream.transport();
         let (read, mut write) = stream.into_split().await.unwrap();
         let length = Length::default();
         write
@@ -344,7 +344,7 @@ async fn unsplit_server_stream_counts_undelivered_raw_datagrams() {
                 Instant::now(),
             )
             .unwrap();
-        let handle = stream.udp().unwrap();
+        let handle = stream.transport();
         for _ in 0..2 {
             listener.dispatch(
                 &Frame::data(cookie.mac, &[7]).encode(),
@@ -388,7 +388,7 @@ async fn raw_drop_oldest_evicts_exact_datagram_and_preserves_timestamp() {
                 Instant::now(),
             )
             .unwrap();
-        let handle = stream.udp().unwrap();
+        let handle = stream.transport();
         let (mut read, _write) = stream.into_split().await.unwrap();
         let started = Instant::now();
         for (value, offset_ms) in [(1, 0), (2, 1), (3, 2)] {
@@ -498,7 +498,7 @@ async fn raw_byte_budget_obeys_both_policies_without_eviction_for_oversized_item
                     Instant::now(),
                 )
                 .unwrap();
-            let handle = stream.udp().unwrap();
+            let handle = stream.transport();
             let (mut read, _write) = stream.into_split().await.unwrap();
             let started = Instant::now();
             for (payload, offset_ms) in [(&[1, 1][..], 0), (&[2][..], 1), (&[3, 3][..], 2)] {
@@ -560,7 +560,7 @@ async fn raw_byte_budget_obeys_both_policies_without_eviction_for_oversized_item
 async fn socket_send_error_is_counted_and_followed_by_healthy_send() {
     super::test_support::wall_timeout(async {
         use super::wire::Payload;
-        use crate::protocols::protocol::WriteStream;
+        use crate::protocols::protocol::PacketWriter;
 
         let listener =
             UdpNetworkListener::bind("127.0.0.1:0".parse().unwrap(), UdpOptions::DEFAULT)
@@ -576,7 +576,7 @@ async fn socket_send_error_is_counted_and_followed_by_healthy_send() {
                 Instant::now(),
             )
             .unwrap();
-        let handle = stream.udp().unwrap();
+        let handle = stream.transport();
         let (_read, mut write) = stream.into_split().await.unwrap();
         let before = handle.stats().dropped_socket_send_error;
         let length = Length::default();
