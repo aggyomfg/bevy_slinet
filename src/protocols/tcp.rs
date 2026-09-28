@@ -1,7 +1,10 @@
 //! TCP [`Protocol`] implementation based on [`tokio::net`]. You can enable it by adding `protocol_tcp` feature.
 
+use bevy::platform::time::Instant;
+use std::fmt::Debug;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 
 use async_trait::async_trait;
@@ -9,8 +12,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
 use crate::protocol::{
-    ClientStream, Listener, NetworkStream, Protocol, ReadStream, ServerStream, WriteStream,
+    receive_framed, ClientStream, Listener, NetworkStream, Protocol, ReadStream, ReceiveError,
+    ServerStream, WriteStream,
 };
+use crate::serializer::Serializer;
+use crate::PacketLengthSerializer;
 
 /// TCP protocol.
 pub struct TcpProtocol;
@@ -68,6 +74,20 @@ impl NetworkStream for TcpNetworkStream {
 impl ReadStream for OwnedReadHalf {
     async fn read_exact(&mut self, buffer: &mut [u8]) -> io::Result<()> {
         AsyncReadExt::read_exact(self, buffer).await.map(|_| ())
+    }
+
+    async fn receive_with_timestamp<ReceivingPacket, SendingPacket, S, LS>(
+        &mut self,
+        serializer: Arc<S>,
+        length_serializer: &LS,
+    ) -> Result<(ReceivingPacket, Instant), ReceiveError<S::DecodeError, LS>>
+    where
+        ReceivingPacket: Send + Sync + Debug + 'static,
+        SendingPacket: Send + Sync + Debug + 'static,
+        S: Serializer<ReceivingPacket, SendingPacket> + ?Sized,
+        LS: PacketLengthSerializer,
+    {
+        receive_framed(self, serializer, length_serializer).await
     }
 }
 

@@ -284,11 +284,11 @@ fn setup_system<Config: ClientConfig>(mut commands: Commands, _world: &World) {
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
-                        result = read.receive(Arc::clone(&serializer2), &*packet_length_serializer2) => {
+                        result = read.receive_with_timestamp(Arc::clone(&serializer2), &*packet_length_serializer2) => {
                             match result {
-                                Ok(packet) => {
+                                Ok((packet, received_at)) => {
                                     log::trace!("({id:?}) Received packet {packet:?}");
-                                    if pack_tx2.send((ecs_conn.clone(), packet, Instant::now())).is_err() {
+                                    if pack_tx2.send((ecs_conn.clone(), packet, received_at)).is_err() {
                                         break
                                     }
                                 }
@@ -438,7 +438,8 @@ pub struct PacketReceiveEvent<Config: ClientConfig> {
     pub connection: ClientConnection<Config>,
     /// The packet.
     pub packet: Config::ServerPacket,
-    /// When the network task received the packet, before it waited for the next ECS update.
+    /// When the built-in transport finished reading the packet, before decoding or queueing.
+    /// Custom protocols use `ReadStream::receive_with_timestamp` semantics.
     pub received_at: Instant,
 }
 

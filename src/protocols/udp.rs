@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bevy::log;
+use bevy::platform::time::Instant;
 use bevy::prelude::Resource;
 use dashmap::DashMap;
 use futures::future::poll_fn;
@@ -172,7 +173,7 @@ struct Inner {
 
 #[derive(Default)]
 struct Queue {
-    datagrams: VecDeque<Box<[u8]>>,
+    datagrams: VecDeque<(Box<[u8]>, Instant)>,
     bytes: usize,
 }
 
@@ -180,7 +181,7 @@ struct Queue {
 struct UdpRead(Arc<Inner>);
 
 impl UdpRead {
-    fn push(&self, datagram: &[u8]) {
+    fn push(&self, datagram: &[u8], received_at: Instant) {
         // Empty datagrams are connection probes sent by `UdpClientStream::connect`.
         if datagram.is_empty() {
             return;
@@ -193,18 +194,18 @@ impl UdpRead {
                 return;
             }
             queue.bytes += datagram.len();
-            queue.datagrams.push_back(datagram.into());
+            queue.datagrams.push_back((datagram.into(), received_at));
         }
         self.0.waker.wake();
     }
 
-    async fn pop(&self) -> Box<[u8]> {
+    async fn pop(&self) -> (Box<[u8]>, Instant) {
         poll_fn(|cx| {
             self.0.waker.register(cx.waker());
             let mut queue = self.0.queue.lock().unwrap();
             match queue.datagrams.pop_front() {
                 Some(datagram) => {
-                    queue.bytes -= datagram.len();
+                    queue.bytes -= datagram.0.len();
                     Poll::Ready(datagram)
                 }
                 None => Poll::Pending,
@@ -240,12 +241,13 @@ impl Listener for UdpNetworkListener {
                 }
                 Err(err) => return Err(err),
             };
+            let received_at = Instant::now();
             let datagram = &buf[..len];
             if let Some(task) = self.tasks.get(&address) {
-                task.push(datagram);
+                task.push(datagram, received_at);
             } else if matches!(datagram.first(), None | Some(&DATA_DATAGRAM)) {
                 let new_task = UdpRead::default();
-                new_task.push(datagram);
+                new_task.push(datagram, received_at);
                 self.tasks.insert(address, new_task.clone());
                 return Ok(UdpServerStream {
                     task: new_task,
@@ -329,9 +331,25 @@ impl ReadStream for UdpServerReadHalf {
         S: Serializer<ReceivingPacket, SendingPacket> + ?Sized,
         LS: PacketLengthSerializer,
     {
+        self.receive_with_timestamp(serializer, _length_serializer)
+            .await
+            .map(|(packet, _)| packet)
+    }
+
+    async fn receive_with_timestamp<ReceivingPacket, SendingPacket, S, LS>(
+        &mut self,
+        serializer: Arc<S>,
+        _length_serializer: &LS,
+    ) -> Result<(ReceivingPacket, Instant), ReceiveError<S::DecodeError, LS>>
+    where
+        ReceivingPacket: Send + Sync + Debug + 'static,
+        SendingPacket: Send + Sync + Debug + 'static,
+        S: Serializer<ReceivingPacket, SendingPacket> + ?Sized,
+        LS: PacketLengthSerializer,
+    {
         loop {
             let idle_timeout = *self.idle_timeout.borrow();
-            let datagram = tokio::time::timeout(idle_timeout, self.task.pop())
+            let (datagram, received_at) = tokio::time::timeout(idle_timeout, self.task.pop())
                 .await
                 .map_err(|_| idle_error())?;
             if let Some(packet) = decode_datagram(
@@ -339,7 +357,7 @@ impl ReadStream for UdpServerReadHalf {
                 &*serializer,
                 MAX_PACKET_SIZE.load(Ordering::Relaxed),
             ) {
-                return Ok(packet);
+                return Ok((packet, received_at));
             }
         }
     }
@@ -473,18 +491,35 @@ impl ReadStream for UdpClientReadHalf {
         S: Serializer<ReceivingPacket, SendingPacket> + ?Sized,
         LS: PacketLengthSerializer,
     {
+        self.receive_with_timestamp(serializer, _length_serializer)
+            .await
+            .map(|(packet, _)| packet)
+    }
+
+    async fn receive_with_timestamp<ReceivingPacket, SendingPacket, S, LS>(
+        &mut self,
+        serializer: Arc<S>,
+        _length_serializer: &LS,
+    ) -> Result<(ReceivingPacket, Instant), ReceiveError<S::DecodeError, LS>>
+    where
+        ReceivingPacket: Send + Sync + Debug + 'static,
+        SendingPacket: Send + Sync + Debug + 'static,
+        S: Serializer<ReceivingPacket, SendingPacket> + ?Sized,
+        LS: PacketLengthSerializer,
+    {
         loop {
             let idle_timeout = *self.idle_timeout.borrow();
             let len = tokio::time::timeout(idle_timeout, self.socket.recv(&mut self.buffer))
                 .await
                 .map_err(|_| idle_error())?
                 .map_err(ReceiveError::Io)?;
+            let received_at = Instant::now();
             if let Some(packet) = decode_datagram(
                 &self.buffer[..len],
                 &*serializer,
                 MAX_PACKET_SIZE.load(Ordering::Relaxed),
             ) {
-                return Ok(packet);
+                return Ok((packet, received_at));
             }
         }
     }
@@ -701,18 +736,45 @@ mod tests {
         with_timeout(async {
             let listener = UdpProtocol::bind(([127, 0, 0, 1], 0).into()).await.unwrap();
             let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let before_send = Instant::now();
             peer.send_to(&[DATA_DATAGRAM, 7], listener.address())
                 .await
                 .unwrap();
 
-            let (mut read, _) = listener.accept().await.unwrap().into_split().await.unwrap();
-            let packet = read
-                .receive::<_, Vec<u8>, _, _>(Arc::new(RawSerializer), &Ls::default())
+            let stream = listener.accept().await.unwrap();
+            let after_accept = Instant::now();
+            let (mut read, _) = stream.into_split().await.unwrap();
+            let (packet, received_at) = read
+                .receive_with_timestamp::<_, Vec<u8>, _, _>(Arc::new(RawSerializer), &Ls::default())
                 .await
                 .unwrap();
             assert_eq!(packet, vec![7]);
+            assert!(before_send <= received_at && received_at <= after_accept);
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn queued_packets_preserve_their_timestamps() {
+        let task = UdpRead::default();
+        task.push(&[KEEPALIVE_DATAGRAM], Instant::now());
+        task.push(&[DATA_DATAGRAM, 0xFF], Instant::now());
+        let first = Instant::now();
+        task.push(&[DATA_DATAGRAM, 7], first);
+        let second = Instant::now();
+        task.push(&[DATA_DATAGRAM], second);
+        let mut read = UdpServerReadHalf {
+            task,
+            idle_timeout: tokio::sync::watch::channel(UdpIdleTimeout::default().0).1,
+            _keepalive: oneshot::channel().0,
+        };
+        for expected in [(vec![7], first), (vec![], second)] {
+            let received = read
+                .receive_with_timestamp::<_, Vec<u8>, _, _>(Arc::new(RawSerializer), &Ls::default())
+                .await
+                .unwrap();
+            assert_eq!(received, expected);
+        }
     }
 
     #[tokio::test]
@@ -860,27 +922,27 @@ mod tests {
     async fn queue_overflow_drops_only_excess_datagrams() {
         with_timeout(async {
             let queue = UdpRead::default();
-            queue.push(&[]);
+            queue.push(&[], Instant::now());
             assert!(queue.0.queue.lock().unwrap().datagrams.is_empty());
             for _ in 0..MAX_QUEUED_DATAGRAMS {
-                queue.push(&[DATA_DATAGRAM, 7]);
+                queue.push(&[DATA_DATAGRAM, 7], Instant::now());
             }
-            queue.push(&[DATA_DATAGRAM, 8]);
+            queue.push(&[DATA_DATAGRAM, 8], Instant::now());
             assert_eq!(
                 queue.0.queue.lock().unwrap().datagrams.len(),
                 MAX_QUEUED_DATAGRAMS
             );
-            assert_eq!(&*queue.pop().await, &[DATA_DATAGRAM, 7]);
-            queue.push(&[DATA_DATAGRAM, 9]);
+            assert_eq!(&*queue.pop().await.0, &[DATA_DATAGRAM, 7]);
+            queue.push(&[DATA_DATAGRAM, 9], Instant::now());
             for _ in 1..MAX_QUEUED_DATAGRAMS {
-                assert_eq!(&*queue.pop().await, &[DATA_DATAGRAM, 7]);
+                assert_eq!(&*queue.pop().await.0, &[DATA_DATAGRAM, 7]);
             }
-            assert_eq!(&*queue.pop().await, &[DATA_DATAGRAM, 9]);
+            assert_eq!(&*queue.pop().await.0, &[DATA_DATAGRAM, 9]);
             assert_eq!(queue.0.queue.lock().unwrap().bytes, 0);
             let mut pending = Box::pin(queue.pop());
             assert!(futures::poll!(pending.as_mut()).is_pending());
-            queue.push(&[DATA_DATAGRAM]);
-            assert_eq!(&*pending.await, &[DATA_DATAGRAM]);
+            queue.push(&[DATA_DATAGRAM], Instant::now());
+            assert_eq!(&*pending.await.0, &[DATA_DATAGRAM]);
         })
         .await;
     }
@@ -892,18 +954,18 @@ mod tests {
             let big = vec![DATA_DATAGRAM; MAX_DATAGRAM_SIZE];
             let fits = MAX_QUEUED_BYTES / MAX_DATAGRAM_SIZE;
             for _ in 0..fits + 1 {
-                queue.push(&big);
+                queue.push(&big, Instant::now());
             }
             let small_fits = MAX_QUEUED_BYTES - fits * MAX_DATAGRAM_SIZE;
-            queue.push(&vec![DATA_DATAGRAM; small_fits]);
-            queue.push(&[DATA_DATAGRAM]);
+            queue.push(&vec![DATA_DATAGRAM; small_fits], Instant::now());
+            queue.push(&[DATA_DATAGRAM], Instant::now());
             {
                 let queued = queue.0.queue.lock().unwrap();
                 assert_eq!(queued.datagrams.len(), fits + 1);
                 assert_eq!(queued.bytes, MAX_QUEUED_BYTES);
             }
-            assert_eq!(queue.pop().await.len(), MAX_DATAGRAM_SIZE);
-            queue.push(&big);
+            assert_eq!(queue.pop().await.0.len(), MAX_DATAGRAM_SIZE);
+            queue.push(&big, Instant::now());
             assert_eq!(queue.0.queue.lock().unwrap().bytes, MAX_QUEUED_BYTES);
         })
         .await;
@@ -1037,7 +1099,7 @@ mod tests {
         assert!(futures::poll!(receive.as_mut()).is_pending());
 
         settings.send_replace(Duration::from_secs(2));
-        task.push(&[KEEPALIVE_DATAGRAM]);
+        task.push(&[KEEPALIVE_DATAGRAM], Instant::now());
         assert!(futures::poll!(receive.as_mut()).is_pending());
         tokio::time::advance(Duration::from_secs(2)).await;
         assert_idle(receive.await.unwrap_err());

@@ -190,11 +190,11 @@ fn create_setup_system<Config: ServerConfig>(address: SocketAddr) -> impl Fn(Com
                                 // `select!` handles intentional disconnections (ecs_connection.disconnect()).
                                 // AsyncReadExt::read_exact is not cancel-safe and loses data, but we don't need that data anymore
                                 tokio::select! {
-                                    result = read.receive(Arc::clone(&serializer2), &*packet_length_serializer2) => {
+                                    result = read.receive_with_timestamp(Arc::clone(&serializer2), &*packet_length_serializer2) => {
                                         match result {
-                                            Ok(packet) => {
+                                            Ok((packet, received_at)) => {
                                                 log::trace!("({id:?}) Received packet {:?}", packet);
-                                                if let Err(err) = pack_tx2.send((ecs_conn.clone(), packet, Instant::now())) {
+                                                if let Err(err) = pack_tx2.send((ecs_conn.clone(), packet, received_at)) {
                                                     log::error!("({id:?}) Failed to forward received packet: {err}");
                                                 }
                                             }
@@ -353,7 +353,8 @@ pub struct PacketReceiveEvent<Config: ServerConfig> {
     pub connection: ServerConnection<Config>,
     /// The packet.
     pub packet: Config::ClientPacket,
-    /// When the network task received the packet, before it waited for the next ECS update.
+    /// When the built-in transport finished reading the packet, before decoding or queueing.
+    /// Custom protocols use `ReadStream::receive_with_timestamp` semantics.
     pub received_at: Instant,
 }
 

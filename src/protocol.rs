@@ -4,6 +4,7 @@
 //! Built-in protocols are listed in the [`protocols`](crate::protocols) module.
 
 use bevy::log;
+use bevy::platform::time::Instant;
 use io::Write;
 use std::error::Error;
 use std::fmt::{Debug, Formatter};
@@ -114,32 +115,71 @@ pub trait ReadStream: Send + Sync + 'static {
         S: Serializer<ReceivingPacket, SendingPacket> + ?Sized,
         LS: PacketLengthSerializer,
     {
-        let mut buf = Vec::new();
-        let mut length = Err(PacketLengthDeserializationError::NeedMoreBytes(LS::SIZE));
-        while let Err(PacketLengthDeserializationError::NeedMoreBytes(amt)) = length {
-            let mut tmp = vec![0; amt];
-            self.read_exact(&mut tmp).await.map_err(ReceiveError::Io)?;
-            buf.extend(tmp);
-            length = length_serializer.deserialize_packet_length(&buf);
-        }
+        receive_framed(self, serializer, length_serializer)
+            .await
+            .map(|(packet, _)| packet)
+    }
 
-        match length {
-            Ok(length) => {
-                if length > MAX_PACKET_SIZE.load(Ordering::Relaxed) {
-                    Err(ReceiveError::PacketTooBig)
-                } else {
-                    let mut buf = vec![0; length];
-                    self.read_exact(&mut buf).await.map_err(ReceiveError::Io)?;
-                    Ok(serializer
-                        .deserialize(&buf)
-                        .map_err(ReceiveError::Deserialization)?)
-                }
+    /// Reads a packet and its receive time.
+    ///
+    /// Built-in protocols capture the time before decoding (and before UDP queueing).
+    /// The default preserves custom `receive` implementations and timestamps their completion;
+    /// override this method to provide the transport's receive time.
+    async fn receive_with_timestamp<ReceivingPacket, SendingPacket, S, LS>(
+        &mut self,
+        serializer: Arc<S>,
+        length_serializer: &LS,
+    ) -> Result<(ReceivingPacket, Instant), ReceiveError<S::DecodeError, LS>>
+    where
+        ReceivingPacket: Send + Sync + Debug + 'static,
+        SendingPacket: Send + Sync + Debug + 'static,
+        S: Serializer<ReceivingPacket, SendingPacket> + ?Sized,
+        LS: PacketLengthSerializer,
+    {
+        let packet = self.receive(serializer, length_serializer).await?;
+        Ok((packet, Instant::now()))
+    }
+}
+
+pub(crate) async fn receive_framed<R, ReceivingPacket, SendingPacket, S, LS>(
+    read: &mut R,
+    serializer: Arc<S>,
+    length_serializer: &LS,
+) -> Result<(ReceivingPacket, Instant), ReceiveError<S::DecodeError, LS>>
+where
+    R: ReadStream + ?Sized,
+    ReceivingPacket: Send + Sync + Debug + 'static,
+    SendingPacket: Send + Sync + Debug + 'static,
+    S: Serializer<ReceivingPacket, SendingPacket> + ?Sized,
+    LS: PacketLengthSerializer,
+{
+    let mut buf = Vec::new();
+    let mut length = Err(PacketLengthDeserializationError::NeedMoreBytes(LS::SIZE));
+    while let Err(PacketLengthDeserializationError::NeedMoreBytes(amt)) = length {
+        let mut tmp = vec![0; amt];
+        read.read_exact(&mut tmp).await.map_err(ReceiveError::Io)?;
+        buf.extend(tmp);
+        length = length_serializer.deserialize_packet_length(&buf);
+    }
+
+    match length {
+        Ok(length) => {
+            if length > MAX_PACKET_SIZE.load(Ordering::Relaxed) {
+                Err(ReceiveError::PacketTooBig)
+            } else {
+                let mut buf = vec![0; length];
+                read.read_exact(&mut buf).await.map_err(ReceiveError::Io)?;
+                let received_at = Instant::now();
+                let packet = serializer
+                    .deserialize(&buf)
+                    .map_err(ReceiveError::Deserialization)?;
+                Ok((packet, received_at))
             }
-            Err(PacketLengthDeserializationError::Err(err)) => {
-                Err(ReceiveError::LengthDeserialization(err))
-            }
-            Err(PacketLengthDeserializationError::NeedMoreBytes(_)) => unreachable!(),
         }
+        Err(PacketLengthDeserializationError::Err(err)) => {
+            Err(ReceiveError::LengthDeserialization(err))
+        }
+        Err(PacketLengthDeserializationError::NeedMoreBytes(_)) => unreachable!(),
     }
 }
 
@@ -214,5 +254,114 @@ pub trait WriteStream: Send + Sync + 'static {
         buf.write_all(&serialized)?;
         self.write_all(&buf).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packet_length_serializer::LittleEndian;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct DecodeTime(Mutex<Option<Instant>>);
+
+    impl Serializer<Vec<u8>, Vec<u8>> for DecodeTime {
+        type EncodeError = io::Error;
+        type DecodeError = io::Error;
+
+        fn serialize(&self, packet: Vec<u8>) -> io::Result<Vec<u8>> {
+            Ok(packet)
+        }
+
+        fn deserialize(&self, data: &[u8]) -> io::Result<Vec<u8>> {
+            *self.0.lock().unwrap() = Some(Instant::now());
+            Ok(data.to_vec())
+        }
+    }
+
+    #[cfg(any(feature = "protocol_tcp", feature = "protocol_udp"))]
+    async fn check_timestamps<P: Protocol>()
+    where
+        P::Listener: Send + Sync + 'static,
+    {
+        async fn check(read: &mut impl ReadStream, write: &mut impl WriteStream) {
+            let serializer = Arc::new(DecodeTime::default());
+            let length = LittleEndian::<u32>::default();
+            for payload in [vec![7], vec![]] {
+                write
+                    .send(payload.clone(), Arc::clone(&serializer), &length)
+                    .await
+                    .unwrap();
+                let (packet, received_at) = read
+                    .receive_with_timestamp(Arc::clone(&serializer), &length)
+                    .await
+                    .unwrap();
+                assert_eq!(packet, payload);
+                assert!(received_at <= serializer.0.lock().unwrap().unwrap());
+            }
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let listener = Arc::new(P::bind(([127, 0, 0, 1], 0).into()).await.unwrap());
+            let client = P::connect_to_server(listener.address()).await.unwrap();
+            let server = listener.accept().await.unwrap();
+            let pump = tokio::spawn(async move { while listener.accept().await.is_ok() {} });
+            let (mut client_read, mut client_write) = client.into_split().await.unwrap();
+            let (mut server_read, mut server_write) = server.into_split().await.unwrap();
+            check(&mut server_read, &mut client_write).await;
+            check(&mut client_read, &mut server_write).await;
+            pump.abort();
+        })
+        .await
+        .expect("timestamp test timed out");
+    }
+
+    #[cfg(feature = "protocol_tcp")]
+    #[tokio::test]
+    async fn tcp_timestamps_precede_decoding() {
+        check_timestamps::<crate::protocols::tcp::TcpProtocol>().await;
+    }
+
+    #[cfg(feature = "protocol_udp")]
+    #[tokio::test]
+    async fn udp_timestamps_precede_decoding() {
+        check_timestamps::<crate::protocols::udp::UdpProtocol>().await;
+    }
+
+    #[tokio::test]
+    async fn timestamp_fallback_preserves_custom_receive() {
+        struct CustomRead;
+
+        #[async_trait]
+        impl ReadStream for CustomRead {
+            async fn read_exact(&mut self, _buffer: &mut [u8]) -> io::Result<()> {
+                panic!("custom receive must not use stream framing")
+            }
+
+            async fn receive<ReceivingPacket, SendingPacket, S, LS>(
+                &mut self,
+                serializer: Arc<S>,
+                _length_serializer: &LS,
+            ) -> Result<ReceivingPacket, ReceiveError<S::DecodeError, LS>>
+            where
+                ReceivingPacket: Send + Sync + Debug + 'static,
+                SendingPacket: Send + Sync + Debug + 'static,
+                S: Serializer<ReceivingPacket, SendingPacket> + ?Sized,
+                LS: PacketLengthSerializer,
+            {
+                serializer
+                    .deserialize(&[7])
+                    .map_err(ReceiveError::Deserialization)
+            }
+        }
+
+        let serializer = Arc::new(DecodeTime::default());
+        let (packet, received_at) = CustomRead
+            .receive_with_timestamp(Arc::clone(&serializer), &LittleEndian::<u32>::default())
+            .await
+            .unwrap();
+        assert_eq!(packet, vec![7]);
+        assert!(received_at >= serializer.0.lock().unwrap().unwrap());
     }
 }
