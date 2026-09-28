@@ -41,6 +41,7 @@ tokio = { version = "1", features = [
     "sync",
     "macros",
 ] }
+tokio-util = { version = "0.7", features = ["rt"] }
 async-trait = "0.1"
 futures = { version = "0.3" }
 

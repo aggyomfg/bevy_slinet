@@ -2,15 +2,11 @@
 
 use std::error::Error;
 use std::fmt::{Debug, Formatter};
-use std::future::Future;
 use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use bevy::prelude::Resource;
-use futures::task::AtomicWaker;
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -79,12 +75,15 @@ where
 
     /// Sends a packet to the server. Returns error if disconnected.
     pub fn send(&self, packet: SendingPacket) -> Result<(), SendError<SendingPacket>> {
+        if self.disconnect_task.is_cancelled() {
+            return Err(SendError(packet));
+        }
         self.packet_tx.send(packet)
     }
 
     /// Closes the connection.
     pub fn disconnect(&self) {
-        self.disconnect_task.disconnect();
+        self.disconnect_task.cancel();
     }
 }
 
@@ -208,39 +207,8 @@ where
     }
 }
 
-#[derive(Clone, Default)]
-pub struct DisconnectTask(Arc<DisconnectTaskInner>);
-
-#[derive(Default)]
-struct DisconnectTaskInner {
-    disconnect: AtomicBool,
-    waker: AtomicWaker,
-}
-
-impl DisconnectTask {
-    fn disconnect(&self) {
-        self.0.disconnect.store(true, Ordering::Relaxed);
-        self.0.waker.wake();
-    }
-}
-
-impl Future for DisconnectTask {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.0.disconnect.load(Ordering::Relaxed) {
-            return Poll::Ready(());
-        }
-
-        self.0.waker.register(cx.waker());
-
-        if self.0.disconnect.load(Ordering::Relaxed) {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
-        }
-    }
-}
+/// Shared cancellation signal for all tasks belonging to a connection.
+pub type DisconnectTask = tokio_util::sync::CancellationToken;
 
 #[cfg(any(feature = "client", feature = "server"))]
 pub(crate) fn set_max_packet_size_system(

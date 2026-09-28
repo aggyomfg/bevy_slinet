@@ -16,7 +16,11 @@ use std::time::{Duration, Instant};
 /// Calls `step` until it returns `true` or a timeout expires.
 pub(crate) fn wait_until(mut step: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !step() && Instant::now() < deadline {
+    while !step() {
+        assert!(
+            Instant::now() < deadline,
+            "condition was not met before timeout"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -192,10 +196,9 @@ fn udp_packets_and_disconnection() {
             .world()
             .contains_resource::<ClientConnection<UdpConfig>>()
     });
-    assert!(app_server
+    assert!(!app_client
         .world()
-        .resource::<ServerConnections<UdpConfig>>()
-        .is_empty());
+        .contains_resource::<ClientConnection<UdpConfig>>());
 }
 
 #[cfg(feature = "protocol_udp")]
@@ -335,4 +338,157 @@ fn client_packet_receive_system<C: TestConfig>(
 ) {
     assert!(event.event().received_at <= bevy::platform::time::Instant::now());
     received_packets.packets.push(event.event().packet);
+}
+
+#[cfg(feature = "protocol_udp")]
+#[test]
+fn failed_parallel_attempt_must_not_remove_live_connection() {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopped = Arc::clone(&stop);
+    let worker = std::thread::spawn(move || {
+        let mut ignored = None;
+        let mut buffer = [0; 64];
+        while !stopped.load(std::sync::atomic::Ordering::Relaxed) {
+            let Ok((len, source)) = socket.recv_from(&mut buffer) else {
+                continue;
+            };
+            if ignored.is_none() {
+                ignored = Some(source);
+            }
+            if ignored == Some(source) {
+                continue;
+            }
+            if len == 0 {
+                socket.send_to(&[], source).unwrap();
+            } else if buffer[..len] == [2] {
+                socket.send_to(&[2], source).unwrap();
+            }
+        }
+    });
+    let mut client = App::new();
+    client.add_plugins(ClientPlugin::<UdpConfig>::new());
+    client.update();
+    for _ in 0..2 {
+        client
+            .world_mut()
+            .trigger(client::ConnectionRequestEvent::<UdpConfig>::new(address));
+    }
+    wait_until(|| {
+        client.update();
+        client
+            .world()
+            .resource::<client::ClientConnections<UdpConfig>>()
+            .len()
+            == 1
+    });
+    assert_eq!(
+        client
+            .world()
+            .resource::<client::ClientConnections<UdpConfig>>()
+            .len(),
+        1
+    );
+    let established = Instant::now();
+    while established.elapsed() < Duration::from_secs(6) {
+        client.update();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    worker.join().unwrap();
+    assert_eq!(
+        client
+            .world()
+            .resource::<client::ClientConnections<UdpConfig>>()
+            .len(),
+        1,
+        "the live connection must survive failure of another attempt to the same peer_addr"
+    );
+}
+
+#[cfg(feature = "protocol_udp")]
+#[test]
+fn retained_connection_must_reject_send_after_disconnect() {
+    let (mut server, mut client) = exchange_packets::<UdpConfig>();
+    let retained = client
+        .world()
+        .resource::<ClientConnection<UdpConfig>>()
+        .clone();
+    retained.disconnect();
+    wait_until(|| {
+        client.update();
+        server.update();
+        client
+            .world()
+            .resource::<client::ClientConnections<UdpConfig>>()
+            .is_empty()
+    });
+    assert!(client
+        .world()
+        .resource::<client::ClientConnections<UdpConfig>>()
+        .is_empty());
+    assert!(
+        retained.send(Packet(99)).is_err(),
+        "a retained connection still accepts packets after the disconnection event"
+    );
+}
+
+#[cfg(feature = "protocol_udp")]
+#[test]
+fn retained_connection_transmits_after_disconnection_event() {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopped = Arc::clone(&stop);
+    let (data_tx, data_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let mut buffer = [0; 64];
+        while !stopped.load(std::sync::atomic::Ordering::Relaxed) {
+            let Ok((len, source)) = socket.recv_from(&mut buffer) else {
+                continue;
+            };
+            if len == 0 {
+                socket.send_to(&[], source).unwrap();
+            } else if buffer[0] == 1 {
+                data_tx.send(buffer[..len].to_vec()).unwrap();
+            } else if buffer[..len] == [2] {
+                socket.send_to(&[2], source).unwrap();
+            }
+        }
+    });
+    let disconnected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let event_observed = Arc::clone(&disconnected);
+    let mut client = App::new();
+    client.add_plugins(ClientPlugin::<UdpConfig>::connect(address));
+    client.add_observer(move |_: On<client::DisconnectionEvent<UdpConfig>>| {
+        event_observed.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+    wait_until(|| {
+        client.update();
+        client
+            .world()
+            .contains_resource::<ClientConnection<UdpConfig>>()
+    });
+    let retained = client
+        .world()
+        .resource::<ClientConnection<UdpConfig>>()
+        .clone();
+    retained.disconnect();
+    wait_until(|| {
+        client.update();
+        disconnected.load(std::sync::atomic::Ordering::Relaxed)
+    });
+    assert!(disconnected.load(std::sync::atomic::Ordering::Relaxed));
+    let send_result = retained.send(Packet(99));
+    let wire_result = data_rx.recv_timeout(Duration::from_secs(1));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    worker.join().unwrap();
+    assert!(wire_result.is_err(), "after DisconnectionEvent retained.send returned {send_result:?} and peer received {wire_result:?}");
 }

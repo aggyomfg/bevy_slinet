@@ -192,6 +192,7 @@ struct DisconnectionReceiver<Config: ClientConfig>(
     UnboundedReceiver<(
         ReceiveError<Config::DecodeError, Config::LengthSerializer>,
         SocketAddr,
+        Option<crate::connection::ConnectionId>,
     )>,
     PhantomData<Config>,
 );
@@ -272,7 +273,8 @@ fn setup_system<Config: ClientConfig>(
                 }
                 Err(err) => {
                     log::warn!("Couldn't connect to server: {err:?}");
-                    if let Err(send_err) = disc_tx2.send((ReceiveError::NoConnection(err), address))
+                    if let Err(send_err) =
+                        disc_tx2.send((ReceiveError::NoConnection(err), address, None))
                     {
                         log::error!("Failed to send disconnection event: {send_err:?}");
                     }
@@ -306,7 +308,9 @@ fn setup_system<Config: ClientConfig>(
             };
 
             read.set_idle_timeout(idle_timeout.clone());
+            let write_cancel = disconnect_task.clone();
             tokio::spawn(async move {
+                let _guard = disconnect_task.clone().drop_guard();
                 loop {
                     tokio::select! {
                         result = read.receive_with_timestamp(Arc::clone(&serializer2), &*packet_length_serializer2) => {
@@ -318,17 +322,18 @@ fn setup_system<Config: ClientConfig>(
                                     }
                                 }
                                 Err(err) => {
+                                    disconnect_task.cancel();
                                     log::debug!("({id:?}) Error receiving next packet: {err:?}");
-                                    if disc_tx2.send((err, peer_addr)).is_err() {
+                                    if disc_tx2.send((err, peer_addr, Some(id))).is_err() {
                                         break
                                     }
                                     break;
                                 }
                             }
                         }
-                        _ = disconnect_task.clone() => {
+                        _ = disconnect_task.cancelled() => {
                             log::debug!("({id:?}) Client disconnected intentionally");
-                            if let Err(err) = disc_tx2.send((ReceiveError::IntentionalDisconnection, peer_addr)) {
+                            if let Err(err) = disc_tx2.send((ReceiveError::IntentionalDisconnection, peer_addr, Some(id))) {
                                 log::error!("({id:?}) Failed to send disconnection event: {err:?}");
                             }
                             break
@@ -336,22 +341,24 @@ fn setup_system<Config: ClientConfig>(
                     }
                 }
             });
-            // `select!` is not needed because `packets_rx` returns `None` when
-            // all senders are be dropped, and `disc_tx2.send(...)` above should
-            // remove all senders from ECS.
             tokio::spawn(async move {
-                while let Some(packet) = packets_rx.recv().await {
-                    log::trace!("({id:?}) Sending packet {:?}", packet);
-                    match write
-                        .send(packet, Arc::clone(&serializer), &*packet_length_serializer)
-                        .await
-                    {
-                        Ok(()) => (),
-                        Err(err) => {
+                let _guard = write_cancel.clone().drop_guard();
+                let sending = async {
+                    while let Some(packet) = packets_rx.recv().await {
+                        log::trace!("({id:?}) Sending packet {packet:?}");
+                        if let Err(err) = write
+                            .send(packet, Arc::clone(&serializer), &*packet_length_serializer)
+                            .await
+                        {
                             log::error!("({id:?}) Error sending packet: {err}");
                             break;
                         }
                     }
+                };
+                tokio::select! {
+                    biased;
+                    _ = write_cancel.cancelled() => {},
+                    _ = sending => {},
                 }
             });
         }
@@ -421,11 +428,13 @@ fn connection_remove_system<Config: ClientConfig>(
     mut old_connections: ResMut<DisconnectionReceiver<Config>>,
     mut connections: ResMut<ClientConnections<Config>>,
 ) {
-    while let Ok((error, address)) = old_connections.0.try_recv() {
-        commands.remove_resource::<ClientConnection<Config>>();
-        connections.retain(|conn| conn.peer_addr() != address);
-        if let Some(connection) = connections.last() {
-            commands.insert_resource(connection.clone());
+    while let Ok((error, address, id)) = old_connections.0.try_recv() {
+        if let Some(id) = id {
+            commands.remove_resource::<ClientConnection<Config>>();
+            connections.retain(|conn| conn.id() != id);
+            if let Some(connection) = connections.last() {
+                commands.insert_resource(connection.clone());
+            }
         }
         commands.trigger(DisconnectionEvent::<Config> {
             error,

@@ -187,7 +187,9 @@ fn create_setup_system<Config: ServerConfig>(
                         let disc_tx2_2 = disc_tx2.clone();
                         let packet_length_serializer2 = Arc::clone(&packet_length_serializer);
                         read.set_idle_timeout(idle_timeout.clone());
+                        let write_cancel = disconnect_task.clone();
                         tokio::spawn(async move {
+                            let _guard = disconnect_task.clone().drop_guard();
                             loop {
                                 // `select!` handles intentional disconnections (ecs_connection.disconnect()).
                                 // AsyncReadExt::read_exact is not cancel-safe and loses data, but we don't need that data anymore
@@ -201,6 +203,7 @@ fn create_setup_system<Config: ServerConfig>(
                                                 }
                                             }
                                             Err(err) => {
+                                                disconnect_task.cancel();
                                                 if let Err(send_err) = disc_tx_2.send((err, ecs_conn.clone())) {
                                                     log::error!("({id:?}) Failed to send disconnection event: {send_err}");
                                                 }
@@ -211,7 +214,7 @@ fn create_setup_system<Config: ServerConfig>(
                                             }
                                         }
                                     }
-                                    _ = disconnect_task.clone() => {
+                                    _ = disconnect_task.cancelled() => {
                                         log::debug!("({id:?}) Client was disconnected intentionally");
                                         if let Err(send_err) = disc_tx_2.send((ReceiveError::IntentionalDisconnection, ecs_conn.clone())) {
                                             log::error!("({id:?}) Failed to send intentional disconnection event: {send_err}");
@@ -224,22 +227,21 @@ fn create_setup_system<Config: ServerConfig>(
                                 };
                             }
                         });
-                        // `select!` is not needed because `packets_rx` returns `None` when
-                        // all senders are be dropped, and `disc_tx2.send(...)` above should
-                        // remove all senders from ECS.
                         tokio::spawn(async move {
-                            while let Some(packet) = packets_rx.recv().await {
-                                log::trace!("({id:?}) Sending packet {:?}", packet);
-                                match write
-                                    .send(packet, Arc::clone(&serializer), &*packet_length_serializer)
-                                    .await
-                                {
-                                    Ok(()) => (),
-                                    Err(err) => {
+                            let _guard = write_cancel.clone().drop_guard();
+                            let sending = async {
+                                while let Some(packet) = packets_rx.recv().await {
+                                    log::trace!("({id:?}) Sending packet {packet:?}");
+                                    if let Err(err) = write.send(packet, Arc::clone(&serializer), &*packet_length_serializer).await {
                                         log::error!("({id:?}) Error sending packet: {err}");
                                         break;
                                     }
                                 }
+                            };
+                            tokio::select! {
+                                biased;
+                                _ = write_cancel.cancelled() => {},
+                                _ = sending => {},
                             }
                         });
                     }
