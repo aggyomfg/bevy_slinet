@@ -1,19 +1,15 @@
-//! A custom packet serializer capable of handling encryption and decryption.
-//! Demonstrates usage with mutable serializers that can mutate their internal state.
+//! Demonstrates a stateful [`MutableSerializer`] with a replaceable [`CryptEngine`].
 
-use std::{
-    error::Error,
-    fmt::{self, Display},
-    marker::PhantomData,
-};
+use std::marker::PhantomData;
 
 use crate::serializer::MutableSerializer;
 use bevy::log;
 use bitcode::{Decode, Encode};
 
-/// Represents custom packets sent from the client, allowing different types of content.
+/// Carries example application data from a client.
 #[derive(Clone, Debug, Decode, Encode, PartialEq)]
 pub enum CustomCryptClientPacket {
+    /// Carries a text payload.
     String(String),
 }
 
@@ -23,9 +19,10 @@ impl Default for CustomCryptClientPacket {
     }
 }
 
-/// Represents custom packets received by the server, allowing different types of content.
+/// Carries example application data from a server.
 #[derive(Clone, Debug, Decode, Encode, PartialEq)]
 pub enum CustomCryptServerPacket {
+    /// Carries a text payload.
     String(String),
 }
 
@@ -35,37 +32,38 @@ impl Default for CustomCryptServerPacket {
     }
 }
 
-// Define a custom error type for serialization errors.
-#[derive(Debug)]
+/// Reports a payload the example codec cannot decode.
+#[derive(Debug, thiserror::Error)]
+#[error("SerializationFailed")]
 pub struct CustomSerializationError;
-impl Display for CustomSerializationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SerializationFailed")
-    }
-}
 
-impl Error for CustomSerializationError {}
-
-/// Defines a trait for cryptographic engines with methods for packet encryption and decryption.
+/// Supplies the payload transformation used by [`CustomCryptSerializer`].
 pub trait CryptEngine<ReceivingPacket, SendingPacket>: Default {
+    /// Transforms an outgoing packet.
+    ///
+    /// # Errors
+    /// Returns an error when the engine cannot encode or transform the packet.
     fn encrypt(&mut self, packet: SendingPacket) -> Result<Vec<u8>, CustomSerializationError>;
+    /// Reconstructs a packet using the engine’s current receive state.
+    ///
+    /// # Errors
+    /// Returns an error when the payload cannot be decoded.
     fn decrypt(&mut self, packet: &[u8]) -> Result<ReceivingPacket, CustomSerializationError>;
 }
 
-/// A simple key pair structure used for XOR encryption operations.
+/// Tracks independent send and receive positions for the example XOR transform.
 #[derive(Clone, Debug, Default)]
 pub struct ExampleKeyPair(u64, u64);
 
-/// A cryptographic engine implementing XOR encryption, typically not secure but used for demonstration.
-/// Requires reliable, ordered delivery: a lost, duplicated, reordered or malformed packet
-/// can desynchronize the key state. This stream-cipher example must not be used with UDP.
+/// Demonstrates a stateful XOR transform; it provides no cryptographic security.
+/// Requires reliable, ordered packets: loss, duplication, reordering or malformed input
+/// desynchronizes its state, so it must not be used with UDP.
 #[derive(Clone, Default)]
 pub struct CustomCryptEngine {
     key_pair: ExampleKeyPair,
 }
 
 impl CustomCryptEngine {
-    /// Encrypts data using XOR operation and rotates the key to simulate a stream cipher.
     fn xor_encrypt(&mut self, data: Vec<u8>) -> Vec<u8> {
         let mut key = self.key_pair.0;
         let encrypted: Vec<u8> = data
@@ -80,7 +78,6 @@ impl CustomCryptEngine {
         encrypted
     }
 
-    /// Decrypts data using XOR operation, ensuring the key is rotated in the same manner as encryption.
     fn xor_decrypt(&mut self, data: Vec<u8>) -> Vec<u8> {
         let mut key = self.key_pair.1;
         let decrypted: Vec<u8> = data
@@ -96,8 +93,6 @@ impl CustomCryptEngine {
     }
 }
 
-/// Implements the encryption and decryption processes for specified packet types using the XOR method.
-/// This implement server-side encryption
 impl CryptEngine<CustomCryptClientPacket, CustomCryptServerPacket> for CustomCryptEngine {
     fn encrypt(
         &mut self,
@@ -114,7 +109,6 @@ impl CryptEngine<CustomCryptClientPacket, CustomCryptServerPacket> for CustomCry
         bitcode::decode(&decrypted_data).map_err(|_| CustomSerializationError)
     }
 }
-// This is the client-side encryption
 impl CryptEngine<CustomCryptServerPacket, CustomCryptClientPacket> for CustomCryptEngine {
     fn encrypt(
         &mut self,
@@ -132,7 +126,7 @@ impl CryptEngine<CustomCryptServerPacket, CustomCryptClientPacket> for CustomCry
     }
 }
 
-/// A serializer that integrates encryption, using a cryptographic engine to ensure secure data transmission.
+/// Delegates packet transformation to a connection-local [`CryptEngine`].
 #[derive(Clone, Default)]
 pub struct CustomCryptSerializer<C, ReceivingPacket, SendingPacket>
 where
@@ -150,6 +144,7 @@ impl<
 where
     C: Send + Sync + 'static + CryptEngine<ReceivingPacket, SendingPacket>,
 {
+    /// Takes ownership of the engine, including its current send and receive state.
     pub fn new(crypt_engine: C) -> Self {
         Self {
             crypt_engine,
@@ -168,12 +163,10 @@ where
     type EncodeError = CustomSerializationError;
     type DecodeError = CustomSerializationError;
 
-    /// Serializes a packet into a byte vector.
     fn serialize(&mut self, packet: SendingPacket) -> Result<Vec<u8>, Self::EncodeError> {
         self.crypt_engine.encrypt(packet)
     }
 
-    /// Deserializes a packet from a byte slice
     fn deserialize(&mut self, buffer: &[u8]) -> Result<ReceivingPacket, Self::DecodeError> {
         match self.crypt_engine.decrypt(buffer) {
             Ok(encrypted) => Ok(encrypted),
@@ -213,7 +206,6 @@ mod tests {
         let client_packet = CustomCryptClientPacket::String("Hello, Server!".to_string());
         let server_packet = CustomCryptServerPacket::String("Hello, Client!".to_string());
 
-        // Client packet encryption and decryption
         let encrypted = engine.encrypt(client_packet.clone()).unwrap();
         let decrypted: CustomCryptClientPacket = engine.decrypt(&encrypted).unwrap();
         assert_eq!(
@@ -221,7 +213,6 @@ mod tests {
             "Decrypted client packet should be equal to original packet"
         );
 
-        // Server packet encryption and decryption
         let encrypted = engine.encrypt(server_packet.clone()).unwrap();
         let decrypted: CustomCryptServerPacket = engine.decrypt(&encrypted).unwrap();
         assert_eq!(

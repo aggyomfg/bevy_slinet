@@ -1,10 +1,9 @@
-//! In bevy_slinet all packets are prefixed by their length.
+//! Encodes packet-length prefixes for stream transports; UDP does not use them.
 
 use std::error::Error;
-use std::fmt::{Display, Formatter};
 use std::marker::PhantomData;
 
-/// This serializer controls how to serialize and deserialize the packet length
+/// Defines length-prefixed framing for stream transports.
 pub trait PacketLengthSerializer: Send + Sync + 'static {
     /// The serializer's error type.
     type Error: Error + Send + Sync;
@@ -12,10 +11,17 @@ pub trait PacketLengthSerializer: Send + Sync + 'static {
     /// The length's length in bytes. For u16 it would be 2.
     const SIZE: usize;
 
-    /// Serialize the packet's length
+    /// Encodes the payload length in bytes.
+    ///
+    /// # Errors
+    /// Returns an error when the length cannot be represented.
     fn serialize_packet_length(&self, length: usize) -> Result<Vec<u8>, Self::Error>;
 
-    /// Deserialize the packet's length
+    /// Parses a payload length from its prefix.
+    ///
+    /// # Errors
+    /// Returns [`PacketLengthDeserializationError::NeedMoreBytes`] for an incomplete prefix,
+    /// or [`PacketLengthDeserializationError::Err`] for invalid input.
     fn deserialize_packet_length(
         &self,
         buffer: &[u8],
@@ -33,27 +39,15 @@ pub enum PacketLengthDeserializationError<E: Error> {
     Err(E),
 }
 
-/// Used by [`BigEndian`] and [`LittleEndian`], indicates that the outgoing packet's length
-/// is greater than maximum allowed for this type of number
-#[derive(Debug)]
+/// Reports a payload length exceeding the selected integer representation.
+#[derive(Debug, thiserror::Error)]
+#[error("The packet is too large (length: {length}, max_length: {max_length})")]
 pub struct PacketTooLargeError {
-    /// The maximum allowed packet length. Usually a power of 2.
+    /// Maximum payload length representable by the prefix, in bytes.
     pub max_length: usize,
-    /// The actual packet's length.
+    /// Rejected payload length in bytes.
     pub length: usize,
 }
-
-impl Display for PacketTooLargeError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "The packet is too large (length: {}, max_length: {})",
-            self.max_length, self.length
-        )
-    }
-}
-
-impl Error for PacketTooLargeError {}
 
 /// Serialize the packet length as a little-endian number.
 #[derive(Default)]
@@ -113,3 +107,21 @@ impl_plss!(
     u64,
     u128
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_length_reports_actual_and_limit() {
+        let error = LittleEndian::<u8>::default()
+            .serialize_packet_length(256)
+            .unwrap_err();
+        assert_eq!(error.length, 256);
+        assert_eq!(error.max_length, 255);
+        assert_eq!(
+            error.to_string(),
+            "The packet is too large (length: 256, max_length: 255)"
+        );
+    }
+}

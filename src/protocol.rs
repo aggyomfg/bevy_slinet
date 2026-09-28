@@ -249,7 +249,10 @@ pub trait WriteStream: Send + Sync + 'static {
 
     /// Writes a packet to this stream.
     ///
-    /// You shouldn't override this method unless you know what you're doing.
+    /// The default serializes the payload and its length before writing either.
+    ///
+    /// # Errors
+    /// Returns an error if payload encoding, length encoding or the transport write fails.
     async fn send<ReceivingPacket, SendingPacket, S, LS>(
         &mut self,
         packet: SendingPacket,
@@ -264,10 +267,10 @@ pub trait WriteStream: Send + Sync + 'static {
     {
         let serialized = serializer
             .serialize(packet)
-            .expect("Error serializing packet");
+            .map_err(|err| io::Error::other(format!("Error serializing packet: {err}")))?;
         let mut buf = length_serializer
             .serialize_packet_length(serialized.len())
-            .expect("Error serializing packet length");
+            .map_err(|err| io::Error::other(format!("Error serializing packet length: {err}")))?;
         buf.write_all(&serialized)?;
         self.write_all(&buf).await?;
         Ok(())
@@ -381,5 +384,96 @@ mod tests {
             .unwrap();
         assert_eq!(packet, vec![7]);
         assert!(received_at >= serializer.0.lock().unwrap().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod send_tests {
+    use super::*;
+    use crate::packet_length_serializer::LittleEndian;
+
+    #[derive(Default)]
+    struct RecordingWriter {
+        writes: Vec<Vec<u8>>,
+    }
+    #[async_trait]
+    impl WriteStream for RecordingWriter {
+        async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+            self.writes.push(bytes.to_vec());
+            Ok(())
+        }
+    }
+
+    struct PacketCodec {
+        reject_encoding: bool,
+    }
+    impl Serializer<Vec<u8>, Vec<u8>> for PacketCodec {
+        type EncodeError = io::Error;
+        type DecodeError = io::Error;
+        fn serialize(&self, packet: Vec<u8>) -> io::Result<Vec<u8>> {
+            if self.reject_encoding {
+                Err(io::Error::other("encoding rejected"))
+            } else {
+                Ok(packet)
+            }
+        }
+        fn deserialize(&self, bytes: &[u8]) -> io::Result<Vec<u8>> {
+            Ok(bytes.to_vec())
+        }
+    }
+
+    #[tokio::test]
+    async fn payload_encoding_failure_does_not_write() {
+        let mut writer = RecordingWriter::default();
+        let error = writer
+            .send(
+                vec![7],
+                Arc::new(PacketCodec {
+                    reject_encoding: true,
+                }),
+                &LittleEndian::<u32>::default(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(
+            error.to_string(),
+            "Error serializing packet: encoding rejected"
+        );
+        assert!(writer.writes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn length_encoding_failure_does_not_write() {
+        let mut writer = RecordingWriter::default();
+        let error = writer
+            .send(
+                vec![7; 256],
+                Arc::new(PacketCodec {
+                    reject_encoding: false,
+                }),
+                &LittleEndian::<u8>::default(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "Error serializing packet length: The packet is too large (length: 256, max_length: 255)");
+        assert!(writer.writes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn successful_encoding_writes_length_then_payload() {
+        let mut writer = RecordingWriter::default();
+        writer
+            .send(
+                vec![7, 8],
+                Arc::new(PacketCodec {
+                    reject_encoding: false,
+                }),
+                &LittleEndian::<u16>::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(writer.writes, [vec![2, 0, 7, 8]]);
     }
 }

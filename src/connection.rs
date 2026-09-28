@@ -121,14 +121,8 @@ where
     }
 }
 
-/// A connection ID is an unique connection identifier that is mainly used
-/// in servers with multiple clients. This ID should only be used locally
-/// and is not meant to be exposed to the other side or stored in a database.
-/// Client-side ConnectionId and server-side ConnectionId are NOT the same.
-/// ConnectionId is basically an static AtomicUsize counter, so it resets
-/// every server restart. If there are multiple clients/servers running
-/// (like in multiple_connections example), they'll have a single connection
-/// counter that increments for every clientside/serverside connection.
+/// Identifies a connection locally within this process; it is not a wire or persistent ID.
+/// Client and server endpoints allocate independent IDs from the process-wide counter.
 #[derive(Clone, bevy::ecs::component::Component, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ConnectionId(usize);
 impl Debug for ConnectionId {
@@ -138,14 +132,13 @@ impl Debug for ConnectionId {
 }
 
 impl ConnectionId {
-    /// Creates and returns a new, unique [`ConnectionId`].
-    /// See the source code for implementation details.
+    /// Allocates the next ID from the process-wide counter.
     pub fn next() -> ConnectionId {
         static CONNECTION_ID: AtomicUsize = AtomicUsize::new(0);
 
         ConnectionId(CONNECTION_ID.fetch_add(1, Ordering::Relaxed))
     }
-    // Allows to convert ConnectionId for more flexible usage
+    /// Exposes the local counter value; it has no meaning to the remote peer.
     pub fn read(&self) -> usize {
         self.0
     }
@@ -153,10 +146,9 @@ impl ConnectionId {
 
 pub(crate) static MAX_PACKET_SIZE: AtomicUsize = AtomicUsize::new(usize::MAX);
 
-/// We can't set it as a field in [`ClientConfig`](crate::ClientConfig) or [`ServerConfig`](crate::ServerConfig)
-/// because using trait consts as const generics require `generic_const_exprs` feature. You should set
-/// this resource to avoid out-of-memory attacks (where a client sends a packet with length-prefix of
-/// 100000000000 bytes and bevy_slinet tries to allocate a buffer of that size).
+/// Limits incoming serialized payload sizes in bytes.
+/// Networking plugins apply changes during `Update` to a process-wide limit shared by all apps.
+/// Without a configured limit, stream peers can request arbitrarily large allocations.
 #[derive(Clone, Copy, Resource)]
 pub struct MaxPacketSize(pub usize);
 
