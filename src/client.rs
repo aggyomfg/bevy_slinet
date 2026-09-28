@@ -423,7 +423,7 @@ pub struct PacketReceiveEvent<Config: ClientConfig> {
     pub packet: Config::ServerPacket,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 fn run_async<F>(future: F)
 where
     F: Future<Output = ()> + Send + 'static,
@@ -454,7 +454,7 @@ where
     });
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 fn run_async<F>(future: F)
 where
     F: Future<Output = ()> + Send + 'static,

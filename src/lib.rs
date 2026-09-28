@@ -20,14 +20,32 @@ pub mod serializers;
 #[cfg(feature = "server")]
 pub mod server;
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    feature = "client",
+    feature = "server",
+    feature = "protocol_tcp",
+    feature = "serializer_bincode_serde"
+))]
 mod tests;
-#[cfg(test)]
+#[cfg(all(
+    test,
+    feature = "client",
+    feature = "server",
+    feature = "protocol_tcp",
+    feature = "serializer_bincode",
+    feature = "serializer_bincode_serde"
+))]
 mod tests_mut_serializer;
 
 /// [`SystemSets`](bevy::ecs::schedule::SystemSet) in [`bevy`] are used for system ordering.
 /// See [System Sets][cheatbook_systemsets] on unofficial bevy cheatbook for details.
-/// For more details on what each SystemSet means, refer to [`client`] or [`server`] source code
+/// For more details on what each SystemSet means, refer to the source code of
+#[cfg_attr(feature = "client", doc = "[`client`]")]
+#[cfg_attr(not(feature = "client"), doc = "`client`")]
+/// or
+#[cfg_attr(feature = "server", doc = "[`server`].")]
+#[cfg_attr(not(feature = "server"), doc = "`server`.")]
 ///
 /// [cheatbook_systemsets]: https://bevy-cheatbook.github.io/programming/system-sets.html
 #[derive(Clone, Debug, Eq, Hash, PartialEq, SystemSet)]

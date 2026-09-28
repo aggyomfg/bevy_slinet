@@ -31,4 +31,5 @@ Note: you should implement keep-alive and disconnection systems yourself, or loo
 | `0.15`         | `0.17`       |
 | `0.16`         | `0.17`       |
 | `0.17`         | `0.18`       |
-| `main`         | `0.18`       |
+| `0.18`         | `0.19`       |
+| `main`         | `0.19`       |
