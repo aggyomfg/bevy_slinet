@@ -1,6 +1,6 @@
 use super::wire::{Control, Frame, HandshakeFrame, HandshakeKind, Payload, Session};
 
-pub(crate) struct RawPeer;
+pub struct RawPeer;
 impl RawPeer {
     pub(crate) fn respond(bytes: &[u8]) -> Option<Vec<u8>> {
         if let Some(HandshakeFrame { kind, mut cookie }) = HandshakeFrame::parse(bytes) {
@@ -12,7 +12,7 @@ impl RawPeer {
                     Some(HandshakeFrame::challenge(cookie).encode().to_vec())
                 }
                 HandshakeKind::Confirm => Some(Control::Accept.encode(cookie.mac).to_vec()),
-                _ => None,
+                HandshakeKind::Challenge => None,
             };
         }
         match Frame::parse(bytes) {

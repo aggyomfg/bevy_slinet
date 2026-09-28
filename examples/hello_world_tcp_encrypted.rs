@@ -65,7 +65,7 @@ impl ClientConfig for Config {
         ))))
     }
 }
-fn main() {
+fn main() -> std::thread::Result<()> {
     let server_addr = "127.0.0.1:3000";
     let server = std::thread::spawn(move || {
         App::new()
@@ -94,9 +94,10 @@ fn main() {
             .add_observer(client2_packet_receive_system)
             .run();
     });
-    server.join().unwrap();
-    client.join().unwrap();
-    client2.join().unwrap();
+    server.join()?;
+    client.join()?;
+    client2.join()?;
+    Ok(())
 }
 
 fn server_new_connection_system(new_connection: On<NewConnectionEvent<Config>>) -> Result {

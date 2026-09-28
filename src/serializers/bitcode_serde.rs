@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 pub struct BitcodeSerdeSerializer;
 
 impl BitcodeSerdeSerializer {
-    pub fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self
     }
 }
@@ -53,8 +54,8 @@ mod tests {
         T: Serialize + for<'de> Deserialize<'de> + Clone,
     {
         let serializer = BitcodeSerdeSerializer::new();
-        let serialized = ReadOnlySerializer::<T, T>::serialize(&serializer, packet).unwrap();
-        ReadOnlySerializer::<T, T>::deserialize(&serializer, &serialized).unwrap()
+        let encoded = ReadOnlySerializer::<T, T>::serialize(&serializer, packet).unwrap();
+        ReadOnlySerializer::<T, T>::deserialize(&serializer, &encoded).unwrap()
     }
 
     #[test]
@@ -69,7 +70,7 @@ mod tests {
     #[test]
     fn test_large_packet() {
         let packet = TestPacket {
-            id: 999999,
+            id: 999_999,
             message: "A".repeat(10000),
         };
         assert_eq!(roundtrip(packet.clone()), packet);

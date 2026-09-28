@@ -7,7 +7,7 @@ use bevy::log;
 use bitcode::{Decode, Encode};
 
 /// Carries example application data from a client.
-#[derive(Clone, Debug, Decode, Encode, PartialEq)]
+#[derive(Clone, Debug, Decode, Encode, PartialEq, Eq)]
 pub enum CustomCryptClientPacket {
     /// Carries a text payload.
     String(String),
@@ -15,12 +15,12 @@ pub enum CustomCryptClientPacket {
 
 impl Default for CustomCryptClientPacket {
     fn default() -> Self {
-        CustomCryptClientPacket::String(String::new())
+        Self::String(String::new())
     }
 }
 
 /// Carries example application data from a server.
-#[derive(Clone, Debug, Decode, Encode, PartialEq)]
+#[derive(Clone, Debug, Decode, Encode, PartialEq, Eq)]
 pub enum CustomCryptServerPacket {
     /// Carries a text payload.
     String(String),
@@ -28,7 +28,7 @@ pub enum CustomCryptServerPacket {
 
 impl Default for CustomCryptServerPacket {
     fn default() -> Self {
-        CustomCryptServerPacket::String(String::new())
+        Self::String(String::new())
     }
 }
 
@@ -59,12 +59,12 @@ pub struct ExampleKeyPair {
 }
 
 #[derive(Clone, Debug, Default)]
-struct XorPosition(u64);
+struct XorPosition(u8);
 
 impl XorPosition {
     fn transform(&mut self, mut data: Vec<u8>) -> Vec<u8> {
         for byte in &mut data {
-            *byte ^= self.0 as u8;
+            *byte ^= self.0;
             self.0 = self.0.wrapping_add(1);
         }
         data
@@ -72,6 +72,7 @@ impl XorPosition {
 }
 
 /// Demonstrates a stateful XOR transform; it provides no cryptographic security.
+///
 /// Requires reliable, ordered packets: loss, duplication, reordering or malformed input
 /// desynchronizes its state, so it must not be used with UDP.
 #[derive(Clone, Default)]
@@ -137,7 +138,7 @@ where
     C: Send + Sync + 'static + CryptEngine<ReceivingPacket, SendingPacket>,
 {
     /// Takes ownership of the engine, including its current send and receive state.
-    pub fn new(crypt_engine: C) -> Self {
+    pub const fn new(crypt_engine: C) -> Self {
         Self {
             crypt_engine,
             _client: PhantomData,

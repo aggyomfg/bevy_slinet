@@ -59,7 +59,9 @@ impl Incoming {
             Self::Socket { socket, buffer } => {
                 let len = socket.recv(buffer).await?;
                 Ok(ReceivedDatagram {
-                    bytes: &buffer[..len],
+                    bytes: buffer
+                        .get(..len)
+                        .ok_or_else(|| io::Error::from(ErrorKind::InvalidData))?,
                     received_at: Instant::now(),
                 })
             }
@@ -73,21 +75,24 @@ pub struct UdpServerStream {
     incoming: mpsc::Receiver<QueuedDatagram>,
     state: Arc<SessionState>,
     peer_addr: SocketAddr,
+    local_addr: SocketAddr,
     socket: Arc<UdpSocket>,
 }
 impl UdpServerStream {
-    pub(super) fn accepted(
+    pub(super) const fn accepted(
         registration: PeerRegistration,
         incoming: mpsc::Receiver<QueuedDatagram>,
         state: Arc<SessionState>,
         peer_addr: SocketAddr,
         socket: Arc<UdpSocket>,
+        local_addr: SocketAddr,
     ) -> Self {
         Self {
             registration,
             incoming,
             state,
             peer_addr,
+            local_addr,
             socket,
         }
     }
@@ -114,7 +119,7 @@ impl NetworkStream for UdpServerStream {
         self.peer_addr
     }
     fn local_addr(&self) -> SocketAddr {
-        self.socket.local_addr().unwrap()
+        self.local_addr
     }
 }
 impl ServerStream for UdpServerStream {}
@@ -122,6 +127,8 @@ impl ServerStream for UdpServerStream {}
 /// Connected UDP session.
 pub struct ConfiguredUdpClientStream<C: UdpConfig> {
     _config: PhantomData<C>,
+    peer_addr: SocketAddr,
+    local_addr: SocketAddr,
     socket: Arc<UdpSocket>,
     state: Arc<SessionState>,
 }
@@ -145,6 +152,8 @@ impl<C: UdpConfig> ConfiguredUdpClientStream<C> {
             .map_err(|_| io::Error::new(ErrorKind::TimedOut, "UDP handshake timed out"))??;
         Ok(Self {
             _config: PhantomData,
+            peer_addr: socket.peer_addr()?,
+            local_addr: socket.local_addr()?,
             socket,
             state: SessionState::new(cookie, options),
         })
@@ -174,10 +183,10 @@ impl<C: UdpConfig> NetworkStream for ConfiguredUdpClientStream<C> {
         .into_split())
     }
     fn peer_addr(&self) -> SocketAddr {
-        self.socket.peer_addr().unwrap()
+        self.peer_addr
     }
     fn local_addr(&self) -> SocketAddr {
-        self.socket.local_addr().unwrap()
+        self.local_addr
     }
 }
 
@@ -283,8 +292,8 @@ impl ReadStream for UdpReadHalf {
             let from_socket = matches!(self.incoming, Incoming::Socket { .. });
             let ReceivedDatagram { bytes, received_at } = tokio::select! {
                 biased;
-                _ = self.state.cancelled() => return Err(ReceiveError::Io(SessionState::disconnected_error())),
-                _ = deadline => {
+                () = self.state.cancelled() => return Err(ReceiveError::Io(SessionState::disconnected_error())),
+                () = deadline => {
                     // The listener may have received keepalives while this read waited on its queue.
                     if self.state.last_received() != last { continue; }
                     self.state.close();
@@ -333,10 +342,12 @@ pub struct UdpWriteHalf {
 }
 impl UdpWriteHalf {
     /// Number of application packets dropped because they exceeded the configured datagram size.
+    #[must_use]
     pub fn dropped_oversized_packets(&self) -> usize {
         self.state.dropped_oversized()
     }
     /// Number of application packets dropped after a socket send error.
+    #[must_use]
     pub fn dropped_send_errors(&self) -> usize {
         self.state.dropped_send_errors()
     }

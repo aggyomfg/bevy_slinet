@@ -37,7 +37,7 @@ struct ConnectedTransport<Config: ServerConfig> {
 #[derive(Resource)]
 pub struct ServerConnections<Config: ServerConfig>(Vec<ServerConnection<Config>>);
 impl<Config: ServerConfig> ServerConnections<Config> {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self(Vec::new())
     }
 
@@ -110,11 +110,15 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
     ///
     /// # Panics
     /// Panics if the address cannot be resolved or resolves to no endpoints.
-    pub fn bind<A>(address: A) -> ServerPlugin<Config>
+    #[expect(
+        clippy::expect_used,
+        reason = "Preserve the documented panicking constructor API"
+    )]
+    pub fn bind<A>(address: A) -> Self
     where
         A: ToSocketAddrs,
     {
-        ServerPlugin {
+        Self {
             address: address
                 .to_socket_addrs()
                 .expect("Invalid address")
@@ -135,6 +139,10 @@ struct DisconnectionReceiver<Config: ServerConfig>(Receiver<DisconnectionEvent<C
 struct PacketReceiver<Config: ServerConfig>(Receiver<PacketReceiveEvent<Config>>);
 
 impl<Config: ServerConfig> ServerPlugin<Config> {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Keep the connection task lifecycle and its channel wiring together"
+    )]
     fn setup_system(
         address: SocketAddr,
         idle_timeout: tokio::sync::watch::Receiver<std::time::Duration>,
@@ -145,10 +153,11 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
         move |mut commands: Commands, queues: Option<Res<NetworkQueueSettings>>| {
             let queues = queues.as_deref().copied().unwrap_or_default();
             let (conn_tx, conn_rx) = queues.incoming_channel();
-            let (conn_tx2, mut conn_rx2) = queues.incoming_channel::<ConnectedTransport<Config>>();
+            let (connection_sender, mut incoming_connections) =
+                queues.incoming_channel::<ConnectedTransport<Config>>();
             let (disc_tx, disc_rx) = queues.incoming_channel();
             let (pack_tx, pack_rx) = queues.incoming_channel();
-            let (disc_tx2, mut disc_rx2) = queues.incoming_channel();
+            let (disconnect_sender, mut incoming_disconnects) = queues.incoming_channel();
             commands.insert_resource(ConnectionReceiver::<Config>(conn_rx));
             commands.insert_resource(DisconnectionReceiver::<Config>(disc_rx));
             commands.insert_resource(PacketReceiver::<Config>(pack_rx));
@@ -170,7 +179,7 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
 
                 runtime.block_on(async move {
                 tokio::spawn(async move {
-                    while let Some(ConnectedTransport { connection, ecs_connection: ecs_conn }) = conn_rx2.recv().await {
+                    while let Some(ConnectedTransport { connection, ecs_connection: ecs_conn }) = incoming_connections.recv().await {
                         let RawConnection {
                             disconnect_task,
                             stream,
@@ -187,9 +196,9 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
                             }
                         };
                         let pack_tx2 = pack_tx.clone();
-                        let disc_tx_2 = disc_tx.clone();
+                        let disconnect_forwarder = disc_tx.clone();
                         let serializer2 = Arc::clone(&serializer);
-                        let disc_tx2_2 = disc_tx2.clone();
+                        let disc_tx2_2 = disconnect_sender.clone();
                         let packet_length_serializer2 = Arc::clone(&packet_length_serializer);
                         read.set_idle_timeout(idle_timeout.clone());
                         let write_cancel = disconnect_task.clone();
@@ -203,7 +212,7 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
                             let error = loop {
                                 tokio::select! {
                                     biased;
-                                    _ = disconnect_task.cancelled() => break ReceiveError::IntentionalDisconnection,
+                                    () = disconnect_task.cancelled() => break ReceiveError::IntentionalDisconnection,
                                     result = read.receive_with_timestamp(Arc::clone(&serializer2), &*packet_length_serializer2) => {
                                         match result {
                                             Ok((packet, received_at)) => {
@@ -223,7 +232,7 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
                             };
                             disconnect_task.cancel();
                             read.close();
-                            if let Err(err) = disc_tx_2.send(DisconnectionEvent::<Config> {
+                            if let Err(err) = disconnect_forwarder.send(DisconnectionEvent::<Config> {
                                 error,
                                 connection: ecs_conn.clone(),
                             }).await {
@@ -247,8 +256,8 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
                             };
                             tokio::select! {
                                 biased;
-                                _ = write_cancel.cancelled() => {},
-                                _ = sending => {},
+                                () = write_cancel.cancelled() => {},
+                                () = sending => {},
                             }
                         });
                     }
@@ -269,8 +278,8 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
                     select! {
                         Ok(connection) = listener.accept() => {
                             log::debug!("Accepting a connection from {:?}", connection.peer_addr());
-                            let conn_tx_2 = conn_tx.clone();
-                            let conn_tx2_2 = conn_tx2.clone();
+                            let connection_forwarder = conn_tx.clone();
+                            let conn_tx2_2 = connection_sender.clone();
                             let serializer = Config::build_serializer();
                             serializer.warn_if_stateful_over_datagrams::<Config::Protocol>(&mut warned);
                             tokio::spawn(async move {
@@ -291,7 +300,7 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
                                     local_addr: connection.local_addr(),
                                     peer_addr: connection.peer_addr(),
                                 };
-                                if let Err(err) = conn_tx_2.send(NewConnectionEvent::<Config> {
+                                if let Err(err) = connection_forwarder.send(NewConnectionEvent::<Config> {
                                     address: ecs_conn.peer_addr,
                                     connection: ecs_conn.clone(),
                                 }).await {
@@ -306,7 +315,7 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
                                 }
                             });
                         }
-                        Some(addr) = disc_rx2.recv() => {
+                        Some(addr) = incoming_disconnects.recv() => {
                             listener.handle_disconnection(addr);
                         }
                         else => {
@@ -338,7 +347,8 @@ pub struct ServerAddress<Config: ServerConfig> {
 
 impl<Config: ServerConfig> ServerAddress<Config> {
     /// The bound address.
-    pub fn address(&self) -> SocketAddr {
+    #[must_use]
+    pub const fn address(&self) -> SocketAddr {
         self.address
     }
 }

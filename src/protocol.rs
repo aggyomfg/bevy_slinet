@@ -69,7 +69,7 @@ pub trait ClientStream: NetworkStream {
         Self: Sized;
 }
 
-/// A [NetworkStream] that can be used server-side.
+/// A [`NetworkStream`] that can be used server-side.
 pub trait ServerStream: NetworkStream {}
 
 /// A read-write stream between the client and the server.
@@ -148,7 +148,7 @@ pub(crate) struct FramedReader<'a, R: ?Sized> {
     read: &'a mut R,
 }
 impl<'a, R: ReadStream + ?Sized> FramedReader<'a, R> {
-    pub(crate) fn new(read: &'a mut R) -> Self {
+    pub(crate) const fn new(read: &'a mut R) -> Self {
         Self { read }
     }
     pub(crate) async fn receive<ReceivingPacket, SendingPacket, S, LS>(
@@ -191,7 +191,11 @@ impl<'a, R: ReadStream + ?Sized> FramedReader<'a, R> {
         let mut filled = 0;
         loop {
             self.read
-                .read_exact(&mut prefix[filled..])
+                .read_exact(
+                    prefix.get_mut(filled..).ok_or_else(|| {
+                        ReceiveError::Io(io::Error::from(io::ErrorKind::InvalidData))
+                    })?,
+                )
                 .await
                 .map_err(ReceiveError::Io)?;
             match length_serializer.deserialize_packet_length(&prefix) {
@@ -242,16 +246,16 @@ where
 {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            ReceiveError::Io(error) => write!(f, "ReceiveError::Io({error:?})"),
-            ReceiveError::Deserialization(error) => {
+            Self::Io(error) => write!(f, "ReceiveError::Io({error:?})"),
+            Self::Deserialization(error) => {
                 write!(f, "ReceiveError::Deserialization({error:?})")
             }
-            ReceiveError::LengthDeserialization(error) => {
+            Self::LengthDeserialization(error) => {
                 write!(f, "ReceiveError::LengthDeserialization({error:?})")
             }
-            ReceiveError::PacketTooBig => write!(f, "ReceiveError::PacketTooBig"),
-            ReceiveError::NoConnection(error) => write!(f, "ReceiveError::NoConnection({error:?})"),
-            ReceiveError::IntentionalDisconnection => write!(f, "IntentionalDisconnection"),
+            Self::PacketTooBig => write!(f, "ReceiveError::PacketTooBig"),
+            Self::NoConnection(error) => write!(f, "ReceiveError::NoConnection({error:?})"),
+            Self::IntentionalDisconnection => write!(f, "IntentionalDisconnection"),
         }
     }
 }

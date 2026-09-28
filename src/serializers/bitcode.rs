@@ -9,7 +9,8 @@ use crate::serializer::ReadOnlySerializer;
 pub struct BitcodeSerializer;
 
 impl BitcodeSerializer {
-    pub fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self
     }
 }
@@ -54,8 +55,8 @@ mod tests {
         T: bitcode::Encode + bitcode::DecodeOwned + Clone,
     {
         let serializer = BitcodeSerializer::new();
-        let serialized = ReadOnlySerializer::<T, T>::serialize(&serializer, packet).unwrap();
-        ReadOnlySerializer::<T, T>::deserialize(&serializer, &serialized).unwrap()
+        let encoded = ReadOnlySerializer::<T, T>::serialize(&serializer, packet).unwrap();
+        ReadOnlySerializer::<T, T>::deserialize(&serializer, &encoded).unwrap()
     }
 
     #[test]
@@ -70,7 +71,7 @@ mod tests {
     #[test]
     fn test_large_packet() {
         let packet = TestPacket {
-            id: 999999,
+            id: 999_999,
             message: "A".repeat(10000),
         };
         assert_eq!(roundtrip(packet.clone()), packet);

@@ -36,10 +36,10 @@ impl Nonce {
     pub fn generate() -> io::Result<Self> {
         RandomBytes::generate().map(Self)
     }
-    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
         Self(bytes)
     }
-    pub fn as_bytes(&self) -> &[u8; 16] {
+    pub const fn as_bytes(&self) -> &[u8; 16] {
         &self.0
     }
 }
@@ -47,10 +47,10 @@ impl Nonce {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Session([u8; 32]);
 impl Session {
-    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
-    pub fn as_bytes(&self) -> &[u8; 32] {
+    pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 }
@@ -62,7 +62,7 @@ pub(super) enum Control {
     Accept,
 }
 impl Control {
-    fn tag(self) -> Tag {
+    const fn tag(self) -> Tag {
         match self {
             Self::Keepalive => Tag::Keepalive,
             Self::Disconnect => Tag::Disconnect,
@@ -89,7 +89,7 @@ pub(super) struct Frame<'a> {
     pub payload: Payload<'a>,
 }
 impl<'a> Frame<'a> {
-    pub fn data(session: Session, payload: &'a [u8]) -> Self {
+    pub const fn data(session: Session, payload: &'a [u8]) -> Self {
         Self {
             session,
             payload: Payload::Data(payload),
@@ -110,23 +110,29 @@ impl<'a> Frame<'a> {
     }
     /// Rejects unknown tags, nonempty control payloads and invalid datagram sizes.
     pub fn parse(bytes: &'a [u8]) -> Option<Self> {
-        if !(HEADER..=super::MAX_DATAGRAM_SIZE).contains(&bytes.len()) || &bytes[..4] != MAGIC {
+        if !(HEADER..=super::MAX_DATAGRAM_SIZE).contains(&bytes.len()) || bytes.get(..4)? != MAGIC {
             return None;
         }
-        let tag = Tag::from_repr(bytes[4])?;
+        let tag = Tag::from_repr(*bytes.get(4)?)?;
         let payload = match tag {
-            Tag::Data => Payload::Data(&bytes[HEADER..]),
+            Tag::Data => Payload::Data(bytes.get(HEADER..)?),
             Tag::Keepalive | Tag::Disconnect | Tag::Accept if bytes.len() == HEADER => {
                 Payload::Control(match tag {
                     Tag::Keepalive => Control::Keepalive,
                     Tag::Disconnect => Control::Disconnect,
-                    _ => Control::Accept,
+                    Tag::Accept => Control::Accept,
+                    Tag::Data | Tag::Hello | Tag::Challenge | Tag::Confirm => return None,
                 })
             }
-            _ => return None,
+            Tag::Keepalive
+            | Tag::Disconnect
+            | Tag::Hello
+            | Tag::Challenge
+            | Tag::Confirm
+            | Tag::Accept => return None,
         };
         Some(Self {
-            session: Session::from_bytes(bytes[5..HEADER].try_into().ok()?),
+            session: Session::from_bytes(bytes.get(5..HEADER)?.try_into().ok()?),
             payload,
         })
     }
@@ -140,7 +146,7 @@ pub(super) struct Cookie {
     pub mac: Session,
 }
 impl Cookie {
-    pub fn hello(nonce: Nonce) -> Self {
+    pub const fn hello(nonce: Nonce) -> Self {
         Self {
             nonce,
             epoch: 0,
@@ -157,7 +163,7 @@ pub(super) enum HandshakeKind {
     Confirm,
 }
 impl HandshakeKind {
-    fn tag(self) -> Tag {
+    const fn tag(self) -> Tag {
         match self {
             Self::Hello => Tag::Hello,
             Self::Challenge => Tag::Challenge,
@@ -171,19 +177,19 @@ pub(super) struct HandshakeFrame {
     pub cookie: Cookie,
 }
 impl HandshakeFrame {
-    pub fn hello(nonce: Nonce) -> Self {
+    pub const fn hello(nonce: Nonce) -> Self {
         Self {
             kind: HandshakeKind::Hello,
             cookie: Cookie::hello(nonce),
         }
     }
-    pub fn challenge(cookie: Cookie) -> Self {
+    pub const fn challenge(cookie: Cookie) -> Self {
         Self {
             kind: HandshakeKind::Challenge,
             cookie,
         }
     }
-    pub fn confirm(cookie: Cookie) -> Self {
+    pub const fn confirm(cookie: Cookie) -> Self {
         Self {
             kind: HandshakeKind::Confirm,
             cookie,
@@ -200,22 +206,22 @@ impl HandshakeFrame {
         bytes
     }
     pub fn parse(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != HANDSHAKE_SIZE || &bytes[..4] != MAGIC {
+        if bytes.len() != HANDSHAKE_SIZE || bytes.get(..4)? != MAGIC {
             return None;
         }
-        let kind = match Tag::from_repr(bytes[4])? {
+        let kind = match Tag::from_repr(*bytes.get(4)?)? {
             Tag::Hello => HandshakeKind::Hello,
             Tag::Challenge => HandshakeKind::Challenge,
             Tag::Confirm => HandshakeKind::Confirm,
-            _ => return None,
+            Tag::Data | Tag::Keepalive | Tag::Disconnect | Tag::Accept => return None,
         };
         Some(Self {
             kind,
             cookie: Cookie {
-                nonce: Nonce::from_bytes(bytes[5..21].try_into().ok()?),
-                epoch: u64::from_le_bytes(bytes[21..29].try_into().ok()?),
-                generation: u64::from_le_bytes(bytes[29..37].try_into().ok()?),
-                mac: Session::from_bytes(bytes[37..].try_into().ok()?),
+                nonce: Nonce::from_bytes(bytes.get(5..21)?.try_into().ok()?),
+                epoch: u64::from_le_bytes(bytes.get(21..29)?.try_into().ok()?),
+                generation: u64::from_le_bytes(bytes.get(29..37)?.try_into().ok()?),
+                mac: Session::from_bytes(bytes.get(37..)?.try_into().ok()?),
             },
         })
     }
@@ -320,8 +326,8 @@ mod tests {
         let nonce = Nonce::from_bytes([0x11; 16]);
         let cookie = Cookie {
             nonce,
-            epoch: 0x0807060504030201,
-            generation: 0x1817161514131211,
+            epoch: 0x0807_0605_0403_0201,
+            generation: 0x1817_1615_1413_1211,
             mac: Session::from_bytes([0x22; 32]),
         };
         let mut hello = b"SLN2\x04".to_vec();

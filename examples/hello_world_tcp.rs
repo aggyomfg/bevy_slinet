@@ -61,7 +61,7 @@ enum ServerPacket {
     String(String),
 }
 
-fn main() {
+fn main() -> std::thread::Result<()> {
     let server_addr = "127.0.0.1:3000";
     let server = std::thread::spawn(move || {
         App::new()
@@ -83,8 +83,9 @@ fn main() {
             .add_observer(client_packet_receive_system)
             .run();
     });
-    server.join().unwrap();
-    client.join().unwrap();
+    server.join()?;
+    client.join()?;
+    Ok(())
 }
 
 fn server_new_connection_system(new_connection: On<NewConnectionEvent<Config>>) -> Result {

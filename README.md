@@ -1,4 +1,4 @@
-# bevy_slinet
+# `bevy_slinet`
 
 A simple networking plugin for bevy.
 
@@ -17,7 +17,7 @@ A simple networking plugin for bevy.
 
 > Note: `serializer_bincode` and `serializer_bincode_serde` are kept for compatibility only, since [bincode is unmaintained](https://rustsec.org/advisories/RUSTSEC-2025-0141). Prefer the bitcode serializers for new code.
 
-Note: with TCP, you should implement keep-alive and disconnection systems yourself, or look at [lobby_and_battle_servers example](examples/lobby_and_battle_servers.rs)
+Note: with TCP, you should implement keep-alive and disconnection systems yourself, or look at [`lobby_and_battle_servers` example](examples/lobby_and_battle_servers.rs)
 
 ## [More Examples](https://github.com/aggyomfg/bevy_slinet/tree/main/examples)
 

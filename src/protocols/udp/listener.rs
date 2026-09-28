@@ -47,6 +47,7 @@ impl HandshakeAdmission {
 /// A shared UDP socket that routes packets to validated sessions.
 pub struct UdpNetworkListener {
     socket: Arc<UdpSocket>,
+    local_addr: SocketAddr,
     peers: Arc<Peers>,
     cookies: CookieJar,
     options: ValidatedOptions,
@@ -56,9 +57,12 @@ pub struct UdpNetworkListener {
 impl UdpNetworkListener {
     pub(super) async fn bind(address: SocketAddr, options: UdpOptions) -> io::Result<Self> {
         let options = ValidatedOptions::new(options)?;
+        let socket = Arc::new(UdpSocket::bind(address).await?);
+        let local_addr = socket.local_addr()?;
         Ok(Self {
             slots: Arc::new(Semaphore::new(options.max_peers())),
-            socket: Arc::new(UdpSocket::bind(address).await?),
+            socket,
+            local_addr,
             peers: Arc::default(),
             cookies: CookieJar::new()?,
             options,
@@ -77,7 +81,11 @@ impl UdpNetworkListener {
     ) -> Option<UdpServerStream> {
         if let Some(HandshakeFrame { kind, cookie }) = HandshakeFrame::parse(bytes) {
             if !matches!(kind, HandshakeKind::Hello | HandshakeKind::Confirm)
-                || !self.admission.lock().unwrap().take()
+                || !self
+                    .admission
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
             {
                 return None;
             }
@@ -87,7 +95,10 @@ impl UdpNetworkListener {
                 let _ = self.socket.try_send_to(&challenge, address);
                 return None;
             }
-            let mut peers = self.peers.lock().unwrap();
+            let mut peers = self
+                .peers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(peer) = peers.get(&address) {
                 if peer.state().id() == cookie.mac {
                     let reply = if peer.state().is_closed() {
@@ -130,13 +141,17 @@ impl UdpNetworkListener {
                 state,
                 address,
                 Arc::clone(&self.socket),
+                self.local_addr,
             ));
         }
         if let Some(Frame { session, payload }) = Frame::parse(bytes) {
             if payload == Payload::Control(Control::Accept) {
                 return None;
             }
-            let peers = self.peers.lock().unwrap();
+            let peers = self
+                .peers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             match peers
                 .get(&address)
                 .filter(|peer| peer.state().id() == session)
@@ -146,7 +161,7 @@ impl UdpNetworkListener {
                     match payload {
                         Payload::Control(Control::Disconnect) => peer.state().close(),
                         Payload::Data(_) => peer.push(bytes, received_at),
-                        _ => {}
+                        Payload::Control(Control::Keepalive | Control::Accept) => {}
                     }
                 }
                 None if payload != Payload::Control(Control::Disconnect) => {
@@ -178,20 +193,26 @@ impl Listener for UdpNetworkListener {
                 }
                 Err(err) => return Err(err),
             };
-            if let Some(stream) = self.dispatch(&buffer[..len], address, Instant::now()) {
+            let bytes = buffer
+                .get(..len)
+                .ok_or_else(|| io::Error::from(ErrorKind::InvalidData))?;
+            if let Some(stream) = self.dispatch(bytes, address, Instant::now()) {
                 return Ok(stream);
             }
         }
     }
     fn address(&self) -> SocketAddr {
-        self.socket.local_addr().unwrap()
+        self.local_addr
     }
 }
 
 #[cfg(test)]
 impl UdpNetworkListener {
     pub(super) fn peer_count(&self) -> usize {
-        self.peers.lock().unwrap().len()
+        self.peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
     pub(super) fn issue_cookie(
         &self,

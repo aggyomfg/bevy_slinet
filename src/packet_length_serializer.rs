@@ -30,7 +30,7 @@ pub trait PacketLengthSerializer: Send + Sync + 'static {
 
 /// Distinguishes an incomplete prefix from one the codec cannot decode.
 #[derive(Clone, Debug, thiserror::Error)]
-pub enum PacketLengthDeserializationError<E: Error> {
+pub enum PacketLengthDeserializationError<E> {
     /// Counts additional bytes needed beyond the prefix already supplied.
     #[error("Packet length prefix needs {0} more bytes")]
     NeedMoreBytes(usize),
@@ -65,21 +65,29 @@ macro_rules! impl_pls {
             const SIZE: usize = <$number>::BITS as usize / 8;
 
             fn serialize_packet_length(&self, length: usize) -> Result<Vec<u8>, Self::Error> {
-                if length > <$number>::MAX as usize {
-                    Err(PacketTooLargeError {
-                        length,
-                        max_length: <$number>::MAX as usize,
-                    })
-                } else {
-                    Ok((length as $number).$to().to_vec())
-                }
+                let value = <$number>::try_from(length).map_err(|_| PacketTooLargeError {
+                    length,
+                    max_length: usize::try_from(<$number>::MAX).unwrap_or(usize::MAX),
+                })?;
+                Ok(value.$to().to_vec())
             }
 
             fn deserialize_packet_length(
                 &self,
                 buffer: &[u8],
             ) -> Result<usize, PacketLengthDeserializationError<Self::Error>> {
-                Ok(<$number>::$from(buffer.try_into().unwrap()) as usize)
+                let Some(prefix) = buffer.get(..Self::SIZE) else {
+                    return Err(PacketLengthDeserializationError::NeedMoreBytes(Self::SIZE - buffer.len()));
+                };
+                let mut bytes = [0; size_of::<$number>()];
+                bytes.copy_from_slice(prefix);
+                usize::try_from(<$number>::$from(bytes)).map_err(|_| {
+                    PacketLengthDeserializationError::Err(PacketTooLargeError {
+                        // The actual wire value exceeds the range of this error's usize fields.
+                        length: usize::MAX,
+                        max_length: usize::MAX,
+                    })
+                })
             }
         }
     };
@@ -123,5 +131,27 @@ mod tests {
             error.to_string(),
             "The packet is too large (length: 256, max_length: 255)"
         );
+    }
+    #[test]
+    fn incomplete_prefix_requests_missing_bytes() {
+        assert!(matches!(
+            LittleEndian::<u32>::default().deserialize_packet_length(&[1, 2]),
+            Err(PacketLengthDeserializationError::NeedMoreBytes(2))
+        ));
+    }
+
+    #[test]
+    fn prefix_exceeding_usize_is_rejected() {
+        for codec in [false, true] {
+            let result = if codec {
+                BigEndian::<u128>::default().deserialize_packet_length(&u128::MAX.to_be_bytes())
+            } else {
+                LittleEndian::<u128>::default().deserialize_packet_length(&u128::MAX.to_le_bytes())
+            };
+            assert!(matches!(
+                result,
+                Err(PacketLengthDeserializationError::Err(_))
+            ));
+        }
     }
 }

@@ -70,7 +70,7 @@ struct SequenceNumber(usize);
 impl SequenceNumber {
     const FIRST: Self = Self(0);
 
-    fn next(self) -> Self {
+    const fn next(self) -> Self {
         Self(self.0 + 1)
     }
 }
@@ -120,7 +120,7 @@ impl ClientPacket {
     }
 }
 
-fn main() {
+fn main() -> std::thread::Result<()> {
     let server = std::thread::spawn(move || {
         App::new()
             .add_plugins((
@@ -146,7 +146,8 @@ fn main() {
                 .run();
         });
     }
-    server.join().unwrap();
+    server.join()?;
+    Ok(())
 }
 
 fn server_new_connection_system(new_connection: On<NewConnectionEvent<Config>>) -> Result {

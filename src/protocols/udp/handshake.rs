@@ -7,7 +7,7 @@ pub(super) struct Handshake<'a> {
     socket: &'a UdpSocket,
 }
 impl<'a> Handshake<'a> {
-    pub(super) fn new(socket: &'a UdpSocket) -> Self {
+    pub(super) const fn new(socket: &'a UdpSocket) -> Self {
         Self { socket }
     }
     pub(super) async fn connect(self) -> io::Result<Cookie> {
@@ -21,12 +21,12 @@ impl<'a> Handshake<'a> {
         loop {
             tokio::select! {
                 _ = retry.tick() => {
-                    let request = selected.map(|cookie| HandshakeFrame::confirm(cookie).encode()).unwrap_or(hello);
+                    let request = selected.map_or(hello, |cookie| HandshakeFrame::confirm(cookie).encode());
                     socket.send(&request).await?;
                 }
                 result = socket.peek(&mut buffer) => {
                     let len = result?;
-                    if let Some(HandshakeFrame { kind, cookie }) = HandshakeFrame::parse(&buffer[..len]) {
+                    if let Some(HandshakeFrame { kind, cookie }) = HandshakeFrame::parse(buffer.get(..len).ok_or_else(|| io::Error::from(ErrorKind::InvalidData))?) {
                         socket.recv(&mut buffer).await?;
                         if kind == HandshakeKind::Challenge && cookie.nonce == nonce && selected.is_none_or(|old| cookie.generation > old.generation) {
                             selected = Some(cookie);
@@ -34,13 +34,13 @@ impl<'a> Handshake<'a> {
                         }
                         continue;
                     }
-                    if let (Some(cookie), Some(Frame { session, payload })) = (selected, Frame::parse(&buffer[..len])) {
+                    if let (Some(cookie), Some(Frame { session, payload })) = (selected, Frame::parse(buffer.get(..len).ok_or_else(|| io::Error::from(ErrorKind::InvalidData))?)) {
                         if session == cookie.mac {
                             match payload {
                                 Payload::Control(Control::Accept) => { socket.recv(&mut buffer).await?; return Ok(cookie); }
                                 Payload::Data(_) => return Ok(cookie), // Preserve early application data for the read half.
                                 Payload::Control(Control::Disconnect) => return Err(io::Error::new(ErrorKind::ConnectionRefused, "UDP connection refused")),
-                                _ => {},
+                                Payload::Control(Control::Keepalive) => {},
                             }
                         }
                     }

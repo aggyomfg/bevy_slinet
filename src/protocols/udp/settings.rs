@@ -40,7 +40,7 @@ pub struct UdpOptions {
     pub max_datagram_size: usize,
     /// Heartbeat interval while no application data is being sent.
     pub heartbeat_interval: Duration,
-    /// Additional random delay in [0, heartbeat_jitter] for each heartbeat tick.
+    /// Additional random delay in [0, `heartbeat_jitter`] for each heartbeat tick.
     pub heartbeat_jitter: Duration,
 }
 impl UdpOptions {
@@ -83,6 +83,7 @@ impl<C: UdpConfig> Protocol for ConfiguredUdpProtocol<C> {
     }
 }
 /// Closes app-local sessions after this much time without a valid peer datagram.
+///
 /// Changes wake pending reads; removing this resource restores the default timeout.
 /// `Duration::MAX` disables expiry. Allow several heartbeat intervals, including jitter.
 #[derive(Clone, Copy, Debug, Resource)]
@@ -90,13 +91,13 @@ pub struct UdpIdleTimeout(pub Duration);
 
 impl Default for UdpIdleTimeout {
     fn default() -> Self {
-        UdpIdleTimeout(Duration::from_secs(10))
+        Self(Duration::from_secs(10))
     }
 }
 
 #[cfg(any(feature = "client", feature = "server"))]
 #[derive(Resource)]
-pub(crate) struct IdleTimeoutSettings(tokio::sync::watch::Sender<Duration>);
+pub struct IdleTimeoutSettings(tokio::sync::watch::Sender<Duration>);
 
 #[cfg(any(feature = "client", feature = "server"))]
 impl Default for IdleTimeoutSettings {
@@ -111,12 +112,12 @@ impl IdleTimeoutSettings {
     pub(crate) fn install(app: &mut bevy::prelude::App) -> watch::Receiver<Duration> {
         use bevy::prelude::{Startup, Update};
 
-        if !app.world().contains_resource::<IdleTimeoutSettings>() {
-            app.init_resource::<IdleTimeoutSettings>()
+        if !app.world().contains_resource::<Self>() {
+            app.init_resource::<Self>()
                 .add_systems(Startup, set_idle_timeout_system)
                 .add_systems(Update, set_idle_timeout_system);
         }
-        app.world().resource::<IdleTimeoutSettings>().0.subscribe()
+        app.world().resource::<Self>().0.subscribe()
     }
 }
 
@@ -171,19 +172,19 @@ impl ValidatedOptions {
         }
         Ok(Self(options))
     }
-    pub(super) fn max_peers(self) -> usize {
+    pub(super) const fn max_peers(self) -> usize {
         self.0.max_peers
     }
-    pub(super) fn max_handshake_packets_per_second(self) -> usize {
+    pub(super) const fn max_handshake_packets_per_second(self) -> usize {
         self.0.max_handshake_packets_per_second
     }
-    pub(super) fn max_payload_size(self) -> usize {
+    pub(super) const fn max_payload_size(self) -> usize {
         self.0.max_datagram_size - HEADER
     }
-    pub(super) fn heartbeat_interval(self) -> Duration {
+    pub(super) const fn heartbeat_interval(self) -> Duration {
         self.0.heartbeat_interval
     }
-    pub(super) fn heartbeat_jitter(self) -> Duration {
+    pub(super) const fn heartbeat_jitter(self) -> Duration {
         self.0.heartbeat_jitter
     }
 }

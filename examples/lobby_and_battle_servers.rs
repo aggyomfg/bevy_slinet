@@ -306,7 +306,7 @@ fn lobby_server_packet_handler(
                 .send(LobbyServerPacket::BattleServer(BATTLE_SERVER))
                 .with_severity(Severity::Error)?;
         }
-        _ => (),
+        LobbyClientPacket::KeepAlive => (),
     }
     Ok(())
 }
@@ -375,7 +375,7 @@ fn lobby_client_packet_handler(
             log::info!("Connecting to the battle server");
             commands.trigger(ConnectionRequestEvent::<BattleConfig>::new(address));
         }
-        _ => (),
+        LobbyServerPacket::KeepAlive => (),
     }
     Ok(())
 }
@@ -410,7 +410,7 @@ fn battle_client_packet_handler(
 
             commands.trigger(ConnectionRequestEvent::<LobbyConfig>::new(LOBBY_SERVER));
         }
-        _ => (),
+        BattleServerPacket::KeepAlive => (),
     }
     Ok(())
 }

@@ -39,7 +39,7 @@ type RawClientConnection<Config> = RawConnection<
 #[derive(Resource)]
 pub struct ClientConnections<Config: ClientConfig>(Vec<ClientConnection<Config>>);
 impl<Config: ClientConfig> ClientConnections<Config> {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self(Vec::new())
     }
 
@@ -123,7 +123,7 @@ impl<Config: ClientConfig> Plugin for ClientPlugin<Config> {
 
 impl<Config: ClientConfig> Default for ClientPlugin<Config> {
     fn default() -> Self {
-        ClientPlugin {
+        Self {
             address: None,
             _marker: PhantomData,
         }
@@ -132,19 +132,24 @@ impl<Config: ClientConfig> Default for ClientPlugin<Config> {
 
 impl<Config: ClientConfig> ClientPlugin<Config> {
     /// Installs networking without connecting; trigger [`ConnectionRequestEvent`] to connect later.
-    pub fn new() -> ClientPlugin<Config> {
-        ClientPlugin::default()
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Requests a connection during startup.
     ///
     /// # Panics
     /// Panics if the address cannot be resolved or resolves to no endpoints.
-    pub fn connect<A>(addr: A) -> ClientPlugin<Config>
+    #[expect(
+        clippy::expect_used,
+        reason = "Preserve the documented panicking constructor API"
+    )]
+    pub fn connect<A>(addr: A) -> Self
     where
         A: ToSocketAddrs,
     {
-        ClientPlugin {
+        Self {
             address: Some(
                 addr.to_socket_addrs()
                     .expect("Invalid address")
@@ -169,8 +174,12 @@ impl<Config: ClientConfig> ConnectionRequestEvent<Config> {
     ///
     /// # Panics
     /// Panics if the address cannot be resolved or resolves to no endpoints.
-    pub fn new(address: impl ToSocketAddrs) -> ConnectionRequestEvent<Config> {
-        ConnectionRequestEvent {
+    #[expect(
+        clippy::expect_used,
+        reason = "Preserve the documented panicking constructor API"
+    )]
+    pub fn new(address: impl ToSocketAddrs) -> Self {
+        Self {
             address: address
                 .to_socket_addrs()
                 .expect("Invalid address")
@@ -183,7 +192,7 @@ impl<Config: ClientConfig> ConnectionRequestEvent<Config> {
 
 impl<Config: ClientConfig> Clone for ConnectionRequestEvent<Config> {
     fn clone(&self) -> Self {
-        ConnectionRequestEvent::new(self.address)
+        Self::new(self.address)
     }
 }
 
@@ -205,7 +214,7 @@ struct ConnectionClosed<Config: ClientConfig> {
 }
 
 impl<Config: ClientConfig> ConnectionClosed<Config> {
-    fn new(
+    const fn new(
         error: ReceiveError<Config::DecodeError, Config::LengthSerializer>,
         address: SocketAddr,
         id: Option<ConnectionId>,
@@ -241,10 +250,14 @@ impl<Config: ClientConfig> ClientPlugin<Config> {
                 commands,
                 idle_timeout.clone(),
                 queues.as_deref().copied().unwrap_or_default(),
-            )
+            );
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Keep the connection task lifecycle and its channel wiring together"
+    )]
     fn setup(
         mut commands: Commands,
         idle_timeout: tokio::sync::watch::Receiver<std::time::Duration>,
@@ -254,7 +267,7 @@ impl<Config: ClientConfig> ClientPlugin<Config> {
         commands.insert_resource(ConnectionRequestSender::<Config>(req_tx, PhantomData));
 
         let (conn_tx, conn_rx) = queues.incoming_channel();
-        let (conn_tx2, mut conn_rx2) = queues.incoming_channel();
+        let (connection_sender, mut incoming_connections) = queues.incoming_channel();
         let (disc_tx, disc_rx) = queues.incoming_channel();
         let (pack_tx, pack_rx) = queues.incoming_channel();
         commands.insert_resource(ConnectionReceiver::<Config>(conn_rx));
@@ -262,7 +275,7 @@ impl<Config: ClientConfig> ClientPlugin<Config> {
         commands.insert_resource(PacketReceiver::<Config>(pack_rx));
         commands.add_observer(ConnectionRequestSender::<Config>::observe);
 
-        let disc_tx2 = disc_tx.clone();
+        let disconnect_sender = disc_tx.clone();
         Self::run_async(async move {
             let mut warned = false;
             // Bound in-flight handshakes while allowing other endpoints to connect.
@@ -316,7 +329,7 @@ impl<Config: ClientConfig> ClientPlugin<Config> {
                             log::error!("Failed to send connection establishment: {err:?}");
                             return;
                         }
-                        if let Err(err) = conn_tx2
+                        if let Err(err) = connection_sender
                             .send(ConnectedTransport::<Config> {
                                 connection,
                                 ecs_connection: ecs_conn,
@@ -328,7 +341,7 @@ impl<Config: ClientConfig> ClientPlugin<Config> {
                     }
                     Err(err) => {
                         log::warn!("Couldn't connect to server: {err:?}");
-                        if let Err(send_err) = disc_tx2
+                        if let Err(send_err) = disconnect_sender
                             .send(ConnectionClosed::<Config>::new(
                                 ReceiveError::NoConnection(err),
                                 address,
@@ -347,7 +360,7 @@ impl<Config: ClientConfig> ClientPlugin<Config> {
             while let Some(ConnectedTransport {
                 connection,
                 ecs_connection: ecs_conn,
-            }) = conn_rx2.recv().await
+            }) = incoming_connections.recv().await
             {
                 let RawConnection {
                     disconnect_task,
@@ -358,7 +371,7 @@ impl<Config: ClientConfig> ClientPlugin<Config> {
                     id,
                 } = connection;
                 let pack_tx2 = pack_tx.clone();
-                let disc_tx2 = disc_tx.clone();
+                let disconnect_sender = disc_tx.clone();
                 let serializer2 = Arc::clone(&serializer);
                 let packet_length_serializer2 = Arc::clone(&packet_length_serializer);
                 let peer_addr = stream.peer_addr();
@@ -383,7 +396,7 @@ impl<Config: ClientConfig> ClientPlugin<Config> {
                     let error = loop {
                         tokio::select! {
                             biased;
-                            _ = disconnect_task.cancelled() => break ReceiveError::IntentionalDisconnection,
+                            () = disconnect_task.cancelled() => break ReceiveError::IntentionalDisconnection,
                             result = read.receive_with_timestamp(Arc::clone(&serializer2), &*packet_length_serializer2) => {
                                 match result {
                                     Ok((packet, received_at)) => {
@@ -403,7 +416,7 @@ impl<Config: ClientConfig> ClientPlugin<Config> {
                     };
                     disconnect_task.cancel();
                     read.close();
-                    if let Err(err) = disc_tx2
+                    if let Err(err) = disconnect_sender
                         .send(ConnectionClosed::<Config>::new(error, peer_addr, Some(id)))
                         .await
                     {
@@ -429,8 +442,8 @@ impl<Config: ClientConfig> ClientPlugin<Config> {
                     };
                     tokio::select! {
                         biased;
-                        _ = write_cancel.cancelled() => {},
-                        _ = sending => {},
+                        () = write_cancel.cancelled() => {},
+                        () = sending => {},
                     }
                 });
             }

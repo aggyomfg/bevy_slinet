@@ -67,13 +67,13 @@ pub(super) struct SessionState {
     closed: CancellationToken,
 }
 impl SessionState {
-    pub(super) fn id(&self) -> Session {
+    pub(super) const fn id(&self) -> Session {
         self.id
     }
-    pub(super) fn can_be_replaced_by(&self, cookie: Cookie) -> bool {
+    pub(super) const fn can_be_replaced_by(&self, cookie: Cookie) -> bool {
         cookie.generation > self.generation
     }
-    pub(super) fn options(&self) -> ValidatedOptions {
+    pub(super) const fn options(&self) -> ValidatedOptions {
         self.options
     }
     pub(super) fn close(&self) {
@@ -86,10 +86,16 @@ impl SessionState {
         self.closed.cancelled().await;
     }
     pub(super) fn last_received(&self) -> Clock {
-        *self.last_received.lock().unwrap()
+        *self
+            .last_received
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
     pub(super) fn sent(&self) {
-        *self.last_sent.lock().unwrap() = Clock::now();
+        *self
+            .last_sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Clock::now();
     }
     pub(super) fn dequeue(&self, bytes: usize) {
         self.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
@@ -125,11 +131,18 @@ impl SessionState {
         })
     }
     pub(super) fn received(&self) {
-        *self.last_received.lock().unwrap() = Clock::now();
+        *self
+            .last_received
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Clock::now();
         self.responses.received();
     }
     fn heartbeat_due(&self) -> bool {
-        self.last_sent.lock().unwrap().elapsed() >= self.options.heartbeat_interval()
+        self.last_sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .elapsed()
+            >= self.options.heartbeat_interval()
     }
 }
 
@@ -138,7 +151,7 @@ pub(super) struct Peer {
     state: Arc<SessionState>,
 }
 impl Peer {
-    pub(super) fn new(queue: mpsc::Sender<QueuedDatagram>, state: Arc<SessionState>) -> Self {
+    pub(super) const fn new(queue: mpsc::Sender<QueuedDatagram>, state: Arc<SessionState>) -> Self {
         Self { queue, state }
     }
     pub(super) fn state(&self) -> &SessionState {
@@ -168,7 +181,7 @@ pub(super) struct PeerRegistration {
     state: Arc<SessionState>,
 }
 impl PeerRegistration {
-    pub(super) fn new(
+    pub(super) const fn new(
         slot: OwnedSemaphorePermit,
         peers: Weak<Peers>,
         address: SocketAddr,
@@ -185,7 +198,9 @@ impl PeerRegistration {
 impl Drop for PeerRegistration {
     fn drop(&mut self) {
         if let Some(peers) = self.peers.upgrade() {
-            let mut peers = peers.lock().unwrap();
+            let mut peers = peers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if peers
                 .get(&self.address)
                 .is_some_and(|peer| Arc::ptr_eq(&peer.state, &self.state))
@@ -203,7 +218,7 @@ pub(super) struct Heartbeat {
     state: Arc<SessionState>,
 }
 impl Heartbeat {
-    pub(super) fn new(
+    pub(super) const fn new(
         socket: Arc<UdpSocket>,
         address: Option<SocketAddr>,
         state: Arc<SessionState>,
@@ -216,10 +231,10 @@ impl Heartbeat {
     }
     fn send_control(&self, control: Control) {
         let bytes = control.encode(self.state.id);
-        let result = match self.address {
-            Some(addr) => self.socket.try_send_to(&bytes, addr),
-            None => self.socket.try_send(&bytes),
-        };
+        let result = self.address.map_or_else(
+            || self.socket.try_send(&bytes),
+            |addr| self.socket.try_send_to(&bytes, addr),
+        );
         if result.is_ok() {
             self.state.sent();
         }
@@ -231,16 +246,16 @@ impl Heartbeat {
 
     async fn run(self) {
         let state = &self.state;
-        let mut timing = HeartbeatTiming::new(
-            state.options,
-            u64::from_le_bytes(state.id.as_bytes()[..8].try_into().unwrap()),
-        );
+        let (seed, _) = state.id.as_bytes().split_at(8);
+        let mut seed_bytes = [0; 8];
+        seed_bytes.copy_from_slice(seed);
+        let mut timing = HeartbeatTiming::new(state.options, u64::from_le_bytes(seed_bytes));
         loop {
             let delay = timing.next_delay();
             tokio::select! {
                 biased;
-                _ = state.cancelled() => break,
-                _ = tokio::time::sleep(delay) => {
+                () = state.cancelled() => break,
+                () = tokio::time::sleep(delay) => {
                     if !state.heartbeat_due() { continue; }
                     if self.address.is_some() && !state.responses.take_heartbeat() { continue; }
                     self.send_control(Control::Keepalive);
@@ -261,12 +276,16 @@ pub(super) struct HeartbeatTiming {
     random: u64,
 }
 impl HeartbeatTiming {
-    pub(super) fn new(options: ValidatedOptions, seed: u64) -> Self {
+    pub(super) const fn new(options: ValidatedOptions, seed: u64) -> Self {
         Self {
             options,
             random: seed | 1,
         }
     }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "The shifted random value has at most 53 bits and the divisor is an exact power of two"
+    )]
     pub(super) fn next_delay(&mut self) -> Duration {
         self.random ^= self.random << 13;
         self.random ^= self.random >> 7;

@@ -32,7 +32,7 @@ where
     SendingPacket: Send + Sync + Debug + 'static,
 {
     fn clone(&self) -> Self {
-        EcsConnection {
+        Self {
             disconnect_task: self.disconnect_task.clone(),
             id: self.id,
             packet_tx: self.packet_tx.clone(),
@@ -56,17 +56,20 @@ where
     SendingPacket: Send + Sync + Debug + 'static,
 {
     /// Identifies this connection independently of its peer address.
-    pub fn id(&self) -> ConnectionId {
+    #[must_use]
+    pub const fn id(&self) -> ConnectionId {
         self.id
     }
 
     /// Returns the socket address of the remote peer.
-    pub fn peer_addr(&self) -> SocketAddr {
+    #[must_use]
+    pub const fn peer_addr(&self) -> SocketAddr {
         self.peer_addr
     }
 
     /// Returns the socket address of the local endpoint.
-    pub fn local_addr(&self) -> SocketAddr {
+    #[must_use]
+    pub const fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 
@@ -133,13 +136,14 @@ impl Debug for ConnectionId {
 
 impl ConnectionId {
     /// Allocates the next ID from the process-wide counter.
-    pub fn next() -> ConnectionId {
+    pub fn next() -> Self {
         static CONNECTION_ID: AtomicUsize = AtomicUsize::new(0);
 
-        ConnectionId(CONNECTION_ID.fetch_add(1, Ordering::Relaxed))
+        Self(CONNECTION_ID.fetch_add(1, Ordering::Relaxed))
     }
     /// Exposes the local counter value; it has no meaning to the remote peer.
-    pub fn read(&self) -> usize {
+    #[must_use]
+    pub const fn read(&self) -> usize {
         self.0
     }
 }
@@ -147,6 +151,7 @@ impl ConnectionId {
 pub(crate) static MAX_PACKET_SIZE: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 /// Limits incoming serialized payload sizes in bytes.
+///
 /// Networking plugins apply changes during `Update` to a process-wide limit shared by all apps.
 /// Without a configured limit, stream peers can request arbitrarily large allocations.
 #[derive(Clone, Copy, Resource)]
@@ -186,7 +191,7 @@ where
         }
     }
 
-    pub fn id(&self) -> ConnectionId {
+    pub const fn id(&self) -> ConnectionId {
         self.id
     }
 
@@ -220,11 +225,12 @@ pub(crate) fn max_packet_size_warning_system(
     max_packet_size: Option<bevy::prelude::Res<MaxPacketSize>>,
 ) {
     if max_packet_size.is_none() {
-        bevy::log::warn!("You haven't set \"MaxPacketSize\" resource! This is a security risk, please insert it before using this in production.")
+        bevy::log::warn!("You haven't set \"MaxPacketSize\" resource! This is a security risk, please insert it before using this in production.");
     }
 }
 
 /// Limits the channels between ECS and network tasks. Insert before `Startup`.
+///
 /// Capacities count packets/events (not decoded bytes); zero capacities are clamped to one.
 /// UDP drops newly received packets when the ECS queue is full; streams apply backpressure.
 #[derive(Clone, Copy, Debug, Resource)]
@@ -266,7 +272,7 @@ pub(crate) struct PacketForwarder<T> {
 }
 #[cfg(any(feature = "client", feature = "server"))]
 impl<T> PacketForwarder<T> {
-    pub(crate) fn new(sender: Sender<T>, datagram: bool, cancel: DisconnectTask) -> Self {
+    pub(crate) const fn new(sender: Sender<T>, datagram: bool, cancel: DisconnectTask) -> Self {
         Self {
             sender,
             datagram,
@@ -280,7 +286,7 @@ impl<T> PacketForwarder<T> {
         } else {
             tokio::select! {
                 biased;
-                _ = self.cancel.cancelled() => false,
+                () = self.cancel.cancelled() => false,
                 result = self.sender.send(packet) => result.is_ok(),
             }
         }

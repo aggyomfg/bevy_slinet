@@ -89,17 +89,31 @@ where
     type EncodeError = EncErr;
     type DecodeError = DecErr;
 
+    #[expect(
+        clippy::expect_used,
+        reason = "A poisoned user serializer may have inconsistent codec state; preserve fail-fast behavior"
+    )]
     fn serialize(&self, packet: SendingPacket) -> Result<Vec<u8>, Self::EncodeError> {
         match self {
-            SerializerAdapter::ReadOnly(serializer) => serializer.serialize(packet),
-            SerializerAdapter::Mutable(serializer) => serializer.lock().unwrap().serialize(packet),
+            Self::ReadOnly(serializer) => serializer.serialize(packet),
+            Self::Mutable(serializer) => serializer
+                .lock()
+                .expect("serializer state poisoned")
+                .serialize(packet),
         }
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "A poisoned user serializer may have inconsistent codec state; preserve fail-fast behavior"
+    )]
     fn deserialize(&self, data: &[u8]) -> Result<ReceivingPacket, Self::DecodeError> {
         match self {
-            SerializerAdapter::ReadOnly(serializer) => serializer.deserialize(data),
-            SerializerAdapter::Mutable(serializer) => serializer.lock().unwrap().deserialize(data),
+            Self::ReadOnly(serializer) => serializer.deserialize(data),
+            Self::Mutable(serializer) => serializer
+                .lock()
+                .expect("serializer state poisoned")
+                .deserialize(data),
         }
     }
 }

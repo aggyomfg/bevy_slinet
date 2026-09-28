@@ -1,3 +1,8 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "Test helpers and Bevy test systems fail the test on errors"
+)]
 use bevy::app::App;
 use bevy::prelude::*;
 
@@ -107,7 +112,7 @@ fn tcp_connection() {
             .unwrap()
             .len(),
         1,
-    )
+    );
 }
 
 #[derive(Default, Resource)]

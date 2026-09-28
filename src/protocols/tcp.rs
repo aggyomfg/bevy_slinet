@@ -28,12 +28,14 @@ impl Protocol for TcpProtocol {
     type ClientStream = TcpNetworkStream;
 
     async fn bind(addr: SocketAddr) -> io::Result<Self::Listener> {
-        Ok(TcpNetworkListener(TcpListener::bind(addr).await?))
+        let listener = TcpListener::bind(addr).await?;
+        let address = listener.local_addr()?;
+        Ok(TcpNetworkListener(listener, address))
     }
 }
 
 /// A wrapped [TCP listener](std::net::TcpListener).
-pub struct TcpNetworkListener(TcpListener);
+pub struct TcpNetworkListener(TcpListener, SocketAddr);
 
 #[async_trait]
 impl Listener for TcpNetworkListener {
@@ -41,16 +43,24 @@ impl Listener for TcpNetworkListener {
 
     async fn accept(&self) -> io::Result<TcpNetworkStream> {
         let (stream, _) = self.0.accept().await?;
-        Ok(TcpNetworkStream(stream))
+        TcpNetworkStream::new(stream)
     }
 
     fn address(&self) -> SocketAddr {
-        self.0.local_addr().unwrap()
+        self.1
     }
 }
 
 /// A wrapped [TCP stream](std::net::TcpStream).
-pub struct TcpNetworkStream(TcpStream);
+pub struct TcpNetworkStream(TcpStream, SocketAddr, SocketAddr);
+
+impl TcpNetworkStream {
+    fn new(stream: TcpStream) -> io::Result<Self> {
+        let peer = stream.peer_addr()?;
+        let local = stream.local_addr()?;
+        Ok(Self(stream, peer, local))
+    }
+}
 
 #[async_trait]
 impl NetworkStream for TcpNetworkStream {
@@ -62,11 +72,11 @@ impl NetworkStream for TcpNetworkStream {
     }
 
     fn peer_addr(&self) -> SocketAddr {
-        self.0.peer_addr().unwrap()
+        self.1
     }
 
     fn local_addr(&self) -> SocketAddr {
-        self.0.local_addr().unwrap()
+        self.2
     }
 }
 
@@ -106,7 +116,7 @@ impl ClientStream for TcpNetworkStream {
     where
         Self: Sized,
     {
-        Ok(TcpNetworkStream(TcpStream::connect(addr).await?))
+        Self::new(TcpStream::connect(addr).await?)
     }
 }
 

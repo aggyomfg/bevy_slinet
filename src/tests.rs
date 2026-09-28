@@ -1,3 +1,8 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "Test helpers and Bevy test systems fail the test on errors"
+)]
 use crate::client;
 use crate::client::{ClientConnection, ClientPlugin, ConnectionEstablishEvent};
 use crate::packet_length_serializer::LittleEndian;
@@ -14,7 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Calls `step` until it returns `true` or a timeout expires.
-pub(crate) fn wait_until(mut step: impl FnMut() -> bool) {
+pub fn wait_until(mut step: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !step() {
         assert!(

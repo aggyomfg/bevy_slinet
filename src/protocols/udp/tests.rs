@@ -141,7 +141,7 @@ async fn cookie_is_required_before_allocating_a_peer() {
             .to_vec(),
     ] {
         assert!(listener.dispatch(&bytes, address, Instant::now()).is_none());
-        assert!(listener.peer_count() == 0);
+        assert_eq!(listener.peer_count(), 0);
     }
 }
 
@@ -166,6 +166,10 @@ async fn cookies_bind_address_nonce_generation_and_expiry() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "The replacement stream must stay alive while the old registration is dropped"
+)]
 async fn session_replacement_rejects_old_data_disconnect_and_confirmation() {
     let AcceptedPeer {
         listener,
@@ -202,7 +206,7 @@ async fn session_replacement_rejects_old_data_disconnect_and_confirmation() {
     assert_eq!(packet, [7]);
     assert_eq!(timestamp, received_at);
     drop(read);
-    assert!(listener.peer_count() == 0);
+    assert_eq!(listener.peer_count(), 0);
 }
 
 #[tokio::test]
@@ -280,7 +284,7 @@ async fn handshake_rate_limit_recovers_without_allocating_pending_state() {
             Instant::now()
         )
         .is_none());
-    assert!(listener.peer_count() == 0);
+    assert_eq!(listener.peer_count(), 0);
     tokio::time::advance(Duration::from_secs(1)).await;
     assert!(listener
         .dispatch(
@@ -301,7 +305,7 @@ async fn queue_limits_and_control_packets_under_overload() {
     } = AcceptedPeer::new(UdpOptions::DEFAULT).await;
     let address = peer.local_addr().unwrap();
     let (mut read, _write) = stream.into_split().await.unwrap();
-    for _ in 0..MAX_QUEUED_DATAGRAMS + 1 {
+    for _ in 0..=MAX_QUEUED_DATAGRAMS {
         listener.dispatch(
             &Frame::data(cookie.mac, &[7]).encode(),
             address,
