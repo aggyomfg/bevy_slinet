@@ -40,6 +40,8 @@ pub const MAX_DATAGRAM_SIZE: usize = 65_507;
 const DATA_DATAGRAM: u8 = 1;
 /// Datagrams received from a peer beyond this many unread ones are dropped.
 const MAX_QUEUED_DATAGRAMS: usize = 1024;
+/// Datagrams that would push a peer's unread bytes above this limit are dropped.
+const MAX_QUEUED_BYTES: usize = 1 << 20;
 
 /// UDP protocol.
 pub struct UdpProtocol;
@@ -61,7 +63,13 @@ impl Protocol for UdpProtocol {
 #[derive(Default)]
 struct Inner {
     waker: AtomicWaker,
-    datagrams: Mutex<VecDeque<Box<[u8]>>>,
+    queue: Mutex<Queue>,
+}
+
+#[derive(Default)]
+struct Queue {
+    datagrams: VecDeque<Box<[u8]>>,
+    bytes: usize,
 }
 
 #[derive(Clone, Default)]
@@ -74,11 +82,14 @@ impl UdpRead {
             return;
         }
         {
-            let mut datagrams = self.0.datagrams.lock().unwrap();
-            if datagrams.len() >= MAX_QUEUED_DATAGRAMS {
+            let mut queue = self.0.queue.lock().unwrap();
+            if queue.datagrams.len() >= MAX_QUEUED_DATAGRAMS
+                || queue.bytes + datagram.len() > MAX_QUEUED_BYTES
+            {
                 return;
             }
-            datagrams.push_back(datagram.into());
+            queue.bytes += datagram.len();
+            queue.datagrams.push_back(datagram.into());
         }
         self.0.waker.wake();
     }
@@ -86,8 +97,12 @@ impl UdpRead {
     async fn pop(&self) -> Box<[u8]> {
         poll_fn(|cx| {
             self.0.waker.register(cx.waker());
-            match self.0.datagrams.lock().unwrap().pop_front() {
-                Some(datagram) => Poll::Ready(datagram),
+            let mut queue = self.0.queue.lock().unwrap();
+            match queue.datagrams.pop_front() {
+                Some(datagram) => {
+                    queue.bytes -= datagram.len();
+                    Poll::Ready(datagram)
+                }
                 None => Poll::Pending,
             }
         })
@@ -708,13 +723,13 @@ mod tests {
         with_timeout(async {
             let queue = UdpRead::default();
             queue.push(&[]);
-            assert!(queue.0.datagrams.lock().unwrap().is_empty());
+            assert!(queue.0.queue.lock().unwrap().datagrams.is_empty());
             for _ in 0..MAX_QUEUED_DATAGRAMS {
                 queue.push(&[DATA_DATAGRAM, 7]);
             }
             queue.push(&[DATA_DATAGRAM, 8]);
             assert_eq!(
-                queue.0.datagrams.lock().unwrap().len(),
+                queue.0.queue.lock().unwrap().datagrams.len(),
                 MAX_QUEUED_DATAGRAMS
             );
             assert_eq!(&*queue.pop().await, &[DATA_DATAGRAM, 7]);
@@ -723,11 +738,35 @@ mod tests {
                 assert_eq!(&*queue.pop().await, &[DATA_DATAGRAM, 7]);
             }
             assert_eq!(&*queue.pop().await, &[DATA_DATAGRAM, 9]);
-            assert!(queue.0.datagrams.lock().unwrap().is_empty());
+            assert_eq!(queue.0.queue.lock().unwrap().bytes, 0);
             let mut pending = Box::pin(queue.pop());
             assert!(futures::poll!(pending.as_mut()).is_pending());
             queue.push(&[DATA_DATAGRAM]);
             assert_eq!(&*pending.await, &[DATA_DATAGRAM]);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn queue_byte_budget_drops_only_excess_datagrams() {
+        with_timeout(async {
+            let queue = UdpRead::default();
+            let big = vec![DATA_DATAGRAM; MAX_DATAGRAM_SIZE];
+            let fits = MAX_QUEUED_BYTES / MAX_DATAGRAM_SIZE;
+            for _ in 0..fits + 1 {
+                queue.push(&big);
+            }
+            let small_fits = MAX_QUEUED_BYTES - fits * MAX_DATAGRAM_SIZE;
+            queue.push(&vec![DATA_DATAGRAM; small_fits]);
+            queue.push(&[DATA_DATAGRAM]);
+            {
+                let queued = queue.0.queue.lock().unwrap();
+                assert_eq!(queued.datagrams.len(), fits + 1);
+                assert_eq!(queued.bytes, MAX_QUEUED_BYTES);
+            }
+            assert_eq!(queue.pop().await.len(), MAX_DATAGRAM_SIZE);
+            queue.push(&big);
+            assert_eq!(queue.0.queue.lock().unwrap().bytes, MAX_QUEUED_BYTES);
         })
         .await;
     }
