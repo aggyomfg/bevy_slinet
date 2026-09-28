@@ -108,7 +108,19 @@ impl Listener for UdpNetworkListener {
     async fn accept(&self) -> std::io::Result<UdpServerStream> {
         let mut buf = [0; BUFFER_SIZE];
         loop {
-            let (len, address) = self.socket.recv_from(&mut buf).await?;
+            let (len, address) = match self.socket.recv_from(&mut buf).await {
+                Ok(received) => received,
+                // Windows reports ICMP "port unreachable" for an earlier `send_to` here.
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        ErrorKind::ConnectionReset | ErrorKind::ConnectionRefused
+                    ) =>
+                {
+                    continue
+                }
+                Err(err) => return Err(err),
+            };
             let datagram = &buf[..len];
             if let Some(task) = self.tasks.get(&address) {
                 task.push(datagram);
