@@ -13,8 +13,9 @@ use bevy::prelude::*;
 use futures::StreamExt;
 use tokio::sync::mpsc::{Receiver, Sender};
 
-#[cfg(feature = "protocol_udp")]
-use crate::connection::PendingUdpPacket;
+use crate::connection::transport::{
+    install_idle_timeout, ConnectionDiagnostics, PendingPacket, QueueDropReason,
+};
 use crate::connection::{
     ConnectionId, DisconnectTask, EcsConnection, MaxPacketSize, NetworkQueueSettings,
     OutgoingReceiver, OutgoingSender, PacketForwarder, RawConnection, ReceiveLimits,
@@ -89,10 +90,7 @@ struct AddInitialConnectionRequestEventLabel;
 impl<Config: ClientConfig> Plugin for ClientPlugin<Config> {
     fn build(&self, app: &mut App) {
         let address = self.address;
-        #[cfg(feature = "protocol_udp")]
-        let idle_timeout = crate::protocols::udp::IdleTimeoutSettings::install(app);
-        #[cfg(not(feature = "protocol_udp"))]
-        let idle_timeout = tokio::sync::watch::channel(std::time::Duration::MAX).1;
+        let idle_timeout = install_idle_timeout(app);
 
         app.init_resource::<ReceiveLimits>()
             .insert_resource(ClientConnections::<Config>::new())
@@ -395,16 +393,11 @@ impl<Config: ClientConfig> ConnectionAttempt<Config> {
             result,
         } = self;
         match result {
-            Ok(connection) => {
-                #[cfg(feature = "protocol_udp")]
-                let mut connection = connection;
-                #[cfg(feature = "protocol_udp")]
-                let udp = connection.stream.udp();
-                #[cfg(feature = "protocol_udp")]
-                connection.packets_rx.set_udp_handle(udp.clone());
+            Ok(mut connection) => {
+                let diagnostics = ConnectionDiagnostics::from_stream(&connection.stream);
+                connection.packets_rx.set_diagnostics(diagnostics.clone());
                 let ecs_conn = EcsConnection {
-                    #[cfg(feature = "protocol_udp")]
-                    udp,
+                    diagnostics,
                     disconnect_task: connection.disconnect_task.clone(),
                     id: connection.id(),
                     published: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -485,8 +478,7 @@ impl<Config: ClientConfig> ConnectedTransport<Config> {
             }
         };
         read.set_idle_timeout(idle_timeout);
-        #[cfg(feature = "protocol_udp")]
-        let udp = self.ecs_connection.udp();
+        let diagnostics = self.ecs_connection.diagnostics.clone();
         tokio::spawn(Self::receive_packets(
             read,
             self.ecs_connection,
@@ -504,8 +496,7 @@ impl<Config: ClientConfig> ConnectedTransport<Config> {
             packet_length_serializer,
             disconnect_task,
             id,
-            #[cfg(feature = "protocol_udp")]
-            udp,
+            diagnostics,
         ));
     }
 
@@ -530,8 +521,7 @@ impl<Config: ClientConfig> ConnectedTransport<Config> {
             packets,
             Config::Protocol::DATAGRAM,
             disconnect_task.clone(),
-            #[cfg(feature = "protocol_udp")]
-            ecs_conn.udp.clone(),
+            ecs_conn.diagnostics.clone(),
         );
         let error = loop {
             tokio::select! {
@@ -546,12 +536,7 @@ impl<Config: ClientConfig> ConnectedTransport<Config> {
                                 packet,
                                 received_at,
                             }, |discarded| {
-                                #[cfg(feature = "protocol_udp")]
-                                if let Some(udp) = discarded.connection.udp() {
-                                    udp.count_drop(crate::protocols::udp::UdpDropReason::ReceiveQueueEvicted);
-                                }
-                                #[cfg(not(feature = "protocol_udp"))]
-                                drop(discarded);
+                                discarded.connection.record_drop(QueueDropReason::ReceiveQueueEvicted);
                             }).await {
                                 break ReceiveError::IntentionalDisconnection;
                             }
@@ -582,13 +567,12 @@ impl<Config: ClientConfig> ConnectedTransport<Config> {
         packet_length_serializer: Arc<Config::LengthSerializer>,
         disconnect_task: DisconnectTask,
         id: ConnectionId,
-        #[cfg(feature = "protocol_udp")] udp: Option<crate::protocols::udp::UdpConnectionHandle>,
+        diagnostics: ConnectionDiagnostics,
     ) {
         let _guard = disconnect_task.clone().drop_guard();
         let sending = async {
             while let Some(packet) = packets_rx.recv().await {
-                #[cfg(feature = "protocol_udp")]
-                let mut pending = PendingUdpPacket::new(udp.clone());
+                let mut pending = PendingPacket::new(diagnostics.clone());
                 if disconnect_task.is_cancelled() {
                     break;
                 }
@@ -596,11 +580,7 @@ impl<Config: ClientConfig> ConnectedTransport<Config> {
                 let result = write
                     .send(packet, Arc::clone(&serializer), &*packet_length_serializer)
                     .await;
-                #[cfg(feature = "protocol_udp")]
-                if !matches!(&result, Err(err) if err.kind() == std::io::ErrorKind::ConnectionAborted)
-                {
-                    pending.disarm();
-                }
+                pending.finish(&result);
                 if let Err(err) = result {
                     log::error!("({id:?}) Error sending packet: {err}");
                     break;
@@ -644,20 +624,16 @@ fn packet_receive_system<Config: ClientConfig>(
         });
         let Ok(packet) = next else { break };
         if Config::Protocol::DATAGRAM && packet.connection.disconnect_task.is_cancelled() {
-            #[cfg(feature = "protocol_udp")]
-            if let Some(udp) = packet.connection.udp() {
-                udp.count_drop(crate::protocols::udp::UdpDropReason::ClosedBeforeDelivery);
-            }
+            packet
+                .connection
+                .record_drop(QueueDropReason::ClosedBeforeDelivery);
         } else if packet.connection.is_published() {
             if Config::Protocol::DATAGRAM {
                 commands.queue(move |world: &mut World| {
                     if packet.connection.disconnect_task.is_cancelled() {
-                        #[cfg(feature = "protocol_udp")]
-                        if let Some(udp) = packet.connection.udp() {
-                            udp.count_drop(
-                                crate::protocols::udp::UdpDropReason::ClosedBeforeDelivery,
-                            );
-                        }
+                        packet
+                            .connection
+                            .record_drop(QueueDropReason::ClosedBeforeDelivery);
                     } else {
                         world.trigger(packet);
                     }
@@ -829,7 +805,7 @@ mod udp_lifecycle_tests {
             id: ConnectionId::next(),
             published: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             packet_tx: outgoing,
-            udp: Some(udp.clone()),
+            diagnostics: ConnectionDiagnostics::from_udp(Some(udp.clone())),
             local_addr: address,
             peer_addr: address,
         };
@@ -904,14 +880,14 @@ mod udp_lifecycle_tests {
         };
         let (packet_tx, mut packets_rx) = settings.outgoing_channel(true);
         let udp = UdpConnectionHandle::new(128, None);
-        packets_rx.set_udp_handle(Some(udp.clone()));
+        packets_rx.set_diagnostics(ConnectionDiagnostics::from_udp(Some(udp.clone())));
         let address: SocketAddr = "127.0.0.1:1234".parse().unwrap();
         let connection = EcsConnection {
             disconnect_task: DisconnectTask::new(),
             id: ConnectionId::next(),
             published: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             packet_tx,
-            udp: Some(udp.clone()),
+            diagnostics: ConnectionDiagnostics::from_udp(Some(udp.clone())),
             local_addr: address,
             peer_addr: address,
         };
@@ -925,7 +901,7 @@ mod udp_lifecycle_tests {
             Arc::new(LittleEndian::<u32>::default()),
             connection.disconnect_task.clone(),
             connection.id(),
-            Some(udp.clone()),
+            ConnectionDiagnostics::from_udp(Some(udp.clone())),
         ));
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while !entered.load(std::sync::atomic::Ordering::Acquire) {
@@ -955,7 +931,7 @@ mod udp_lifecycle_tests {
             id: ConnectionId::next(),
             published: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             packet_tx: outgoing,
-            udp: Some(udp.clone()),
+            diagnostics: ConnectionDiagnostics::from_udp(Some(udp.clone())),
             local_addr: address,
             peer_addr: address,
         };
@@ -1040,8 +1016,7 @@ mod tcp_lifecycle_tests {
             id: ConnectionId::next(),
             published: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             packet_tx: outgoing,
-            #[cfg(feature = "protocol_udp")]
-            udp: None,
+            diagnostics: ConnectionDiagnostics::default(),
             local_addr: address,
             peer_addr: address,
         };
