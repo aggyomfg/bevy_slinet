@@ -4,10 +4,7 @@ use std::convert::Infallible;
 
 use crate::serializer::ReadOnlySerializer;
 
-/// Bitcode serializer using native [`bitcode::Encode`]/[`bitcode::Decode`] traits.
-/// This is the fastest and most compact option.
-///
-/// For serde compatibility, use `BitcodeSerdeSerializer` instead.
+/// Encodes packets using native [`bitcode::Encode`]/[`bitcode::Decode`] traits.
 #[derive(Clone, Default)]
 pub struct BitcodeSerializer;
 
@@ -26,8 +23,8 @@ where
     type EncodeError = Infallible;
     type DecodeError = bitcode::Error;
 
-    fn serialize(&self, t: SendingPacket) -> Result<Vec<u8>, Self::EncodeError> {
-        Ok(bitcode::encode(&t))
+    fn serialize(&self, packet: SendingPacket) -> Result<Vec<u8>, Self::EncodeError> {
+        Ok(bitcode::encode(&packet))
     }
 
     fn deserialize(&self, bytes: &[u8]) -> Result<ReceivingPacket, Self::DecodeError> {

@@ -38,16 +38,7 @@ mod tests;
 ))]
 mod tests_mut_serializer;
 
-/// [`SystemSets`](bevy::ecs::schedule::SystemSet) in [`bevy`] are used for system ordering.
-/// See [System Sets][cheatbook_systemsets] on unofficial bevy cheatbook for details.
-/// For more details on what each SystemSet means, refer to the source code of
-#[cfg_attr(feature = "client", doc = "[`client`]")]
-#[cfg_attr(not(feature = "client"), doc = "`client`")]
-/// or
-#[cfg_attr(feature = "server", doc = "[`server`].")]
-#[cfg_attr(not(feature = "server"), doc = "`server`.")]
-///
-/// [cheatbook_systemsets]: https://bevy-cheatbook.github.io/programming/system-sets.html
+/// Exposes networking phases so application systems can order their work around packet events.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, SystemSet)]
 #[allow(missing_docs)]
 pub enum SystemSets {

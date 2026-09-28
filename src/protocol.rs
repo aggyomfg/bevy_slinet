@@ -5,7 +5,6 @@
 
 use bevy::log;
 use bevy::platform::time::Instant;
-use io::Write;
 use std::error::Error;
 use std::fmt::{Debug, Formatter};
 use std::io;
@@ -58,7 +57,7 @@ pub trait Listener {
     fn address(&self) -> SocketAddr;
 
     /// Releases listener-side state after a connection’s receive task closes.
-    fn handle_disconnection(&self, #[allow(unused_variables)] peer_addr: SocketAddr) {}
+    fn handle_disconnection(&self, _peer_addr: SocketAddr) {}
 }
 
 /// A [NetworkStream](NetworkStream) that can be used client-side.
@@ -153,7 +152,7 @@ impl<'a, R: ReadStream + ?Sized> FramedReader<'a, R> {
         Self { read }
     }
     pub(crate) async fn receive<ReceivingPacket, SendingPacket, S, LS>(
-        self,
+        mut self,
         serializer: Arc<S>,
         length_serializer: &LS,
     ) -> Result<(ReceivingPacket, Instant), ReceiveError<S::DecodeError, LS>>
@@ -163,60 +162,76 @@ impl<'a, R: ReadStream + ?Sized> FramedReader<'a, R> {
         S: Serializer<ReceivingPacket, SendingPacket> + ?Sized,
         LS: PacketLengthSerializer,
     {
-        let mut buf = Vec::new();
-        let mut length = Err(PacketLengthDeserializationError::NeedMoreBytes(LS::SIZE));
-        while let Err(PacketLengthDeserializationError::NeedMoreBytes(amt)) = length {
-            let mut tmp = vec![0; amt];
-            self.read
-                .read_exact(&mut tmp)
-                .await
-                .map_err(ReceiveError::Io)?;
-            buf.extend(tmp);
-            length = length_serializer.deserialize_packet_length(&buf);
+        let length = self.read_length(length_serializer).await?;
+        if length > MAX_PACKET_SIZE.load(Ordering::Relaxed) {
+            return Err(ReceiveError::PacketTooBig);
         }
 
-        match length {
-            Ok(length) => {
-                if length > MAX_PACKET_SIZE.load(Ordering::Relaxed) {
-                    Err(ReceiveError::PacketTooBig)
-                } else {
-                    let mut buf = vec![0; length];
-                    self.read
-                        .read_exact(&mut buf)
-                        .await
-                        .map_err(ReceiveError::Io)?;
-                    let received_at = Instant::now();
-                    let packet = serializer
-                        .deserialize(&buf)
-                        .map_err(ReceiveError::Deserialization)?;
-                    Ok((packet, received_at))
+        let mut payload = vec![0; length];
+        self.read
+            .read_exact(&mut payload)
+            .await
+            .map_err(ReceiveError::Io)?;
+        let received_at = Instant::now();
+        let packet = serializer
+            .deserialize(&payload)
+            .map_err(ReceiveError::Deserialization)?;
+        Ok((packet, received_at))
+    }
+
+    async fn read_length<DecErr, LS>(
+        &mut self,
+        length_serializer: &LS,
+    ) -> Result<usize, ReceiveError<DecErr, LS>>
+    where
+        DecErr: Error + Send + Sync,
+        LS: PacketLengthSerializer,
+    {
+        let mut prefix = vec![0; LS::SIZE];
+        let mut filled = 0;
+        loop {
+            self.read
+                .read_exact(&mut prefix[filled..])
+                .await
+                .map_err(ReceiveError::Io)?;
+            match length_serializer.deserialize_packet_length(&prefix) {
+                Ok(length) => return Ok(length),
+                Err(PacketLengthDeserializationError::NeedMoreBytes(additional)) => {
+                    filled = prefix.len();
+                    prefix.resize(filled + additional, 0);
+                }
+                Err(PacketLengthDeserializationError::Err(error)) => {
+                    return Err(ReceiveError::LengthDeserialization(error));
                 }
             }
-            Err(PacketLengthDeserializationError::Err(err)) => {
-                Err(ReceiveError::LengthDeserialization(err))
-            }
-            Err(PacketLengthDeserializationError::NeedMoreBytes(_)) => unreachable!(),
         }
     }
 }
 
-/// An error that may happen when receiving packets.
+/// Reports transport and decoding failures, including an explicitly closed connection.
+#[derive(thiserror::Error)]
 pub enum ReceiveError<SerializationError, LS>
 where
     SerializationError: Error + Send + Sync,
     LS: PacketLengthSerializer,
 {
-    /// IO error.
-    Io(io::Error),
-    /// Deserialization error.
-    Deserialization(SerializationError),
-    /// Length deserialization error.
-    LengthDeserialization(LS::Error),
-    /// The packet size is too large (set by [`MaxPacketSize`](crate::connection::MaxPacketSize) resource).
+    /// Stops reception when the transport cannot supply a complete packet.
+    #[error("Failed to receive packet: {0}")]
+    Io(#[source] io::Error),
+    /// Rejects a complete payload using the packet codec's error.
+    #[error("Failed to decode packet: {0}")]
+    Deserialization(#[source] SerializationError),
+    /// Stops framing because the prefix cannot be decoded.
+    #[error("Failed to decode packet length: {0}")]
+    LengthDeserialization(#[source] LS::Error),
+    /// Exceeds the process-wide [`MaxPacketSize`](crate::connection::MaxPacketSize).
+    #[error("Packet exceeds the configured size limit")]
     PacketTooBig,
-    /// The client failed to connect.
-    NoConnection(io::Error),
-    /// [`ServerConnection::disconnect`](crate::connection::EcsConnection::disconnect) was called
+    /// Reports a failed connection attempt before packet reception starts.
+    #[error("Failed to connect: {0}")]
+    NoConnection(#[source] io::Error),
+    /// Follows an explicit [`disconnect`](crate::connection::EcsConnection::disconnect) request.
+    #[error("Connection was explicitly closed")]
     IntentionalDisconnection,
 }
 
@@ -271,9 +286,8 @@ pub trait WriteStream: Send + Sync + 'static {
         let mut buf = length_serializer
             .serialize_packet_length(serialized.len())
             .map_err(|err| io::Error::other(format!("Error serializing packet length: {err}")))?;
-        buf.write_all(&serialized)?;
-        self.write_all(&buf).await?;
-        Ok(())
+        buf.extend_from_slice(&serialized);
+        self.write_all(&buf).await
     }
 }
 
@@ -298,6 +312,70 @@ mod tests {
             *self.0.lock().unwrap() = Some(Instant::now());
             Ok(data.to_vec())
         }
+    }
+
+    struct BufferedRead(io::Cursor<Vec<u8>>);
+
+    #[async_trait]
+    impl ReadStream for BufferedRead {
+        async fn read_exact(&mut self, buffer: &mut [u8]) -> io::Result<()> {
+            io::Read::read_exact(&mut self.0, buffer)
+        }
+    }
+
+    struct ExtendedLength;
+
+    impl PacketLengthSerializer for ExtendedLength {
+        type Error = io::Error;
+        const SIZE: usize = 1;
+
+        fn serialize_packet_length(&self, length: usize) -> io::Result<Vec<u8>> {
+            let length = u16::try_from(length).map_err(io::Error::other)?;
+            let mut prefix = vec![255];
+            prefix.extend(length.to_le_bytes());
+            Ok(prefix)
+        }
+
+        fn deserialize_packet_length(
+            &self,
+            prefix: &[u8],
+        ) -> Result<usize, PacketLengthDeserializationError<io::Error>> {
+            match prefix {
+                [255] => Err(PacketLengthDeserializationError::NeedMoreBytes(2)),
+                [255, low, high] => Ok(u16::from_le_bytes([*low, *high]) as usize),
+                [length] => Ok(*length as usize),
+                _ => Err(PacketLengthDeserializationError::Err(io::Error::other(
+                    "invalid prefix",
+                ))),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn variable_prefixes_preserve_packet_boundaries() {
+        let mut read = BufferedRead(io::Cursor::new(vec![255, 2, 0, 7, 8, 0, 1, 9]));
+        let serializer = Arc::new(DecodeTime::default());
+        for expected in [vec![7, 8], vec![], vec![9]] {
+            let packet = read
+                .receive(Arc::clone(&serializer), &ExtendedLength)
+                .await
+                .unwrap();
+            assert_eq!(packet, expected);
+        }
+        assert_eq!(read.0.position(), 8);
+    }
+
+    #[tokio::test]
+    async fn incomplete_extended_prefix_reports_transport_error() {
+        let mut read = BufferedRead(io::Cursor::new(vec![255, 2]));
+        let error = read
+            .receive(Arc::new(DecodeTime::default()), &ExtendedLength)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ReceiveError::Io(ref source) if source.kind() == io::ErrorKind::UnexpectedEof)
+        );
+        assert!(error.source().is_some());
     }
 
     #[cfg(any(feature = "protocol_tcp", feature = "protocol_udp"))]

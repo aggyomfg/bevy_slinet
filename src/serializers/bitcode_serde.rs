@@ -3,10 +3,7 @@
 use crate::serializer::ReadOnlySerializer;
 use serde::{Deserialize, Serialize};
 
-/// Bitcode serializer using serde traits.
-/// Provides compatibility with other serde-based formats.
-///
-/// For better performance without serde overhead, use `BitcodeSerializer` instead.
+/// Encodes packets through [`serde`] using the bitcode format.
 #[derive(Clone, Default)]
 pub struct BitcodeSerdeSerializer;
 
@@ -25,8 +22,8 @@ where
     type EncodeError = bitcode::Error;
     type DecodeError = bitcode::Error;
 
-    fn serialize(&self, t: SendingPacket) -> Result<Vec<u8>, Self::EncodeError> {
-        bitcode::serialize(&t)
+    fn serialize(&self, packet: SendingPacket) -> Result<Vec<u8>, Self::EncodeError> {
+        bitcode::serialize(&packet)
     }
 
     fn deserialize(&self, bytes: &[u8]) -> Result<ReceivingPacket, Self::DecodeError> {

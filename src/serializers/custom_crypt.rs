@@ -53,7 +53,23 @@ pub trait CryptEngine<ReceivingPacket, SendingPacket>: Default {
 
 /// Tracks independent send and receive positions for the example XOR transform.
 #[derive(Clone, Debug, Default)]
-pub struct ExampleKeyPair(u64, u64);
+pub struct ExampleKeyPair {
+    send: XorPosition,
+    receive: XorPosition,
+}
+
+#[derive(Clone, Debug, Default)]
+struct XorPosition(u64);
+
+impl XorPosition {
+    fn transform(&mut self, mut data: Vec<u8>) -> Vec<u8> {
+        for byte in &mut data {
+            *byte ^= self.0 as u8;
+            self.0 = self.0.wrapping_add(1);
+        }
+        data
+    }
+}
 
 /// Demonstrates a stateful XOR transform; it provides no cryptographic security.
 /// Requires reliable, ordered packets: loss, duplication, reordering or malformed input
@@ -65,31 +81,11 @@ pub struct CustomCryptEngine {
 
 impl CustomCryptEngine {
     fn xor_encrypt(&mut self, data: Vec<u8>) -> Vec<u8> {
-        let mut key = self.key_pair.0;
-        let encrypted: Vec<u8> = data
-            .into_iter()
-            .map(|byte| {
-                let result = byte ^ (key as u8);
-                key = key.wrapping_add(1);
-                result
-            })
-            .collect();
-        self.key_pair.0 = key;
-        encrypted
+        self.key_pair.send.transform(data)
     }
 
     fn xor_decrypt(&mut self, data: Vec<u8>) -> Vec<u8> {
-        let mut key = self.key_pair.1;
-        let decrypted: Vec<u8> = data
-            .into_iter()
-            .map(|byte| {
-                let result = byte ^ (key as u8);
-                key = key.wrapping_add(1);
-                result
-            })
-            .collect();
-        self.key_pair.1 = key;
-        decrypted
+        self.key_pair.receive.transform(data)
     }
 }
 
@@ -136,11 +132,7 @@ where
     _client: PhantomData<ReceivingPacket>,
     _server: PhantomData<SendingPacket>,
 }
-impl<
-        C: Send + Sync + 'static + CryptEngine<ReceivingPacket, SendingPacket>,
-        SendingPacket,
-        ReceivingPacket,
-    > CustomCryptSerializer<C, ReceivingPacket, SendingPacket>
+impl<C, ReceivingPacket, SendingPacket> CustomCryptSerializer<C, ReceivingPacket, SendingPacket>
 where
     C: Send + Sync + 'static + CryptEngine<ReceivingPacket, SendingPacket>,
 {
@@ -168,13 +160,9 @@ where
     }
 
     fn deserialize(&mut self, buffer: &[u8]) -> Result<ReceivingPacket, Self::DecodeError> {
-        match self.crypt_engine.decrypt(buffer) {
-            Ok(encrypted) => Ok(encrypted),
-            Err(e) => {
-                log::error!("{}", e);
-                Err(e)
-            }
-        }
+        self.crypt_engine
+            .decrypt(buffer)
+            .inspect_err(|error| log::error!("{error}"))
     }
 }
 

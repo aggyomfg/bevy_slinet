@@ -38,8 +38,8 @@ where
     type EncodeError = bincode::error::EncodeError;
     type DecodeError = bincode::error::DecodeError;
 
-    fn serialize(&self, t: SendingPacket) -> Result<Vec<u8>, Self::EncodeError> {
-        bincode::serde::encode_to_vec(&t, self.config)
+    fn serialize(&self, packet: SendingPacket) -> Result<Vec<u8>, Self::EncodeError> {
+        bincode::serde::encode_to_vec(&packet, self.config)
     }
 
     fn deserialize(&self, bytes: &[u8]) -> Result<ReceivingPacket, Self::DecodeError> {

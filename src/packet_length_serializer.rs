@@ -5,10 +5,10 @@ use std::marker::PhantomData;
 
 /// Defines length-prefixed framing for stream transports.
 pub trait PacketLengthSerializer: Send + Sync + 'static {
-    /// The serializer's error type.
+    /// Describes a length the codec cannot represent.
     type Error: Error + Send + Sync;
 
-    /// The length's length in bytes. For u16 it would be 2.
+    /// Initial prefix width in bytes; decoders can request additional bytes.
     const SIZE: usize;
 
     /// Encodes the payload length in bytes.
@@ -28,15 +28,15 @@ pub trait PacketLengthSerializer: Send + Sync + 'static {
     ) -> Result<usize, PacketLengthDeserializationError<Self::Error>>;
 }
 
-/// An error that [`PacketLengthSerializer::deserialize_packet_length`] may return.
-#[derive(Clone, Debug)]
+/// Distinguishes an incomplete prefix from one the codec cannot decode.
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum PacketLengthDeserializationError<E: Error> {
-    /// The deserializer needs more bytes. This is useful for serializers
-    /// with dynamic packet length length, e.g., 1 byte to store packet
-    /// length for small packets, 2 bytes for larger packets)
+    /// Counts additional bytes needed beyond the prefix already supplied.
+    #[error("Packet length prefix needs {0} more bytes")]
     NeedMoreBytes(usize),
-    /// Error
-    Err(E),
+    /// Rejects the prefix instead of requesting more bytes.
+    #[error(transparent)]
+    Err(#[from] E),
 }
 
 /// Reports a payload length exceeding the selected integer representation.
@@ -49,11 +49,11 @@ pub struct PacketTooLargeError {
     pub length: usize,
 }
 
-/// Serialize the packet length as a little-endian number.
+/// Encodes the packet length as a little-endian number.
 #[derive(Default)]
 pub struct LittleEndian<N>(PhantomData<N>);
 
-/// Serialize the packet length as a big-endian number.
+/// Encodes the packet length as a big-endian number.
 #[derive(Default)]
 pub struct BigEndian<N>(PhantomData<N>);
 
