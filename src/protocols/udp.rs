@@ -13,22 +13,29 @@
 //! must decode each datagram independently and remain usable after a decoding error.
 //! Serializers that depend on previous packets, such as the example `CustomCryptEngine`
 //! stream cipher, are not suitable for UDP.
+//!
+//! Both peers send a `2` keep-alive datagram every [`KEEPALIVE_INTERVAL`] and close the
+//! connection after [`UdpIdleTimeout`] without any datagrams from the other side.
 
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::io;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bevy::log;
+use bevy::prelude::Resource;
 use dashmap::DashMap;
 use futures::future::poll_fn;
 use futures::task::AtomicWaker;
 use tokio::net::UdpSocket;
+use tokio::sync::oneshot;
+use tokio::time::MissedTickBehavior;
 
 use crate::connection::MAX_PACKET_SIZE;
 use crate::protocol::{
@@ -41,10 +48,73 @@ const BUFFER_SIZE: usize = u16::MAX as usize;
 /// The largest UDP payload that can be sent over IPv4.
 pub const MAX_DATAGRAM_SIZE: usize = 65_507;
 const DATA_DATAGRAM: u8 = 1;
+const KEEPALIVE_DATAGRAM: u8 = 2;
+/// How often each peer sends a keep-alive datagram.
+pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 /// Datagrams received from a peer beyond this many unread ones are dropped.
 const MAX_QUEUED_DATAGRAMS: usize = 1024;
 /// Datagrams that would push a peer's unread bytes above this limit are dropped.
 const MAX_QUEUED_BYTES: usize = 1 << 20;
+
+static IDLE_TIMEOUT_MILLIS: AtomicU64 = AtomicU64::new(10_000);
+
+/// Closes a UDP connection when no datagrams arrive from the peer for this long.
+/// Must be longer than [`KEEPALIVE_INTERVAL`]; `Duration::MAX` disables it. Defaults to 10 seconds.
+#[derive(Clone, Copy, Debug, Resource)]
+pub struct UdpIdleTimeout(pub Duration);
+
+impl Default for UdpIdleTimeout {
+    fn default() -> Self {
+        UdpIdleTimeout(Duration::from_secs(10))
+    }
+}
+
+#[cfg(any(feature = "client", feature = "server"))]
+pub(crate) fn set_idle_timeout_system(timeout: Option<bevy::prelude::Res<UdpIdleTimeout>>) {
+    use bevy::prelude::DetectChanges;
+    if let Some(timeout) = timeout.filter(|timeout| timeout.is_changed()) {
+        let millis = u64::try_from(timeout.0.as_millis()).unwrap_or(u64::MAX);
+        IDLE_TIMEOUT_MILLIS.store(millis, Ordering::Relaxed);
+    }
+}
+
+fn idle_timeout() -> Duration {
+    Duration::from_millis(IDLE_TIMEOUT_MILLIS.load(Ordering::Relaxed))
+}
+
+fn idle_error<E, LS>() -> ReceiveError<E, LS>
+where
+    E: std::error::Error + Send + Sync,
+    LS: PacketLengthSerializer,
+{
+    ReceiveError::Io(io::Error::new(
+        ErrorKind::TimedOut,
+        "no datagrams from the UDP peer",
+    ))
+}
+
+/// Sends keep-alive datagrams until the returned sender is dropped.
+fn spawn_keepalive(socket: Arc<UdpSocket>, peer_addr: Option<SocketAddr>) -> oneshot::Sender<()> {
+    let (stop, mut stopped) = oneshot::channel();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(KEEPALIVE_INTERVAL);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut stopped => break,
+                _ = interval.tick() => {
+                    // Errors are reported to the read half or end in an idle timeout.
+                    let _ = match peer_addr {
+                        Some(addr) => socket.send_to(&[KEEPALIVE_DATAGRAM], addr).await,
+                        None => socket.send(&[KEEPALIVE_DATAGRAM]).await,
+                    };
+                }
+            }
+        }
+    });
+    stop
+}
 
 /// UDP protocol.
 pub struct UdpProtocol;
@@ -181,7 +251,10 @@ impl NetworkStream for UdpServerStream {
     async fn into_split(self) -> io::Result<(Self::ReadHalf, Self::WriteHalf)> {
         let peer_addr = self.peer_addr();
         Ok((
-            UdpServerReadHalf(self.task.clone()),
+            UdpServerReadHalf {
+                task: self.task.clone(),
+                _keepalive: spawn_keepalive(Arc::clone(&self.socket), Some(peer_addr)),
+            },
             UdpServerWriteHalf {
                 peer_addr,
                 socket: self.socket,
@@ -199,7 +272,10 @@ impl NetworkStream for UdpServerStream {
 }
 
 /// The read half of [`UdpServerStream`].
-pub struct UdpServerReadHalf(UdpRead);
+pub struct UdpServerReadHalf {
+    task: UdpRead,
+    _keepalive: oneshot::Sender<()>,
+}
 
 #[async_trait]
 impl ReadStream for UdpServerReadHalf {
@@ -219,7 +295,9 @@ impl ReadStream for UdpServerReadHalf {
         LS: PacketLengthSerializer,
     {
         loop {
-            let datagram = self.0.pop().await;
+            let datagram = tokio::time::timeout(idle_timeout(), self.task.pop())
+                .await
+                .map_err(|_| idle_error())?;
             if let Some(packet) = decode_datagram(
                 &datagram,
                 &*serializer,
@@ -281,6 +359,7 @@ impl NetworkStream for UdpClientStream {
     async fn into_split(mut self) -> io::Result<(Self::ReadHalf, Self::WriteHalf)> {
         let std_socket = self.socket.into_std()?;
         let std_socket2 = std_socket.try_clone()?;
+        let keepalive_socket = Arc::new(UdpSocket::from_std(std_socket.try_clone()?)?);
         let read_socket = UdpSocket::from_std(std_socket)?;
         let write_socket = UdpSocket::from_std(std_socket2)?;
         let write = UdpClientWriteHalf {
@@ -289,6 +368,7 @@ impl NetworkStream for UdpClientStream {
         let read = UdpClientReadHalf {
             socket: read_socket,
             buffer: vec![0; BUFFER_SIZE].into_boxed_slice(),
+            _keepalive: spawn_keepalive(keepalive_socket, None),
         };
         Ok((read, write))
     }
@@ -331,6 +411,7 @@ impl ClientStream for UdpClientStream {
 pub struct UdpClientReadHalf {
     socket: UdpSocket,
     buffer: Box<[u8]>,
+    _keepalive: oneshot::Sender<()>,
 }
 
 #[async_trait]
@@ -351,10 +432,9 @@ impl ReadStream for UdpClientReadHalf {
         LS: PacketLengthSerializer,
     {
         loop {
-            let len = self
-                .socket
-                .recv(&mut self.buffer)
+            let len = tokio::time::timeout(idle_timeout(), self.socket.recv(&mut self.buffer))
                 .await
+                .map_err(|_| idle_error())?
                 .map_err(ReceiveError::Io)?;
             if let Some(packet) = decode_datagram(
                 &self.buffer[..len],
@@ -598,7 +678,7 @@ mod tests {
             let listener = UdpProtocol::bind(([127, 0, 0, 1], 0).into()).await.unwrap();
             let garbage = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            for datagram in [&[0][..], &[0xAB, 7]] {
+            for datagram in [&[0][..], &[0xAB, 7], &[KEEPALIVE_DATAGRAM]] {
                 garbage.send_to(datagram, listener.address()).await.unwrap();
             }
             peer.send_to(&[], listener.address()).await.unwrap();
@@ -646,7 +726,14 @@ mod tests {
             None
         );
         assert_eq!(decode_datagram(&[], &RawSerializer, 0), None);
-        assert_eq!(decode_datagram(&[2, 7], &RawSerializer, usize::MAX), None);
+        assert_eq!(
+            decode_datagram(&[KEEPALIVE_DATAGRAM], &RawSerializer, usize::MAX),
+            None
+        );
+        assert_eq!(
+            decode_datagram(&[0xAB, 7], &RawSerializer, usize::MAX),
+            None
+        );
     }
 
     #[test]
@@ -667,7 +754,13 @@ mod tests {
     #[tokio::test]
     async fn invalid_datagrams_do_not_affect_following_packets() {
         async fn check(read: &mut impl ReadStream, write: &mut impl WriteStream) {
-            for invalid in [vec![], vec![0], vec![2, 7], vec![DATA_DATAGRAM, 0xFF, 9]] {
+            for invalid in [
+                vec![],
+                vec![0],
+                vec![KEEPALIVE_DATAGRAM],
+                vec![0xAB, 7],
+                vec![DATA_DATAGRAM, 0xFF, 9],
+            ] {
                 write.write_all(&invalid).await.unwrap();
             }
             write
@@ -771,6 +864,100 @@ mod tests {
             assert_eq!(queue.0.queue.lock().unwrap().bytes, MAX_QUEUED_BYTES);
         })
         .await;
+    }
+
+    async fn next_non_probe(socket: &UdpSocket) -> Vec<u8> {
+        let mut buf = [0; 16];
+        loop {
+            let (len, _) = socket.recv_from(&mut buf).await.unwrap();
+            if len > 0 {
+                return buf[..len].to_vec();
+            }
+        }
+    }
+
+    fn assert_idle(err: ReceiveError<io::Error, Ls>) {
+        assert!(matches!(err, ReceiveError::Io(err) if err.kind() == ErrorKind::TimedOut));
+    }
+
+    #[tokio::test]
+    async fn both_sides_send_keepalives() {
+        with_timeout(async {
+            let listener = UdpProtocol::bind(([127, 0, 0, 1], 0).into()).await.unwrap();
+            let client_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            client_peer.send_to(&[], listener.address()).await.unwrap();
+            let _server = listener.accept().await.unwrap().into_split().await.unwrap();
+            assert_eq!(next_non_probe(&client_peer).await, [KEEPALIVE_DATAGRAM]);
+
+            let server_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let client = UdpClientStream::connect(server_peer.local_addr().unwrap())
+                .await
+                .unwrap();
+            let _client = client.into_split().await.unwrap();
+            assert_eq!(next_non_probe(&server_peer).await, [KEEPALIVE_DATAGRAM]);
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keepalives_stop_with_the_read_half() {
+        let listener = UdpProtocol::bind(([127, 0, 0, 1], 0).into()).await.unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        peer.send_to(&[], listener.address()).await.unwrap();
+        let (read, _write) = listener.accept().await.unwrap().into_split().await.unwrap();
+        drop(read);
+        tokio::time::sleep(KEEPALIVE_INTERVAL * 5).await;
+        let mut buf = [0; 16];
+        let err = peer.try_recv_from(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::WouldBlock);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_peers_time_out() {
+        let serializer = Arc::new(RawSerializer);
+        let listener = UdpProtocol::bind(([127, 0, 0, 1], 0).into()).await.unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        peer.send_to(&[], listener.address()).await.unwrap();
+        let (mut server_read, _server_write) =
+            listener.accept().await.unwrap().into_split().await.unwrap();
+        let err = server_read
+            .receive::<Vec<u8>, Vec<u8>, _, _>(Arc::clone(&serializer), &Ls::default())
+            .await
+            .unwrap_err();
+        assert_idle(err);
+
+        let client = UdpClientStream::connect(peer.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut client_read, _client_write) = client.into_split().await.unwrap();
+        let err = client_read
+            .receive::<Vec<u8>, Vec<u8>, _, _>(serializer, &Ls::default())
+            .await
+            .unwrap_err();
+        assert_idle(err);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keepalives_prevent_idle_timeout() {
+        let (mut client_read, _client_write, mut server_read, mut server_write) =
+            connected_pair().await;
+        let serializer = Arc::new(RawSerializer);
+        let idle = tokio::spawn(async move {
+            server_read
+                .receive::<Vec<u8>, Vec<u8>, _, _>(Arc::new(RawSerializer), &Ls::default())
+                .await
+        });
+        tokio::time::sleep(idle_timeout() * 3).await;
+        server_write
+            .send::<Vec<u8>, _, _, _>(vec![7], Arc::clone(&serializer), &Ls::default())
+            .await
+            .unwrap();
+        let packet = client_read
+            .receive::<_, Vec<u8>, _, _>(serializer, &Ls::default())
+            .await
+            .unwrap();
+        assert_eq!(packet, vec![7]);
+        assert!(!idle.is_finished());
     }
 
     #[cfg(feature = "serializer_bitcode")]

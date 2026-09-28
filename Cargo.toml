@@ -45,7 +45,7 @@ async-trait = "0.1"
 futures = { version = "0.3" }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["time"] }
+tokio = { version = "1", features = ["time", "test-util"] }
 
 [features]
 serializer_bitcode = ["bitcode"]
@@ -53,7 +53,7 @@ serializer_bitcode_serde = ["bitcode", "bitcode/serde", "serde"]
 serializer_bincode = ["bincode"]
 serializer_bincode_serde = ["bincode", "bincode/serde", "serde"]
 protocol_tcp = ["tokio/net"]
-protocol_udp = ["tokio/net", "dashmap"]
+protocol_udp = ["tokio/net", "tokio/time", "dashmap"]
 client = []
 server = []
 

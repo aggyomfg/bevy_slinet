@@ -103,6 +103,8 @@ impl<Config: ClientConfig> Plugin for ClientPlugin<Config> {
                     .in_set(AddInitialConnectionRequestEventLabel),
                 ),
             );
+        #[cfg(feature = "protocol_udp")]
+        app.add_systems(Update, crate::protocols::udp::set_idle_timeout_system);
     }
 }
 

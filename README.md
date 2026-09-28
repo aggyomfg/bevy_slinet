@@ -9,7 +9,7 @@ A simple networking plugin for bevy.
 ## Features
 
 - You can choose TCP or UDP protocol. Adding your own protocols is as easy as implementing a few traits.
-  UDP sends one packet per datagram: delivery is unreliable and unordered. A one-byte data tag allows empty payloads; the serialized payload limit is 65506 bytes. Serializers must decode packets independently, including after malformed input. This wire format is incompatible with older UDP framing; update both peers together.
+  UDP sends one packet per datagram: delivery is unreliable and unordered. A one-byte data tag allows empty payloads; the serialized payload limit is 65506 bytes. Serializers must decode packets independently, including after malformed input. UDP peers exchange keep-alives and close connections that stay silent for `UdpIdleTimeout` (10 s by default). This wire format is incompatible with older UDP framing; update both peers together.
 - Multiple clients/servers with different configs (specifies a protocol, packet types, serializer, etc.)
 - De/serialization. You choose a serialization format, packet type (you probably want it to be `enum`), and receive events with deserialized packets.
 
@@ -17,7 +17,7 @@ A simple networking plugin for bevy.
 
 > Note: `serializer_bincode` and `serializer_bincode_serde` are kept for compatibility only, since [bincode is unmaintained](https://rustsec.org/advisories/RUSTSEC-2025-0141). Prefer the bitcode serializers for new code.
 
-Note: you should implement keep-alive and disconnection systems yourself, or look at [lobby_and_battle_servers example](examples/lobby_and_battle_servers.rs)
+Note: with TCP, you should implement keep-alive and disconnection systems yourself, or look at [lobby_and_battle_servers example](examples/lobby_and_battle_servers.rs)
 
 ## [More Examples](https://github.com/aggyomfg/bevy_slinet/tree/main/examples)
 

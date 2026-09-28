@@ -84,6 +84,8 @@ impl<Config: ServerConfig> Plugin for ServerPlugin<Config> {
                 (remove_connections::<Config>.in_set(SystemSets::ServerRemoveConnections),),
             )
             .add_observer(connection_add_system::<Config>);
+        #[cfg(feature = "protocol_udp")]
+        app.add_systems(Update, crate::protocols::udp::set_idle_timeout_system);
     }
 }
 
