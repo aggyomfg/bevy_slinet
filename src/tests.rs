@@ -524,3 +524,133 @@ fn ecs_packet_budget_limits_each_frame() {
         after == 17
     });
 }
+
+#[cfg(feature = "protocol_udp")]
+#[test]
+fn disconnect_removes_only_one_connection_to_the_same_address() {
+    let mut server = App::new();
+    server.add_plugins(ServerPlugin::<UdpConfig>::bind("127.0.0.1:0"));
+    server.update();
+    let address = server
+        .world()
+        .resource::<ServerAddress<UdpConfig>>()
+        .address();
+    let mut client = App::new();
+    client.add_plugins(ClientPlugin::<UdpConfig>::new());
+    client.update();
+    for _ in 0..2 {
+        client
+            .world_mut()
+            .trigger(client::ConnectionRequestEvent::<UdpConfig>::new(address));
+    }
+    wait_until(|| {
+        client.update();
+        server.update();
+        client
+            .world()
+            .resource::<client::ClientConnections<UdpConfig>>()
+            .len()
+            == 2
+            && server
+                .world()
+                .resource::<ServerConnections<UdpConfig>>()
+                .len()
+                == 2
+    });
+    let connections = client
+        .world()
+        .resource::<client::ClientConnections<UdpConfig>>();
+    let survivor = connections[1].id();
+    connections[0].disconnect();
+    wait_until(|| {
+        client.update();
+        server.update();
+        client
+            .world()
+            .resource::<client::ClientConnections<UdpConfig>>()
+            .len()
+            == 1
+    });
+    assert_eq!(
+        client
+            .world()
+            .resource::<client::ClientConnections<UdpConfig>>()[0]
+            .id(),
+        survivor
+    );
+}
+
+#[cfg(feature = "protocol_udp")]
+#[test]
+fn retained_server_connection_rejects_sends_after_remote_disconnect() {
+    let (mut server, mut client) = exchange_packets::<UdpConfig>();
+    let retained = server.world().resource::<ServerConnections<UdpConfig>>()[0].clone();
+    client
+        .world()
+        .resource::<ClientConnection<UdpConfig>>()
+        .disconnect();
+    wait_until(|| {
+        server.update();
+        client.update();
+        server
+            .world()
+            .resource::<ServerConnections<UdpConfig>>()
+            .is_empty()
+    });
+    assert!(retained.send(Packet(99)).is_err());
+}
+
+#[test]
+fn tcp_disconnect_is_reported_while_ecs_queue_is_full() {
+    let queues = crate::connection::NetworkQueueSettings {
+        receive_capacity: 1,
+        ..Default::default()
+    };
+    let mut server = App::new();
+    server.insert_resource(queues);
+    server.add_plugins(ServerPlugin::<TcpConfig>::bind("127.0.0.1:0"));
+    server.update();
+    let address = server
+        .world()
+        .resource::<ServerAddress<TcpConfig>>()
+        .address();
+    let mut client = App::new();
+    client.insert_resource(queues);
+    client.add_plugins(ClientPlugin::<TcpConfig>::connect(address));
+    wait_until(|| {
+        server.update();
+        client.update();
+        !server
+            .world()
+            .resource::<ServerConnections<TcpConfig>>()
+            .is_empty()
+            && client
+                .world()
+                .contains_resource::<ClientConnection<TcpConfig>>()
+    });
+    let server_connection = server.world().resource::<ServerConnections<TcpConfig>>()[0].clone();
+    let client_connection = client
+        .world()
+        .resource::<ClientConnection<TcpConfig>>()
+        .clone();
+    for n in 0..16 {
+        client_connection.send(Packet(n)).unwrap();
+        server_connection.send(Packet(n)).unwrap();
+    }
+    // Stop draining ECS while network tasks fill the one-packet queues.
+    std::thread::sleep(Duration::from_millis(100));
+    client_connection.disconnect();
+    server_connection.disconnect();
+    wait_until(|| {
+        server.update();
+        client.update();
+        server
+            .world()
+            .resource::<ServerConnections<TcpConfig>>()
+            .is_empty()
+            && client
+                .world()
+                .resource::<client::ClientConnections<TcpConfig>>()
+                .is_empty()
+    });
+}

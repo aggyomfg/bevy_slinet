@@ -314,40 +314,35 @@ fn setup_system<Config: ClientConfig>(
             let write_cancel = disconnect_task.clone();
             tokio::spawn(async move {
                 let _guard = disconnect_task.clone().drop_guard();
-                loop {
+                let error = loop {
                     tokio::select! {
+                        biased;
+                        _ = disconnect_task.cancelled() => break ReceiveError::IntentionalDisconnection,
                         result = read.receive_with_timestamp(Arc::clone(&serializer2), &*packet_length_serializer2) => {
                             match result {
                                 Ok((packet, received_at)) => {
                                     log::trace!("({id:?}) Received packet {packet:?}");
                                     if !forward_packet(&pack_tx2, (ecs_conn.clone(), packet, received_at), Config::Protocol::DATAGRAM, &disconnect_task).await {
-                                        break
+                                        break ReceiveError::IntentionalDisconnection;
                                     }
                                 }
-                                Err(err) => {
-                                    disconnect_task.cancel();
-                                    log::debug!("({id:?}) Error receiving next packet: {err:?}");
-                                    if disc_tx2.send((err, peer_addr, Some(id))).await.is_err() {
-                                        break
-                                    }
-                                    break;
-                                }
+                                Err(err) => break err,
                             }
-                        }
-                        _ = disconnect_task.cancelled() => {
-                            log::debug!("({id:?}) Client disconnected intentionally");
-                            if let Err(err) = disc_tx2.send((ReceiveError::IntentionalDisconnection, peer_addr, Some(id))).await {
-                                log::error!("({id:?}) Failed to send disconnection event: {err:?}");
-                            }
-                            break
                         }
                     }
+                };
+                disconnect_task.cancel();
+                if let Err(err) = disc_tx2.send((error, peer_addr, Some(id))).await {
+                    log::debug!("({id:?}) Disconnection receiver closed: {err:?}");
                 }
             });
             tokio::spawn(async move {
                 let _guard = write_cancel.clone().drop_guard();
                 let sending = async {
                     while let Some(packet) = packets_rx.recv().await {
+                        if write_cancel.is_cancelled() {
+                            break;
+                        }
                         log::trace!("({id:?}) Sending packet {packet:?}");
                         if let Err(err) = write
                             .send(packet, Arc::clone(&serializer), &*packet_length_serializer)
