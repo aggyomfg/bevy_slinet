@@ -19,15 +19,17 @@
 //! it gets an answer or [`CONNECT_TIMEOUT`] passes. Only probes open server connections; other
 //! datagrams from unknown peers are answered with a disconnect.
 //!
-//! Both peers send a `2` keep-alive datagram every [`KEEPALIVE_INTERVAL`] and close the
-//! connection after [`UdpIdleTimeout`] without any datagrams from the other side. A closing
-//! peer sends several `3` disconnect datagrams, which close the connection on the other side.
+//! Clients send a `2` keep-alive datagram every [`KEEPALIVE_INTERVAL`]. The server sends one per
+//! interval only if the client sent something in that interval, so it never sends more
+//! datagrams than it receives. Both sides close the connection after [`UdpIdleTimeout`] without
+//! any datagrams from the other side. A closing peer sends several `3` disconnect datagrams,
+//! which close the connection on the other side.
 
 use std::fmt::Debug;
 use std::io;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -145,7 +147,13 @@ async fn send_datagram(
 }
 
 /// Sends keep-alive datagrams until the returned sender is dropped, then disconnect datagrams.
-fn spawn_keepalive(socket: Arc<UdpSocket>, peer_addr: Option<SocketAddr>) -> oneshot::Sender<()> {
+/// With `peer`, a keep-alive is sent only if a datagram arrived from it since the previous one,
+/// so spoofed probes are not amplified.
+fn spawn_keepalive(
+    socket: Arc<UdpSocket>,
+    peer_addr: Option<SocketAddr>,
+    peer: Option<Arc<PeerState>>,
+) -> oneshot::Sender<()> {
     let (stop, mut stopped) = oneshot::channel();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(KEEPALIVE_INTERVAL);
@@ -155,6 +163,9 @@ fn spawn_keepalive(socket: Arc<UdpSocket>, peer_addr: Option<SocketAddr>) -> one
                 biased;
                 _ = &mut stopped => break,
                 _ = interval.tick() => {
+                    if peer.as_ref().is_some_and(|peer| !peer.seen.swap(false, Ordering::Relaxed)) {
+                        continue;
+                    }
                     // Errors are reported to the read half or end in an idle timeout.
                     let _ = send_datagram(&socket, peer_addr, &[KEEPALIVE_DATAGRAM]).await;
                 }
@@ -191,6 +202,8 @@ type Queued = (Box<[u8]>, Instant);
 #[derive(Default)]
 struct PeerState {
     queued_bytes: AtomicUsize,
+    /// Set for every non-probe datagram, cleared by each keep-alive tick.
+    seen: AtomicBool,
 }
 
 /// The listener's end of a server connection's datagram queue.
@@ -213,6 +226,9 @@ impl Peer {
     fn push(&self, datagram: &[u8], received_at: Instant) -> bool {
         // Empty datagrams are connection probes sent by `UdpClientStream::connect`.
         let len = datagram.len();
+        if len > 0 {
+            self.state.seen.store(true, Ordering::Relaxed);
+        }
         if len == 0 || self.state.queued_bytes.load(Ordering::Relaxed) + len > MAX_QUEUED_BYTES {
             return !self.queue.is_closed();
         }
@@ -342,16 +358,18 @@ impl NetworkStream for UdpServerStream {
 
     async fn into_split(self) -> io::Result<(Self::ReadHalf, Self::WriteHalf)> {
         let peer_addr = Some(self.peer_addr);
+        let keepalive = spawn_keepalive(
+            Arc::clone(&self.socket),
+            peer_addr,
+            Some(Arc::clone(&self.state)),
+        );
         let incoming = Incoming::Queue {
             queue: self.incoming,
             state: self.state,
             current: Box::default(),
         };
         Ok((
-            UdpReadHalf::new(
-                incoming,
-                spawn_keepalive(Arc::clone(&self.socket), peer_addr),
-            ),
+            UdpReadHalf::new(incoming, keepalive),
             UdpWriteHalf {
                 socket: self.socket,
                 peer_addr,
@@ -503,7 +521,7 @@ impl NetworkStream for UdpClientStream {
             socket: Arc::clone(&self.socket),
             buffer: vec![0; BUFFER_SIZE].into_boxed_slice(),
         };
-        let keepalive = spawn_keepalive(Arc::clone(&self.socket), None);
+        let keepalive = spawn_keepalive(Arc::clone(&self.socket), None, None);
         let write = UdpWriteHalf {
             socket: self.socket,
             peer_addr: None,
@@ -1053,10 +1071,16 @@ mod tests {
     #[tokio::test]
     async fn both_sides_send_keepalives() {
         with_timeout(async {
-            let listener = UdpProtocol::bind(([127, 0, 0, 1], 0).into()).await.unwrap();
+            let listener = Arc::new(UdpProtocol::bind(([127, 0, 0, 1], 0).into()).await.unwrap());
             let client_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             client_peer.send_to(&[], listener.address()).await.unwrap();
             let _server = listener.accept().await.unwrap().into_split().await.unwrap();
+            let pump = Arc::clone(&listener);
+            tokio::spawn(async move { while pump.accept().await.is_ok() {} });
+            client_peer
+                .send_to(&[KEEPALIVE_DATAGRAM], listener.address())
+                .await
+                .unwrap();
             assert_eq!(next_non_probe(&client_peer).await, [KEEPALIVE_DATAGRAM]);
 
             let server_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1067,6 +1091,33 @@ mod tests {
         .await;
     }
 
+    fn drain(socket: &UdpSocket) -> Vec<Vec<u8>> {
+        let mut buf = [0; 16];
+        let mut received = Vec::new();
+        while let Ok((len, _)) = socket.try_recv_from(&mut buf) {
+            received.push(buf[..len].to_vec());
+        }
+        received
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn server_keepalives_only_answer_client_traffic() {
+        let listener = Arc::new(UdpProtocol::bind(([127, 0, 0, 1], 0).into()).await.unwrap());
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        peer.send_to(&[], listener.address()).await.unwrap();
+        let _server = listener.accept().await.unwrap().into_split().await.unwrap();
+        let pump = Arc::clone(&listener);
+        tokio::spawn(async move { while pump.accept().await.is_ok() {} });
+        tokio::time::sleep(KEEPALIVE_INTERVAL * 5).await;
+        assert_eq!(drain(&peer), [Vec::<u8>::new()]);
+
+        peer.send_to(&[KEEPALIVE_DATAGRAM], listener.address())
+            .await
+            .unwrap();
+        tokio::time::sleep(KEEPALIVE_INTERVAL * 5).await;
+        assert_eq!(drain(&peer), [vec![KEEPALIVE_DATAGRAM]]);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn keepalives_stop_with_the_read_half() {
         let listener = UdpProtocol::bind(([127, 0, 0, 1], 0).into()).await.unwrap();
@@ -1075,11 +1126,7 @@ mod tests {
         let (read, _write) = listener.accept().await.unwrap().into_split().await.unwrap();
         drop(read);
         tokio::time::sleep(KEEPALIVE_INTERVAL * 5).await;
-        let mut buf = [0; 16];
-        let mut received = Vec::new();
-        while let Ok((len, _)) = peer.try_recv_from(&mut buf) {
-            received.push(buf[..len].to_vec());
-        }
+        let received = drain(&peer);
         assert!(
             received.ends_with(&vec![vec![DISCONNECT_DATAGRAM]; DISCONNECT_REPEATS]),
             "{received:?}"
