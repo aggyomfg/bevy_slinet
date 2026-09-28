@@ -1,11 +1,15 @@
 use std::convert::Infallible;
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bevy::ecs::error::{ResultSeverityExt, Severity};
+use bevy::log::LogPlugin;
 use bevy::prelude::*;
 use bevy_slinet::serializer::SerializerAdapter;
 
 use bevy_slinet::client::ClientPlugin;
+use bevy_slinet::connection::ConnectionId;
 use bevy_slinet::packet_length_serializer::LittleEndian;
 use bevy_slinet::protocols::udp::UdpProtocol;
 use bevy_slinet::serializers::bitcode::BitcodeSerializer;
@@ -51,23 +55,77 @@ impl ClientConfig for Config {
 #[derive(Debug, Decode, Encode)]
 enum ServerPacket {
     Hello,
-    Message(usize),
+    Message(SequenceNumber),
 }
 
 #[derive(Debug, Decode, Encode)]
 enum ClientPacket {
     Hello,
-    Reply(usize),
+    Reply(SequenceNumber),
+}
+
+#[derive(Clone, Copy, Debug, Decode, Encode)]
+struct SequenceNumber(usize);
+
+impl SequenceNumber {
+    const FIRST: Self = Self(0);
+
+    fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+}
+
+impl fmt::Display for SequenceNumber {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
 }
 
 #[derive(Resource)]
 struct ClientId(usize);
+
+impl fmt::Display for ClientId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl ServerPacket {
+    fn reply(&self, client: &ClientId) -> ClientPacket {
+        match self {
+            Self::Hello => {
+                println!("Server -> Client: Hello (client #{client})");
+                ClientPacket::Hello
+            }
+            Self::Message(sequence) => {
+                println!("Server -> Client: {sequence} (client #{client})");
+                ClientPacket::Reply(*sequence)
+            }
+        }
+    }
+}
+
+impl ClientPacket {
+    fn reply(&self, connection: ConnectionId) -> ServerPacket {
+        match self {
+            Self::Hello => {
+                println!("Server <- Client {connection:04?}: Hello");
+                ServerPacket::Message(SequenceNumber::FIRST)
+            }
+            Self::Reply(sequence) => {
+                println!("Server <- Client {connection:04?}: {sequence}");
+                ServerPacket::Message(sequence.next())
+            }
+        }
+    }
+}
 
 fn main() {
     let server = std::thread::spawn(move || {
         App::new()
             .add_plugins((
                 MinimalPlugins,
+                LogPlugin::default(),
                 ServerPlugin::<Config>::bind("127.0.0.1:3000"),
             ))
             .add_observer(server_new_connection_system)
@@ -91,66 +149,30 @@ fn main() {
     server.join().unwrap();
 }
 
-fn server_new_connection_system(new_connection: On<NewConnectionEvent<Config>>) {
-    new_connection
-        .event()
-        .connection
+fn server_new_connection_system(new_connection: On<NewConnectionEvent<Config>>) -> Result {
+    let connection = &new_connection.event().connection;
+    connection
         .send(ServerPacket::Hello)
-        .unwrap();
-    println!(
-        "Connection from {:?}",
-        new_connection.event().connection.peer_addr()
-    );
+        .with_severity(Severity::Error)?;
+    println!("Connection from {:?}", connection.peer_addr());
+    Ok(())
 }
 
 fn client_packet_receive_system(
     new_packet: On<client::PacketReceiveEvent<Config>>,
-    client_number: Res<ClientId>,
-) {
-    match &new_packet.event().packet {
-        ServerPacket::Hello => {
-            println!("Server -> Client: Hello (client #{})", client_number.0);
-            new_packet
-                .event()
-                .connection
-                .send(ClientPacket::Hello)
-                .unwrap();
-        }
-        ServerPacket::Message(i) => {
-            println!("Server -> Client: {} (client #{})", i, client_number.0);
-            new_packet
-                .event()
-                .connection
-                .send(ClientPacket::Reply(*i))
-                .unwrap();
-        }
-    }
+    client_id: Res<ClientId>,
+) -> Result {
+    let event = new_packet.event();
+    event
+        .connection
+        .send(event.packet.reply(&client_id))
+        .with_severity(Severity::Error)
 }
 
-fn server_packet_receive_system(new_packet: On<server::PacketReceiveEvent<Config>>) {
-    match &new_packet.event().packet {
-        ClientPacket::Hello => {
-            println!(
-                "Server <- Client {:04?}: Hello",
-                new_packet.event().connection.id()
-            );
-            new_packet
-                .event()
-                .connection
-                .send(ServerPacket::Message(0))
-                .unwrap();
-        }
-        ClientPacket::Reply(i) => {
-            println!(
-                "Server <- Client {:04?}: {}",
-                new_packet.event().connection.id(),
-                i
-            );
-            new_packet
-                .event()
-                .connection
-                .send(ServerPacket::Message(i + 1))
-                .unwrap();
-        }
-    }
+fn server_packet_receive_system(new_packet: On<server::PacketReceiveEvent<Config>>) -> Result {
+    let event = new_packet.event();
+    event
+        .connection
+        .send(event.packet.reply(event.connection.id()))
+        .with_severity(Severity::Error)
 }

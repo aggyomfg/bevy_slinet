@@ -2,6 +2,8 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bevy::ecs::error::{ResultSeverityExt, Severity};
+use bevy::log::LogPlugin;
 use bevy::prelude::*;
 use bevy_slinet::serializer::SerializerAdapter;
 use bitcode::{Decode, Encode};
@@ -63,7 +65,11 @@ fn main() {
     let server_addr = "127.0.0.1:3000";
     let server = std::thread::spawn(move || {
         App::new()
-            .add_plugins((MinimalPlugins, ServerPlugin::<Config>::bind(server_addr)))
+            .add_plugins((
+                MinimalPlugins,
+                LogPlugin::default(),
+                ServerPlugin::<Config>::bind(server_addr),
+            ))
             .add_observer(server_new_connection_system)
             .add_observer(server_packet_receive_system)
             .run();
@@ -81,19 +87,20 @@ fn main() {
     client.join().unwrap();
 }
 
-fn server_new_connection_system(new_connection: On<NewConnectionEvent<Config>>) {
+fn server_new_connection_system(new_connection: On<NewConnectionEvent<Config>>) -> Result {
     new_connection
         .event()
         .connection
         .send(ServerPacket::String("Hello, World!".to_string()))
-        .unwrap();
+        .with_severity(Severity::Error)?;
     println!(
         "New connection from {:?}",
         new_connection.event().connection.peer_addr()
     );
+    Ok(())
 }
 
-fn client_packet_receive_system(new_packet: On<client::PacketReceiveEvent<Config>>) {
+fn client_packet_receive_system(new_packet: On<client::PacketReceiveEvent<Config>>) -> Result {
     match &new_packet.event().packet {
         ServerPacket::String(s) => println!("Server -> Client: {s}"),
     }
@@ -101,10 +108,11 @@ fn client_packet_receive_system(new_packet: On<client::PacketReceiveEvent<Config
         .event()
         .connection
         .send(ClientPacket::String("Hello, Server!".to_string()))
-        .unwrap();
+        .with_severity(Severity::Error)?;
+    Ok(())
 }
 
-fn server_packet_receive_system(new_packet: On<server::PacketReceiveEvent<Config>>) {
+fn server_packet_receive_system(new_packet: On<server::PacketReceiveEvent<Config>>) -> Result {
     match &new_packet.event().packet {
         ClientPacket::String(s) => println!("Server <- Client: {s}"),
     }
@@ -112,5 +120,6 @@ fn server_packet_receive_system(new_packet: On<server::PacketReceiveEvent<Config
         .event()
         .connection
         .send(ServerPacket::String("Hello, Client!".to_string()))
-        .unwrap();
+        .with_severity(Severity::Error)?;
+    Ok(())
 }

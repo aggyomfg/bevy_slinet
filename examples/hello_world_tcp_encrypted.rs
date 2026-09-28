@@ -1,6 +1,8 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bevy::ecs::error::{ResultSeverityExt, Severity};
+use bevy::log::LogPlugin;
 use bevy::prelude::*;
 use bevy_slinet::serializer::SerializerAdapter;
 use bevy_slinet::serializers::custom_crypt::{
@@ -67,7 +69,11 @@ fn main() {
     let server_addr = "127.0.0.1:3000";
     let server = std::thread::spawn(move || {
         App::new()
-            .add_plugins((MinimalPlugins, ServerPlugin::<Config>::bind(server_addr)))
+            .add_plugins((
+                MinimalPlugins,
+                LogPlugin::default(),
+                ServerPlugin::<Config>::bind(server_addr),
+            ))
             .add_observer(server_new_connection_system)
             .add_observer(server_packet_receive_system)
             .run();
@@ -93,19 +99,20 @@ fn main() {
     client2.join().unwrap();
 }
 
-fn server_new_connection_system(new_connection: On<NewConnectionEvent<Config>>) {
+fn server_new_connection_system(new_connection: On<NewConnectionEvent<Config>>) -> Result {
     new_connection
         .event()
         .connection
         .send(CustomCryptServerPacket::String("Hello, World!".to_string()))
-        .unwrap();
+        .with_severity(Severity::Error)?;
     println!(
         "New connection from: {:?}",
         new_connection.event().connection.peer_addr()
     );
+    Ok(())
 }
 
-fn client_packet_receive_system(new_packet: On<client::PacketReceiveEvent<Config>>) {
+fn client_packet_receive_system(new_packet: On<client::PacketReceiveEvent<Config>>) -> Result {
     match &new_packet.event().packet {
         CustomCryptServerPacket::String(s) => println!("Server -> Client: {s}"),
     }
@@ -115,10 +122,11 @@ fn client_packet_receive_system(new_packet: On<client::PacketReceiveEvent<Config
         .send(CustomCryptClientPacket::String(
             "Hello, Server!".to_string(),
         ))
-        .unwrap();
+        .with_severity(Severity::Error)?;
+    Ok(())
 }
 
-fn client2_packet_receive_system(new_packet: On<client::PacketReceiveEvent<Config>>) {
+fn client2_packet_receive_system(new_packet: On<client::PacketReceiveEvent<Config>>) -> Result {
     match &new_packet.event().packet {
         CustomCryptServerPacket::String(s) => println!("Server -> Client2: {s}"),
     }
@@ -128,10 +136,11 @@ fn client2_packet_receive_system(new_packet: On<client::PacketReceiveEvent<Confi
         .send(CustomCryptClientPacket::String(
             "Hello, Server!, I'm Client2".to_string(),
         ))
-        .unwrap();
+        .with_severity(Severity::Error)?;
+    Ok(())
 }
 
-fn server_packet_receive_system(new_packet: On<server::PacketReceiveEvent<Config>>) {
+fn server_packet_receive_system(new_packet: On<server::PacketReceiveEvent<Config>>) -> Result {
     match &new_packet.event().packet {
         CustomCryptClientPacket::String(s) => println!("Server <- Client: {s}"),
     }
@@ -141,5 +150,6 @@ fn server_packet_receive_system(new_packet: On<server::PacketReceiveEvent<Config
         .send(CustomCryptServerPacket::String(
             "Hello, Client!".to_string(),
         ))
-        .unwrap();
+        .with_severity(Severity::Error)?;
+    Ok(())
 }
