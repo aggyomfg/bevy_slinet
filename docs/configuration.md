@@ -59,3 +59,8 @@ protocol updates, send errors, and the differences from the older public APIs.
 Client `DisconnectionEvent::connection_id` is `Some(id)` for an established
 connection and `None` for a failed connection attempt. This distinguishes
 connections that share the same server address.
+
+Rejected connection requests emit a client `DisconnectionEvent` with no connection
+ID and `ReceiveError::NoConnection`: `WouldBlock` when the request queue is full,
+or `BrokenPipe` when its worker has stopped. The notification comes from the
+request observer, independently of the network lifecycle queue.

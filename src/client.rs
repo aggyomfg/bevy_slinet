@@ -576,14 +576,26 @@ impl<Config: ClientConfig> ConnectedTransport<Config> {
 }
 
 impl<Config: ClientConfig> ConnectionRequestSender<Config> {
-    fn request(&self, address: SocketAddr) {
-        if let Err(err) = self.0.try_send(address) {
-            log::error!("Failed to send connection request: {err:?}");
+    fn observe(
+        connection_request: On<ConnectionRequestEvent<Config>>,
+        requests: Res<Self>,
+        mut commands: Commands,
+    ) {
+        let address = connection_request.event().address;
+        if let Err(err) = requests.0.try_send(address) {
+            let kind = match err {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => io::ErrorKind::WouldBlock,
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => io::ErrorKind::BrokenPipe,
+            };
+            commands.trigger(
+                ConnectionClosed::<Config>::new(
+                    ReceiveError::NoConnection(io::Error::new(kind, "connection request rejected")),
+                    address,
+                    None,
+                )
+                .event,
+            );
         }
-    }
-
-    fn observe(connection_request: On<ConnectionRequestEvent<Config>>, requests: Res<Self>) {
-        requests.request(connection_request.event().address);
     }
 }
 
@@ -1049,5 +1061,47 @@ mod tcp_lifecycle_tests {
             .resource::<ClientConnections<Config>>()
             .is_empty());
         assert_eq!(app.world().resource::<Packets>().0, [9]);
+    }
+
+    #[derive(Default, Resource)]
+    struct RequestFailures(Vec<(SocketAddr, io::ErrorKind)>);
+
+    #[test]
+    fn rejected_connection_requests_emit_failure_events() {
+        let address: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(address).unwrap();
+        let mut app = App::new();
+        app.insert_resource(ConnectionRequestSender::<Config>(tx, PhantomData));
+        app.init_resource::<RequestFailures>();
+        app.add_observer(ConnectionRequestSender::<Config>::observe);
+        app.add_observer(
+            |event: On<DisconnectionEvent<Config>>, mut failures: ResMut<RequestFailures>| {
+                assert!(event.connection_id.is_none());
+                let ReceiveError::NoConnection(error) = &event.error else {
+                    panic!("expected a failed connection attempt");
+                };
+                failures.0.push((event.address, error.kind()));
+            },
+        );
+        app.world_mut()
+            .trigger(ConnectionRequestEvent::<Config>::new(address));
+        app.world_mut().flush();
+        assert_eq!(
+            app.world().resource::<RequestFailures>().0,
+            [(address, io::ErrorKind::WouldBlock)]
+        );
+        assert_eq!(rx.try_recv().unwrap(), address);
+        drop(rx);
+        app.world_mut()
+            .trigger(ConnectionRequestEvent::<Config>::new(address));
+        app.world_mut().flush();
+        assert_eq!(
+            app.world().resource::<RequestFailures>().0,
+            [
+                (address, io::ErrorKind::WouldBlock),
+                (address, io::ErrorKind::BrokenPipe),
+            ]
+        );
     }
 }
