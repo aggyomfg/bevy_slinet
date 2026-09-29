@@ -151,9 +151,11 @@ pub struct NetworkQueueSettings {
     /// Outgoing packets per connection. Datagram `DropNewest` reports `Full` on overflow.
     pub send_capacity: usize,
     /// Incoming channel capacity per plugin. Streams share a FIFO for packets and
-    /// lifecycle; datagrams have a separate packet queue. ECS retains one lookahead event.
+    /// lifecycle; datagrams have a separate packet queue.
     pub receive_capacity: usize,
-    /// Maximum items drained by each networking ECS system per frame. May change at runtime.
+    /// Maximum events drained per frame. Streams share this budget across packets,
+    /// establishment and closure. Datagram lifecycle and packets have separate budgets.
+    /// May change at runtime; zero pauses delivery.
     pub events_per_frame: usize,
     /// Policy for a full datagram outgoing packet queue.
     pub datagram_send_overflow: OverflowPolicy,

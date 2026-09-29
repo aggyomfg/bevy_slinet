@@ -1,34 +1,22 @@
 # `bevy_slinet`
 
-A simple networking plugin for bevy.
+TCP/UDP networking for Bevy with configurable packet types, serializers and custom transports.
 
 [![docs.rs](https://img.shields.io/docsrs/bevy_slinet)](https://docs.rs/bevy_slinet)
 [![Crates.io](https://img.shields.io/crates/v/bevy_slinet)](https://crates.io/crates/bevy_slinet)
 [![Crates.io](https://img.shields.io/crates/l/bevy_slinet)](https://github.com/aggyomfg/bevy_slinet/tree/main/LICENSE)
 
-## Features
+Enable the features you need: `client`, `server`, `protocol_tcp`, `protocol_udp`,
+`serializer_bitcode` or `serializer_bitcode_serde`. See [Cargo.toml](Cargo.toml).
+Bincode serializers remain for compatibility; prefer bitcode for new code.
 
-- You can choose TCP or UDP protocol. Adding your own protocols is as easy as implementing a few traits.
-- Multiple clients/servers with different configs (specifies a protocol, packet types, serializer, etc.)
-- De/serialization. You choose a serialization format, packet type (you probably want it to be `enum`), and receive events with deserialized packets.
+- Examples: [TCP](examples/hello_world_tcp.rs), [UDP](examples/hello_world_udp.rs),
+  [application sessions](examples/udp_application_sessions.rs), [all examples](examples).
+- [API reference](https://docs.rs/bevy_slinet) · [Configuration](docs/configuration.md) ·
+  [UDP semantics](docs/udp.md) · [Migration to 0.19](docs/019-migration.md) ·
+  [Benchmarks](docs/benchmarks.md).
 
-> Note: Everything in bevy_slinet is feature-gated. Make sure to enable features you need (`client`, `server`, `protocol_tcp`, `protocol_udp`, `serializer_bitcode`, `serializer_bitcode_serde`).
-
-> Note: `serializer_bincode` and `serializer_bincode_serde` are kept for compatibility only, since [bincode is unmaintained](https://rustsec.org/advisories/RUSTSEC-2025-0141). Prefer the bitcode serializers for new code.
-
-Note: with TCP, you should implement keep-alive and disconnection systems yourself, or look at [`lobby_and_battle_servers` example](examples/lobby_and_battle_servers.rs)
-
-## Documentation
-
-- [Queue and receive limits](docs/configuration.md)
-- [API migration: typed transport handles and connection APIs](docs/019-migration.md)
-- [UDP: configuration, diagnostics, pacing, and application sessions](docs/udp.md)
-- [API reference](https://docs.rs/bevy_slinet)
-- [Networking benchmarks](docs/benchmarks.md)
-
-## [More Examples](https://github.com/aggyomfg/bevy_slinet/tree/main/examples)
-
-### Compatibility table
+## Bevy compatibility
 
 | Plugin Version | Bevy Version |
 |----------------|--------------|

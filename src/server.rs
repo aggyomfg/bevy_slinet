@@ -84,6 +84,26 @@ pub struct ServerPlugin<Config: ServerConfig> {
     _marker: PhantomData<Config>,
 }
 
+// Keep benchmark fixtures on exactly the same schedules and labels as the plugin.
+fn configure_receive_systems<Config: ServerConfig>(app: &mut App) {
+    let lifecycle = lifecycle_system::<Config>
+        .in_set(SystemSets::ServerAcceptNewConnections)
+        .in_set(SystemSets::ServerRemoveConnections);
+    if Config::Protocol::DATAGRAM {
+        app.add_systems(PreUpdate, lifecycle).add_systems(
+            PreUpdate,
+            accept_new_packets::<Config>
+                .in_set(SystemSets::ServerAcceptNewPackets)
+                .after(SystemSets::ServerAcceptNewConnections),
+        );
+    } else {
+        app.add_systems(
+            PreUpdate,
+            lifecycle.in_set(SystemSets::ServerAcceptNewPackets),
+        );
+    }
+}
+
 impl<Config: ServerConfig> Plugin for ServerPlugin<Config> {
     fn build(&self, app: &mut App) {
         app.init_resource::<ReceiveLimits>()
@@ -102,18 +122,8 @@ impl<Config: ServerConfig> Plugin for ServerPlugin<Config> {
             .add_systems(
                 Update,
                 MaxPacketSize::set_system.in_set(SystemSets::SetMaxPacketSize),
-            )
-            .add_systems(
-                PreUpdate,
-                (
-                    lifecycle_system::<Config>
-                        .in_set(SystemSets::ServerAcceptNewConnections)
-                        .in_set(SystemSets::ServerRemoveConnections),
-                    accept_new_packets::<Config>
-                        .in_set(SystemSets::ServerAcceptNewPackets)
-                        .after(SystemSets::ServerAcceptNewConnections),
-                ),
             );
+        configure_receive_systems::<Config>(app);
     }
 }
 
@@ -576,7 +586,6 @@ pub struct PacketReceiveEvent<Config: ServerConfig> {
 
 fn lifecycle_system<Config: ServerConfig>(
     mut lifecycle: ResMut<LifecycleReceiver<Config>>,
-    mut connections: ResMut<ServerConnections<Config>>,
     queues: Option<Res<NetworkQueueSettings>>,
     mut commands: Commands,
 ) {
@@ -586,27 +595,33 @@ fn lifecycle_system<Config: ServerConfig>(
         .unwrap_or_default()
         .events_per_frame;
     for _ in 0..budget {
-        match lifecycle
-            .0
-            .try_recv_if(|event| !matches!(event, ServerLifecycle::Packet(_)))
-        {
+        match lifecycle.0.try_recv() {
             Some(ServerLifecycle::Established(event)) => {
-                event.connection.mark_published();
-                connections.register(event.connection.clone());
-                commands.trigger(event);
+                // Registry changes and observers share the same command order as packets.
+                commands.queue(move |world: &mut World| {
+                    world
+                        .resource_mut::<ServerConnections<Config>>()
+                        .register(event.connection.clone());
+                    event.connection.mark_published();
+                    world.trigger(event);
+                });
             }
-            Some(ServerLifecycle::Closed(event)) => {
-                connections.remove_connection(event.connection.id());
-                commands.trigger(event);
+            Some(ServerLifecycle::Packet(packet)) => commands.trigger(packet),
+            Some(ServerLifecycle::Closed(closed)) => {
+                commands.queue(move |world: &mut World| {
+                    world
+                        .resource_mut::<ServerConnections<Config>>()
+                        .remove_connection(closed.connection.id());
+                    world.trigger(closed);
+                });
             }
-            Some(ServerLifecycle::Packet(_)) | None => break,
+            None => break,
         }
     }
 }
 
 fn accept_new_packets<Config: ServerConfig>(
     mut packets: ResMut<PacketReceiver<Config>>,
-    mut lifecycle: ResMut<LifecycleReceiver<Config>>,
     queues: Option<Res<NetworkQueueSettings>>,
     mut commands: Commands,
 ) {
@@ -616,15 +631,6 @@ fn accept_new_packets<Config: ServerConfig>(
         .unwrap_or_default()
         .events_per_frame;
     if !Config::Protocol::DATAGRAM {
-        for _ in 0..budget {
-            let Some(ServerLifecycle::Packet(packet)) = lifecycle
-                .0
-                .try_recv_if(|event| matches!(event, ServerLifecycle::Packet(_)))
-            else {
-                break;
-            };
-            commands.trigger(packet);
-        }
         return;
     }
     for _ in 0..budget {

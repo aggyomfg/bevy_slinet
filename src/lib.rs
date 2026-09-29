@@ -34,12 +34,14 @@ mod tests;
 
 /// Exposes networking phases so application systems can order their work around packet events.
 ///
-/// Each plugin processes establishment and removal in one FIFO system during `PreUpdate`.
-/// Its establishment and removal labels select that same system. Systems ordered around
-/// removal must therefore also run in `PreUpdate`; ordering does not cross schedules.
+/// Each plugin processes establishment and removal during `PreUpdate`.
+/// For stream protocols, packet, establishment and removal labels select one FIFO
+/// system with a shared budget in `PreUpdate`. Do not order a system between those
+/// labels: they select the same system. Datagram packet processing remains separate.
+/// Ordering does not cross schedules.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, SystemSet)]
 pub enum SystemSets {
-    /// Publishes client packet events during `PostUpdate`.
+    /// Publishes stream packets in `PreUpdate` with lifecycle; datagrams in `PostUpdate`.
     ClientPacketReceive,
     /// Processes client establishment and closure during `PreUpdate`.
     ClientConnectionEstablish,
@@ -51,7 +53,7 @@ pub enum SystemSets {
     ServerConnectionAdd,
     /// Processes server establishment and closure during `PreUpdate`.
     ServerAcceptNewConnections,
-    /// Publishes server packet events after lifecycle processing during `PreUpdate`.
+    /// Publishes packets in `PreUpdate`: with lifecycle for streams, after it for datagrams.
     ServerAcceptNewPackets,
     /// The same lifecycle phase as [`Self::ServerAcceptNewConnections`].
     ServerRemoveConnections,

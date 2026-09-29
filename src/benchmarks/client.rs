@@ -63,8 +63,6 @@ impl Fixture {
             .insert_resource(PacketReceiver::<Config> { receiver: packets })
             .insert_resource(ClientConnections::<Config>::new())
             .init_resource::<Counts>()
-            .add_systems(PreUpdate, lifecycle_system::<Config>)
-            .add_systems(PostUpdate, packet_receive_system::<Config>)
             .add_observer(
                 |_: On<ConnectionEstablishEvent<Config>>, mut counts: ResMut<Counts>| {
                     counts.0.established += 1;
@@ -82,6 +80,7 @@ impl Fixture {
                     counts.0.last_close_frame = counts.0.frames;
                 },
             );
+        configure_receive_systems::<Config>(&mut app);
         app.update(); // Initialize schedules outside measurements.
         let mut connections = Vec::new();
         let mut outgoing = Vec::new();
@@ -176,11 +175,13 @@ mod tests {
     #[allow(clippy::wildcard_imports)]
     use super::*;
     #[test]
-    fn frame_budget_and_phase_boundaries_are_visible() {
+    fn mixed_fifo_drains_without_phase_delay_and_respects_total_budget() {
         for (scenario, budget, frames) in [
             (Scenario::Packets, 1, 8),
             (Scenario::Packets, 256, 1),
-            (Scenario::Interleaved, 256, 9),
+            (Scenario::Interleaved, 256, 1),
+            (Scenario::Interleaved, 1, 24),
+            (Scenario::Interleaved, 5, 5),
         ] {
             let mut fixture = Fixture::new(budget, 8, 1, scenario);
             fixture.enqueue();
@@ -190,11 +191,81 @@ mod tests {
             if matches!(scenario, Scenario::Interleaved) {
                 assert_eq!(result.established, 8);
                 assert_eq!(result.closed, 8);
-                assert_eq!(result.last_packet_frame, 8);
-                assert_eq!(result.last_close_frame, 9);
+                assert_eq!(result.last_packet_frame, 23_usize.div_ceil(budget));
+                assert_eq!(result.last_close_frame, 24_usize.div_ceil(budget));
             }
             fixture.enqueue();
             assert_eq!(fixture.drain(), result);
+        }
+    }
+
+    #[test]
+    fn observers_see_registry_changes_in_fifo_order_in_one_frame() {
+        #[derive(Resource, Default)]
+        struct Order(Vec<&'static str>);
+        let mut fixture = Fixture::new(256, 2, 1, Scenario::Interleaved);
+        fixture.app.init_resource::<Order>();
+        fixture.app.add_observer(
+            |event: On<ConnectionEstablishEvent<Config>>,
+             connections: Res<ClientConnections<Config>>,
+             mut order: ResMut<Order>| {
+                assert_eq!(connections.len(), 1);
+                assert_eq!(connections.first().unwrap().id(), event.connection.id());
+                order.0.push("open");
+            },
+        );
+        fixture.app.add_observer(
+            |event: On<PacketReceiveEvent<Config>>,
+             connections: Res<ClientConnections<Config>>,
+             mut order: ResMut<Order>| {
+                assert_eq!(connections.len(), 1);
+                assert_eq!(connections.first().unwrap().id(), event.connection.id());
+                order.0.push("packet");
+            },
+        );
+        fixture.app.add_observer(
+            |event: On<DisconnectionEvent<Config>>,
+             connections: Res<ClientConnections<Config>>,
+             mut order: ResMut<Order>| {
+                assert!(connections
+                    .iter()
+                    .all(|connection| connection.id() != event.connection_id.unwrap()));
+                order.0.push("close");
+            },
+        );
+        fixture.enqueue();
+        fixture.app.update();
+        assert_eq!(
+            fixture.app.world().resource::<Order>().0,
+            ["open", "packet", "close", "open", "packet", "close"]
+        );
+    }
+    #[test]
+    fn zero_budget_pauses_and_each_frame_counts_all_event_types() {
+        let mut fixture = Fixture::new(256, 2, 2, Scenario::Interleaved);
+        fixture.enqueue();
+        fixture
+            .app
+            .world_mut()
+            .resource_mut::<NetworkQueueSettings>()
+            .events_per_frame = 0;
+        fixture.app.update();
+        assert_eq!(
+            fixture.app.world().resource::<Counts>().0,
+            Delivery::default()
+        );
+        fixture
+            .app
+            .world_mut()
+            .resource_mut::<NetworkQueueSettings>()
+            .events_per_frame = 3;
+        for expected in [3, 6, 8] {
+            fixture.app.update();
+            let counts = fixture.app.world().resource::<Counts>().0;
+            assert_eq!(
+                counts.established + counts.packets + counts.closed,
+                expected
+            );
         }
     }
 }

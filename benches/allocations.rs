@@ -89,8 +89,11 @@ fn main() {
         macro_rules! measure_ecs {
             ($fixture:ty, $side:literal) => {{
                 let mut fixture = <$fixture>::new(256, 32, 4, scenario);
-                fixture.enqueue();
-                fixture.drain();
+                // Bevy can rotate frame-local buffers; warm consecutive frames too.
+                for _ in 0..3 {
+                    fixture.enqueue();
+                    fixture.drain();
+                }
                 fixture.enqueue();
                 let name = format!("ecs/{}/{scenario:?}", $side);
                 measure(&name, 128, || {

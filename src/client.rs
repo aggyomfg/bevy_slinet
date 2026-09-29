@@ -89,6 +89,21 @@ pub struct ClientPlugin<Config: ClientConfig> {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, SystemSet)]
 struct AddInitialConnectionRequestEventLabel;
 
+// Keep benchmark fixtures on exactly the same schedules and labels as the plugin.
+fn configure_receive_systems<Config: ClientConfig>(app: &mut App) {
+    let lifecycle = lifecycle_system::<Config>
+        .in_set(SystemSets::ClientConnectionEstablish)
+        .in_set(SystemSets::ClientConnectionRemove);
+    if Config::Protocol::DATAGRAM {
+        app.add_systems(PreUpdate, lifecycle).add_systems(
+            PostUpdate,
+            packet_receive_system::<Config>.in_set(SystemSets::ClientPacketReceive),
+        );
+    } else {
+        app.add_systems(PreUpdate, lifecycle.in_set(SystemSets::ClientPacketReceive));
+    }
+}
+
 impl<Config: ClientConfig> Plugin for ClientPlugin<Config> {
     fn build(&self, app: &mut App) {
         let address = self.address;
@@ -108,16 +123,6 @@ impl<Config: ClientConfig> Plugin for ClientPlugin<Config> {
                 MaxPacketSize::set_system.in_set(SystemSets::SetMaxPacketSize),
             )
             .add_systems(
-                PreUpdate,
-                lifecycle_system::<Config>
-                    .in_set(SystemSets::ClientConnectionEstablish)
-                    .in_set(SystemSets::ClientConnectionRemove),
-            )
-            .add_systems(
-                PostUpdate,
-                packet_receive_system::<Config>.in_set(SystemSets::ClientPacketReceive),
-            )
-            .add_systems(
                 Startup,
                 (
                     Self::setup_system()
@@ -131,6 +136,7 @@ impl<Config: ClientConfig> Plugin for ClientPlugin<Config> {
                     .in_set(AddInitialConnectionRequestEventLabel),
                 ),
             );
+        configure_receive_systems::<Config>(app);
     }
 }
 
@@ -626,7 +632,6 @@ impl<Config: ClientConfig> ConnectionRequestSender<Config> {
 
 fn packet_receive_system<Config: ClientConfig>(
     mut packets: ResMut<PacketReceiver<Config>>,
-    mut lifecycle: ResMut<LifecycleReceiver<Config>>,
     queues: Option<Res<NetworkQueueSettings>>,
     mut commands: Commands,
 ) {
@@ -636,15 +641,6 @@ fn packet_receive_system<Config: ClientConfig>(
         .unwrap_or_default()
         .events_per_frame;
     if !Config::Protocol::DATAGRAM {
-        for _ in 0..budget {
-            let Some(ClientLifecycle::Packet(packet)) = lifecycle
-                .0
-                .try_recv_if(|event| matches!(event, ClientLifecycle::Packet(_)))
-            else {
-                break;
-            };
-            commands.trigger(packet);
-        }
         return;
     }
     for _ in 0..budget {
@@ -677,7 +673,6 @@ fn packet_receive_system<Config: ClientConfig>(
 
 fn lifecycle_system<Config: ClientConfig>(
     mut lifecycle: ResMut<LifecycleReceiver<Config>>,
-    mut connections: ResMut<ClientConnections<Config>>,
     queues: Option<Res<NetworkQueueSettings>>,
     mut commands: Commands,
 ) {
@@ -687,26 +682,34 @@ fn lifecycle_system<Config: ClientConfig>(
         .unwrap_or_default()
         .events_per_frame;
     for _ in 0..budget {
-        match lifecycle
-            .0
-            .try_recv_if(|event| !matches!(event, ClientLifecycle::Packet(_)))
-        {
+        match lifecycle.0.try_recv() {
             Some(ClientLifecycle::Established(event)) => {
-                commands.insert_resource(event.connection.clone());
-                event.connection.mark_published();
-                connections.register(event.connection.clone());
-                commands.trigger(event);
+                // Registry changes and observers share the same command order as packets.
+                commands.queue(move |world: &mut World| {
+                    world.insert_resource(event.connection.clone());
+                    world
+                        .resource_mut::<ClientConnections<Config>>()
+                        .register(event.connection.clone());
+                    event.connection.mark_published();
+                    world.trigger(event);
+                });
             }
+            Some(ClientLifecycle::Packet(packet)) => commands.trigger(packet),
             Some(ClientLifecycle::Closed(closed)) => {
-                if let Some(id) = closed.id {
-                    commands.remove_resource::<ClientConnection<Config>>();
-                    if let Some(connection) = connections.remove_connection(id) {
-                        commands.insert_resource(connection);
+                commands.queue(move |world: &mut World| {
+                    if let Some(id) = closed.id {
+                        world.remove_resource::<ClientConnection<Config>>();
+                        let fallback = world
+                            .resource_mut::<ClientConnections<Config>>()
+                            .remove_connection(id);
+                        if let Some(connection) = fallback {
+                            world.insert_resource(connection);
+                        }
                     }
-                }
-                commands.trigger(closed.event);
+                    world.trigger(closed.event);
+                });
             }
-            Some(ClientLifecycle::Packet(_)) | None => break,
+            None => break,
         }
     }
 }
