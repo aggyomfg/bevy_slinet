@@ -1,5 +1,11 @@
 //! A bounded queue that can discard the oldest item when configured to do so.
 
+// Public only through the unstable benchmark API.
+#![cfg_attr(
+    feature = "bench-internals",
+    allow(clippy::missing_errors_doc, clippy::must_use_candidate)
+)]
+
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -174,9 +180,12 @@ impl<T> Drop for LossyReceiver<T> {
 
 impl<T> LossyReceiver<T> {
     /// Closes the receiver and returns queued items in FIFO order.
-    #[expect(
-        clippy::needless_pass_by_ref_mut,
-        reason = "Only the single receiver may close and drain"
+    #[cfg_attr(
+        not(feature = "bench-internals"),
+        expect(
+            clippy::needless_pass_by_ref_mut,
+            reason = "Only the single receiver may close and drain"
+        )
     )]
     pub fn close_and_drain(&mut self) -> Vec<T> {
         let items = {
@@ -217,9 +226,12 @@ impl<T> LossyReceiver<T> {
     }
 
     /// Receives the front item only when `ready` accepts it, leaving it queued otherwise.
-    #[expect(
-        clippy::needless_pass_by_ref_mut,
-        reason = "Only the single receiver may remove queue items"
+    #[cfg_attr(
+        not(feature = "bench-internals"),
+        expect(
+            clippy::needless_pass_by_ref_mut,
+            reason = "Only the single receiver may remove queue items"
+        )
     )]
     pub fn try_recv_if(&mut self, ready: impl Fn(&T) -> bool) -> Result<T, TryRecvError> {
         let mut state = self.0.lock();

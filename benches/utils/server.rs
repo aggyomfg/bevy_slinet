@@ -59,7 +59,7 @@ impl Fixture {
             lossy_channel(1, usize::MAX, crate::connection::OverflowPolicy::DropNewest);
         let mut app = App::new();
         app.insert_resource(settings)
-            .insert_resource(LifecycleReceiver::<Config>(receiver.into()))
+            .insert_resource(LifecycleReceiver::<Config>(receiver))
             .insert_resource(PacketReceiver::<Config> { receiver: packets })
             .insert_resource(ServerConnections::<Config>::new())
             .init_resource::<Counts>()

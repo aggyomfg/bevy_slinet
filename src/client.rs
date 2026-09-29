@@ -20,7 +20,7 @@ use futures::StreamExt;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_util::sync::CancellationToken;
 
-use crate::connection::transport::{LifecycleQueue, PendingPacket};
+use crate::connection::transport::PendingPacket;
 use crate::connection::{
     ConnectionId, EcsConnection, MaxPacketSize, NetworkQueueSettings, OutgoingReceiver,
     OutgoingSender, PacketForwarder, RawConnection, ReceiveLimits,
@@ -234,7 +234,7 @@ impl<Config: ClientConfig> Clone for ConnectionRequestEvent<Config> {
 struct ConnectionRequestSender<Config: ClientConfig>(Sender<SocketAddr>, PhantomData<Config>);
 
 #[derive(Resource)]
-struct LifecycleReceiver<Config: ClientConfig>(LifecycleQueue<ClientLifecycle<Config>>);
+struct LifecycleReceiver<Config: ClientConfig>(Receiver<ClientLifecycle<Config>>);
 
 enum ClientLifecycle<Config: ClientConfig> {
     Packet(PacketReceiveEvent<Config>),
@@ -312,7 +312,7 @@ impl<Config: ClientConfig> ClientPlugin<Config> {
             usize::MAX,
             queues.datagram_receive_overflow,
         );
-        commands.insert_resource(LifecycleReceiver::<Config>(lifecycle_rx.into()));
+        commands.insert_resource(LifecycleReceiver::<Config>(lifecycle_rx));
         commands.insert_resource(PacketReceiver::<Config> { receiver: pack_rx });
         commands.add_observer(ConnectionRequestSender::<Config>::observe);
 
@@ -703,7 +703,7 @@ fn lifecycle_system<Config: ClientConfig>(
         .events_per_frame;
     for _ in 0..budget {
         match lifecycle.0.try_recv() {
-            Some(ClientLifecycle::Established(event)) => {
+            Ok(ClientLifecycle::Established(event)) => {
                 // Registry changes and observers share the same command order as packets.
                 commands.queue(move |world: &mut World| {
                     world.insert_resource(event.connection.clone());
@@ -714,8 +714,8 @@ fn lifecycle_system<Config: ClientConfig>(
                     world.trigger(event);
                 });
             }
-            Some(ClientLifecycle::Packet(packet)) => commands.trigger(packet),
-            Some(ClientLifecycle::Closed(closed)) => {
+            Ok(ClientLifecycle::Packet(packet)) => commands.trigger(packet),
+            Ok(ClientLifecycle::Closed(closed)) => {
                 commands.queue(move |world: &mut World| {
                     if let Some(id) = closed.id {
                         world.remove_resource::<ClientConnection<Config>>();
@@ -729,7 +729,7 @@ fn lifecycle_system<Config: ClientConfig>(
                     world.trigger(closed.event);
                 });
             }
-            None => break,
+            Err(_) => break,
         }
     }
 }
@@ -919,7 +919,7 @@ mod udp_lifecycle_tests {
         let mut app = App::new();
         app.insert_resource(settings);
         app.insert_resource(ClientConnections::<Config>::new());
-        app.insert_resource(LifecycleReceiver::<Config>(lifecycle_rx.into()));
+        app.insert_resource(LifecycleReceiver::<Config>(lifecycle_rx));
         app.insert_resource(PacketReceiver::<Config> {
             receiver: packet_rx,
         });
@@ -1054,7 +1054,7 @@ mod udp_lifecycle_tests {
         let mut app = App::new();
         app.insert_resource(settings);
         app.insert_resource(ClientConnections::<Config>::new());
-        app.insert_resource(LifecycleReceiver::<Config>(lifecycle_rx.into()));
+        app.insert_resource(LifecycleReceiver::<Config>(lifecycle_rx));
         app.insert_resource(PacketReceiver::<Config> {
             receiver: packet_rx,
         });
@@ -1143,7 +1143,7 @@ mod tcp_lifecycle_tests {
         let mut app = App::new();
         app.insert_resource(settings);
         app.insert_resource(ClientConnections::<Config>::new());
-        app.insert_resource(LifecycleReceiver::<Config>(lifecycle_rx.into()));
+        app.insert_resource(LifecycleReceiver::<Config>(lifecycle_rx));
         app.insert_resource(PacketReceiver::<Config> {
             receiver: packet_rx,
         });

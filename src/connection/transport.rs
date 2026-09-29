@@ -30,21 +30,3 @@ impl<H: TransportHandle> Drop for PendingPacket<H> {
         }
     }
 }
-
-/// One bounded FIFO drained in order with a shared per-frame event budget.
-#[cfg(any(feature = "client", feature = "server"))]
-pub struct LifecycleQueue<T>(tokio::sync::mpsc::Receiver<T>);
-
-#[cfg(any(feature = "client", feature = "server"))]
-impl<T> From<tokio::sync::mpsc::Receiver<T>> for LifecycleQueue<T> {
-    fn from(receiver: tokio::sync::mpsc::Receiver<T>) -> Self {
-        Self(receiver)
-    }
-}
-
-#[cfg(any(feature = "client", feature = "server"))]
-impl<T> LifecycleQueue<T> {
-    pub fn try_recv(&mut self) -> Option<T> {
-        self.0.try_recv().ok()
-    }
-}
