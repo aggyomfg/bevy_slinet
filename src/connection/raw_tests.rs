@@ -209,3 +209,36 @@ fn raw_disconnect_closes_ecs_clones_without_counting_rejected_packets() {
     drop(raw);
     assert!(drops.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn extracting_parts_keeps_queue_codecs_and_shared_controls_alive() {
+    let drops = Arc::new(Mutex::new(Vec::new()));
+    let handle = SharedHandle(Arc::clone(&drops));
+    let (sender, receiver) = tokio::sync::mpsc::channel(2);
+    let raw = RawConnection::new(
+        TestStream::new(handle),
+        Arc::new(ByteSerializer),
+        LittleEndian::<u32>::default(),
+        receiver,
+    );
+    let id = raw.id();
+    let limits = raw.receive_limits().clone();
+    let cancellation = raw.disconnect_task.clone();
+    sender.try_send(7).unwrap();
+    let mut parts = raw.into_parts();
+    assert_eq!(parts.id, id);
+    assert!(!sender.is_closed());
+    assert_eq!(parts.packets_rx.recv().await, Some(7));
+    assert_eq!(parts.serializer.serialize(8).unwrap(), vec![8]);
+    limits.set_max_packet_size(42);
+    assert_eq!(parts.receive_limits.max_packet_size(), 42);
+    parts.disconnect_task.cancel();
+    assert!(cancellation.is_cancelled());
+    sender.try_send(9).unwrap();
+    drop(parts);
+    assert!(sender.is_closed());
+    assert_eq!(
+        *drops.lock().unwrap(),
+        [QueueDropReason::ClosedBeforeDelivery]
+    );
+}

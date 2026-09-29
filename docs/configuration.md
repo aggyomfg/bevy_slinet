@@ -36,3 +36,12 @@ ECS phase (zero pauses that endpoint's event processing). Packet size limits are
 synchronized at startup and `Update`, including for existing connections;
 `Some(usize::MAX)` explicitly disables an endpoint's size bound. An already-running
 packet read may finish using its previous limit.
+
+## Custom connection tasks
+
+`RawConnection::into_parts()` transfers the stream, outgoing receiver, payload and
+length serializers, cancellation token, live receive limits and connection ID.
+Unlike `into_stream()`, it preserves queued packets. A custom task must observe
+`disconnect_task` and use `receive_limits` when calling `PacketReader::receive`.
+Dropping the receiver closes the queue and records undelivered queued packets;
+extracting parts does not itself cancel the connection.

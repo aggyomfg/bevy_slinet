@@ -16,6 +16,8 @@ use crate::protocols::protocol::{NetworkStream, TransportHandle};
 use crate::serializers::packet_length_serializer::PacketLengthSerializer;
 use crate::serializers::serializer::Serializer;
 
+mod parts;
+pub use parts::RawConnectionParts;
 mod queue;
 #[cfg(test)]
 mod raw_tests;
@@ -163,13 +165,6 @@ where
 }
 
 /// Owns the low-level transport and packet queue consumed by a connection task.
-#[cfg_attr(
-    not(any(feature = "client", feature = "server")),
-    expect(
-        dead_code,
-        reason = "Endpoint tasks consume the private serializer and queue fields"
-    )
-)]
 pub struct RawConnection<ReceivingPacket, SendingPacket, NS, EncErr, DecErr, LS>
 where
     ReceivingPacket: Send + Sync + Debug + 'static,
@@ -334,6 +329,23 @@ where
     #[must_use]
     pub const fn stream(&self) -> &NS {
         &self.stream
+    }
+
+    /// Transfers all connection state to a custom task without closing its queue.
+    /// Observe `disconnect_task` and pass `receive_limits` to packet readers.
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> RawConnectionParts<ReceivingPacket, SendingPacket, NS, EncErr, DecErr, LS> {
+        RawConnectionParts {
+            disconnect_task: self.disconnect_task,
+            stream: self.stream,
+            serializer: self.serializer,
+            packet_length_serializer: self.packet_length_serializer,
+            packets_rx: self.packets_rx,
+            receive_limits: self.receive_limits,
+            id: self.id,
+        }
     }
 
     /// Takes ownership of the stream, dropping the outgoing queue and raw wrapper.
