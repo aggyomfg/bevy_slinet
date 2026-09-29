@@ -242,6 +242,28 @@ mod tests {
         );
     }
     #[test]
+    fn receive_sets_expose_observer_effects_in_pre_update() {
+        let mut fixture = Fixture::new(256, 1, 1, Scenario::Interleaved);
+        fixture.app.add_systems(
+            PreUpdate,
+            (
+                (|counts: Res<Counts>| assert_eq!(counts.0.packets, 0))
+                    .before(ServerSystems::<Config>::RECEIVE),
+                (|counts: Res<Counts>| {
+                    assert_eq!(counts.0.established, 1);
+                    assert_eq!(counts.0.packets, 1);
+                    assert_eq!(counts.0.closed, 1);
+                })
+                .after(ServerSystems::<Config>::RECEIVE),
+                (|counts: Res<Counts>| assert_eq!(counts.0.packets, 1))
+                    .after(SystemSets::ServerReceive),
+            ),
+        );
+        fixture.enqueue();
+        fixture.app.update();
+    }
+
+    #[test]
     fn zero_budget_pauses_and_each_frame_counts_all_event_types() {
         let mut fixture = Fixture::new(256, 2, 2, Scenario::Interleaved);
         fixture.enqueue();

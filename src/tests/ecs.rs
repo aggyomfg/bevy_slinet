@@ -180,3 +180,96 @@ fn endpoint_limits_are_isolated_and_restore_global_defaults() {
         (128, 16, 128)
     );
 }
+
+#[test]
+fn global_limits_system_is_registered_once_for_multiple_endpoints() {
+    test_config!(OtherConfig, TcpProtocol);
+    let mut app = App::new();
+    app.add_plugins((
+        ClientPlugin::<EcsTcpConfig>::new(),
+        ClientPlugin::<OtherConfig>::new(),
+        ServerPlugin::<EcsTcpConfig>::bind("127.0.0.1:0"),
+    ));
+    app.update();
+    let schedules = app.world().resource::<Schedules>();
+    for schedule in [
+        schedules.get(Startup).unwrap(),
+        schedules.get(Update).unwrap(),
+    ] {
+        let count = schedule
+            .systems()
+            .unwrap()
+            .filter(|(_, system)| {
+                system.system_type()
+                    == IntoSystem::into_system(MaxPacketSize::set_system).system_type()
+            })
+            .count();
+        assert_eq!(count, 1);
+    }
+}
+
+#[test]
+fn typed_settings_and_setup_sets_apply_commands_before_consumers() {
+    use crate::client::{ClientSettings, ClientSystems};
+    use crate::connection::settings::EndpointReceiveLimits;
+    use crate::server::ServerSystems;
+    let mut app = App::new();
+    app.add_plugins((
+        ClientPlugin::<EcsTcpConfig>::new(),
+        ServerPlugin::<EcsTcpConfig>::bind("127.0.0.1:0"),
+    ));
+    app.add_systems(
+        Startup,
+        (
+            (|mut commands: Commands| {
+                commands.insert_resource(
+                    ClientSettings::<EcsTcpConfig>::default().with_max_packet_size(17),
+                );
+            })
+            .before(ClientSystems::<EcsTcpConfig>::SETTINGS),
+            (|limits: Res<EndpointReceiveLimits<ClientPlugin<EcsTcpConfig>>>| {
+                assert_eq!(limits.limits.max_packet_size(), 17);
+            })
+            .after(ClientSystems::<EcsTcpConfig>::SETUP),
+            (|address: Res<ServerAddress<EcsTcpConfig>>| {
+                assert_ne!(address.address().port(), 0);
+            })
+            .after(ServerSystems::<EcsTcpConfig>::SETUP),
+        ),
+    );
+    app.add_systems(
+        Update,
+        (
+            (|mut commands: Commands| {
+                commands.insert_resource(
+                    ClientSettings::<EcsTcpConfig>::default().with_max_packet_size(23),
+                );
+            })
+            .before(ClientSystems::<EcsTcpConfig>::SETTINGS),
+            (|limits: Res<EndpointReceiveLimits<ClientPlugin<EcsTcpConfig>>>| {
+                assert_eq!(limits.limits.max_packet_size(), 23);
+            })
+            .after(ClientSystems::<EcsTcpConfig>::SETTINGS),
+        ),
+    );
+    app.update();
+}
+
+#[cfg(feature = "protocol_udp")]
+#[test]
+fn server_packet_ordering_does_not_depend_on_other_config_lifecycle() {
+    use crate::server::ServerSystems;
+    test_config!(UdpConfig, crate::protocols::udp::UdpProtocol);
+    let mut app = App::new();
+    app.add_plugins((
+        ServerPlugin::<UdpConfig>::bind("127.0.0.1:0"),
+        ServerPlugin::<EcsTcpConfig>::bind("127.0.0.1:0"),
+    ));
+    // With a global lifecycle dependency this creates a cycle. Independent
+    // endpoints must allow either relative ordering chosen by the application.
+    app.configure_sets(
+        PreUpdate,
+        ServerSystems::<EcsTcpConfig>::LIFECYCLE.after(ServerSystems::<UdpConfig>::PACKETS),
+    );
+    app.update();
+}

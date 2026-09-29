@@ -12,7 +12,21 @@ cargo bench --features bench-internals --bench allocations
 These are microbenchmarks: UDP dispatch bypasses OS receive; ECS drains preloaded
 events. They do not measure end-to-end delivery. Frame counts and CPU execution
 time are separate metrics. Allocated bytes are not peak memory usage.
-See the benchmark code for workloads and measurement boundaries.
+`ecs/udp_client_to_update/{16,256}` drains 128 preloaded UDP packets across 32
+established peers through the production client receive systems and observers,
+until an `Update` system sees all packets. Enqueueing, connection establishment
+and schedule initialization are outside the measured region. Moving receive back
+to `PostUpdate` adds one delivery frame, visible in the printed `Delivery` record.
+The allocations bench includes the same workload with budget 256. This does not
+measure socket I/O, startup cost or first-peer establishment.
+
+Run just this scenario with:
+
+```sh
+cargo bench --features bench-internals --bench network -- udp_client_to_update --noplot
+```
+
+See the benchmark code for other workloads and measurement boundaries.
 
 Compare on the same idle machine and compiler:
 

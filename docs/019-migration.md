@@ -11,8 +11,8 @@
   Replace Tokio error imports and `error.0` with `error.into_inner()`; handle
   bounded-queue overflow. See [configuration](configuration.md).
 - Move systems ordered around `ClientConnectionRemove` / `ServerRemoveConnections`
-  to `PreUpdate`. For stream protocols, move those around `ClientPacketReceive`
-  there too. Stream packet and lifecycle labels now select one FIFO-draining
+  to `PreUpdate`. Move systems around `ClientPacketReceive` there too, for both
+  TCP and UDP. Stream packet and lifecycle labels now select one FIFO-draining
   system with a shared frame budget; order before or after the whole phase.
   TCP disconnection follows queued packet events, potentially in a later frame.
 - Client `ConnectionEstablishEvent` / `PacketReceiveEvent` and server
@@ -21,6 +21,19 @@
 - Client `DisconnectionEvent` adds `connection_id: Option<ConnectionId>`
   (`None` for failed attempts). Rejected connection requests now emit this event too.
 - `MaxPacketSize` is now App-local; set it in each App that needs a limit.
+
+## Scheduling labels
+
+- Prefer `client::ClientSystems<Config>` / `server::ServerSystems<Config>` for
+  ordering one endpoint. `RECEIVE` covers all incoming events in `PreUpdate`;
+  `SETTINGS` covers limit synchronization and `SETUP` covers startup initialization.
+  See [system ordering](configuration.md#system-ordering) for the complete graph.
+- `SystemSets::ClientReceive` / `ServerReceive` cover all configs of that role.
+  Existing active labels remain supported. `ClientConnectionRequest` and
+  `ServerConnectionAdd` are deprecated empty labels; connection requests use observers.
+- UDP client packets now publish in `PreUpdate`, before gameplay in `Update`.
+  Packets arriving later in the frame wait for the next `PreUpdate`.
+  Replace `PostUpdate` ordering around `ClientPacketReceive` with `PreUpdate`.
 
 ## UDP
 

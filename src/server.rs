@@ -6,6 +6,21 @@ use crate::connection::NetworkSettings;
 /// Optional settings for this server config, overriding app-wide defaults.
 pub type ServerSettings<Config> = NetworkSettings<ServerPlugin<Config>>;
 
+/// Scheduling phases for one server config; see [`crate::NetworkSystems`].
+///
+/// ```
+/// use bevy::prelude::*;
+/// use bevy_slinet::{ServerConfig, server::ServerSystems};
+///
+/// fn configure<C: ServerConfig>(app: &mut App) {
+///     app.add_systems(PreUpdate,
+///         consume_network_state.after(ServerSystems::<C>::RECEIVE));
+/// }
+///
+/// fn consume_network_state() { /* Read state populated by packet observers. */ }
+/// ```
+pub type ServerSystems<Config> = crate::NetworkSystems<ServerPlugin<Config>>;
+
 use std::future::Future;
 use std::marker::PhantomData;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -19,8 +34,8 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use crate::connection::tasks::{PacketCodecs, ReceiveTaskState, SendTaskState};
 use crate::connection::transport::PendingPacket;
 use crate::connection::{
-    ConnectionId, EcsConnection, MaxPacketSize, NetworkQueueSettings, PacketForwarder,
-    RawConnection, ReceiveLimits,
+    ConnectionId, EcsConnection, NetworkQueueSettings, PacketForwarder, RawConnection,
+    ReceiveLimits,
 };
 use crate::packet_queue::{lossy_channel, LossyReceiver, LossySender};
 use crate::protocols::protocol::{
@@ -90,56 +105,80 @@ pub struct ServerPlugin<Config: ServerConfig> {
     _marker: PhantomData<Config>,
 }
 
-// Keep benchmark fixtures on exactly the same schedules and labels as the plugin.
-fn configure_receive_systems<Config: ServerConfig>(app: &mut App) {
-    let lifecycle = lifecycle_system::<Config>
-        .in_set(SystemSets::ServerAcceptNewConnections)
-        .in_set(SystemSets::ServerRemoveConnections);
-    if Config::Protocol::DATAGRAM {
-        app.add_systems(PreUpdate, lifecycle).add_systems(
-            PreUpdate,
-            accept_new_packets::<Config>
-                .in_set(SystemSets::ServerAcceptNewPackets)
-                .after(SystemSets::ServerAcceptNewConnections),
-        );
-    } else {
-        app.add_systems(
-            PreUpdate,
-            lifecycle.in_set(SystemSets::ServerAcceptNewPackets),
-        );
-    }
-}
-
 impl<Config: ServerConfig> Plugin for ServerPlugin<Config> {
     fn build(&self, app: &mut App) {
-        app.init_resource::<ReceiveLimits>()
-            .init_resource::<EndpointReceiveLimits<Self>>()
+        crate::scheduling::register_global_limits(app);
+        app.init_resource::<EndpointReceiveLimits<Self>>()
             .insert_resource(ServerConnections::<Config>::new())
-            .add_systems(
+            // Startup: settings -> setup; warnings inspect the synchronized settings.
+            .configure_sets(
                 Startup,
                 (
-                    Self::setup_system(self.address).after(SystemSets::SetMaxPacketSize),
-                    ServerSettings::<Config>::warning_system
-                        .in_set(SystemSets::MaxPacketSizeWarning),
+                    ServerSystems::<Config>::SETTINGS.in_set(SystemSets::SetMaxPacketSize),
+                    ServerSystems::<Config>::SETUP.after(ServerSystems::<Config>::SETTINGS),
                 ),
             )
             .add_systems(
                 Startup,
                 (
-                    MaxPacketSize::set_system,
-                    ServerSettings::<Config>::sync_limits,
-                )
-                    .in_set(SystemSets::SetMaxPacketSize),
+                    ServerSettings::<Config>::sync_limits.in_set(ServerSystems::<Config>::SETTINGS),
+                    ServerSettings::<Config>::warning_system
+                        .after(ServerSystems::<Config>::SETTINGS)
+                        .in_set(SystemSets::MaxPacketSizeWarning),
+                    Self::setup_system(self.address).in_set(ServerSystems::<Config>::SETUP),
+                ),
+            )
+            // Update: synchronize runtime limit changes for this endpoint.
+            .configure_sets(
+                Update,
+                ServerSystems::<Config>::SETTINGS.in_set(SystemSets::SetMaxPacketSize),
             )
             .add_systems(
                 Update,
-                (
-                    MaxPacketSize::set_system,
-                    ServerSettings::<Config>::sync_limits,
-                )
-                    .in_set(SystemSets::SetMaxPacketSize),
+                ServerSettings::<Config>::sync_limits.in_set(ServerSystems::<Config>::SETTINGS),
             );
+        // PreUpdate: all incoming events, using the protocol-specific graph below.
         configure_receive_systems::<Config>(app);
+    }
+}
+
+// This is also used by socket-free fixtures, so tests and benchmarks exercise
+// the plugin's actual set hierarchy and deferred-command boundaries.
+fn configure_receive_systems<Config: ServerConfig>(app: &mut App) {
+    app.configure_sets(
+        PreUpdate,
+        (
+            ServerSystems::<Config>::RECEIVE.in_set(SystemSets::ServerReceive),
+            ServerSystems::<Config>::LIFECYCLE
+                .in_set(ServerSystems::<Config>::RECEIVE)
+                .in_set(SystemSets::ServerAcceptNewConnections)
+                .in_set(SystemSets::ServerRemoveConnections),
+            ServerSystems::<Config>::PACKETS
+                .in_set(ServerSystems::<Config>::RECEIVE)
+                .in_set(SystemSets::ServerAcceptNewPackets),
+        ),
+    );
+    let lifecycle = lifecycle_system::<Config>.in_set(ServerSystems::<Config>::LIFECYCLE);
+    if Config::Protocol::DATAGRAM {
+        // Flush lifecycle commands before looking for packets of published peers.
+        // The dependency is local to this config, not every plugin of this role.
+        app.configure_sets(
+            PreUpdate,
+            ServerSystems::<Config>::PACKETS.after(ServerSystems::<Config>::LIFECYCLE),
+        )
+        .add_systems(
+            PreUpdate,
+            (
+                lifecycle,
+                accept_new_packets::<Config>.in_set(ServerSystems::<Config>::PACKETS),
+            ),
+        );
+    } else {
+        // Streams keep establishment, packets and closure in one budgeted FIFO.
+        app.add_systems(
+            PreUpdate,
+            lifecycle.in_set(ServerSystems::<Config>::PACKETS),
+        );
     }
 }
 
@@ -762,13 +801,7 @@ mod udp_lifecycle_tests {
             receiver: packet_rx,
         });
         app.insert_resource(PacketEvents::default());
-        app.add_systems(
-            PreUpdate,
-            (
-                lifecycle_system::<Config>.in_set(SystemSets::ServerAcceptNewConnections),
-                accept_new_packets::<Config>.after(SystemSets::ServerAcceptNewConnections),
-            ),
-        );
+        configure_receive_systems::<Config>(&mut app);
         app.add_observer(
             |_: On<PacketReceiveEvent<Config>>, mut events: ResMut<PacketEvents>| {
                 events.0 += 1;

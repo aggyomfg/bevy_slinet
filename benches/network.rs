@@ -4,7 +4,9 @@
     clippy::cast_possible_truncation
 )]
 use bevy_slinet::{
-    bench_utils::{lossy_channel, ClientFixture, RawPeer, Scenario, ServerFixture},
+    bench_utils::{
+        lossy_channel, ClientFixture, RawPeer, Scenario, ServerFixture, UdpClientFixture,
+    },
     connection::OverflowPolicy,
 };
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
@@ -202,6 +204,27 @@ fn ecs(c: &mut Criterion) {
             measure!(ClientFixture, "client");
             measure!(ServerFixture, "server");
         }
+    }
+    // Existing UDP peers: finish only when gameplay in Update sees all packets.
+    for budget in [16, 256] {
+        let mut fixture = UdpClientFixture::udp(budget, 32, 4);
+        fixture.enqueue();
+        println!(
+            "delivery/udp_client_to_update/{budget}: {:?}",
+            fixture.drain()
+        );
+        group.bench_function(format!("udp_client_to_update/{budget}"), |b| {
+            b.iter_custom(|iters| {
+                let mut elapsed = Duration::ZERO;
+                for _ in 0..iters {
+                    fixture.enqueue();
+                    let started = Instant::now();
+                    black_box(fixture.drain());
+                    elapsed += started.elapsed();
+                }
+                elapsed
+            });
+        });
     }
     group.finish();
 }

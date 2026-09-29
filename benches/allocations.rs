@@ -1,6 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::cast_precision_loss)]
 use bevy_slinet::{
-    bench_utils::{lossy_channel, ClientFixture, RawPeer, Scenario, ServerFixture},
+    bench_utils::{
+        lossy_channel, ClientFixture, RawPeer, Scenario, ServerFixture, UdpClientFixture,
+    },
     connection::OverflowPolicy,
 };
 use stats_alloc::{Region, StatsAlloc, INSTRUMENTED_SYSTEM};
@@ -104,4 +106,13 @@ fn main() {
         measure_ecs!(ClientFixture, "client");
         measure_ecs!(ServerFixture, "server");
     }
+    let mut fixture = UdpClientFixture::udp(256, 32, 4);
+    for _ in 0..3 {
+        fixture.enqueue();
+        fixture.drain();
+    }
+    fixture.enqueue();
+    measure("ecs/udp_client_to_update", 128, || {
+        black_box(fixture.drain());
+    });
 }
