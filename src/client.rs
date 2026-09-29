@@ -1155,5 +1155,5 @@ mod tcp_lifecycle_tests {
 
 #[cfg(feature = "bench-internals")]
 #[doc(hidden)]
-#[path = "benchmarks/client.rs"]
-pub mod bench_support;
+#[path = "../benches/utils/client.rs"]
+pub mod bench_utils;

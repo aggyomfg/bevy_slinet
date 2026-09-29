@@ -7,14 +7,14 @@ TCP/UDP networking for Bevy with configurable packet types, serializers and cust
 [![Crates.io](https://img.shields.io/crates/l/bevy_slinet)](https://github.com/aggyomfg/bevy_slinet/tree/main/LICENSE)
 
 Enable the features you need: `client`, `server`, `protocol_tcp`, `protocol_udp`,
-`serializer_bitcode` or `serializer_bitcode_serde`. See [Cargo.toml](Cargo.toml).
+`serializer_bitcode` or `serializer_bitcode_serde`. See [Cargo.toml](https://github.com/aggyomfg/bevy_slinet/blob/main/Cargo.toml).
 Bincode serializers remain for compatibility; prefer bitcode for new code.
 
-- Examples: [TCP](examples/hello_world_tcp.rs), [UDP](examples/hello_world_udp.rs),
-  [application sessions](examples/udp_application_sessions.rs), [all examples](examples).
-- [API reference](https://docs.rs/bevy_slinet) · [Configuration](docs/configuration.md) ·
-  [UDP semantics](docs/udp.md) · [Migration to 0.19](docs/019-migration.md) ·
-  [Benchmarks](docs/benchmarks.md).
+- Examples: [TCP](https://github.com/aggyomfg/bevy_slinet/blob/main/examples/hello_world_tcp.rs), [UDP](https://github.com/aggyomfg/bevy_slinet/blob/main/examples/hello_world_udp.rs),
+  [application sessions](https://github.com/aggyomfg/bevy_slinet/blob/main/examples/udp_application_sessions.rs), [all examples](https://github.com/aggyomfg/bevy_slinet/tree/main/examples).
+- [API reference](https://docs.rs/bevy_slinet) · [Configuration](https://github.com/aggyomfg/bevy_slinet/blob/main/docs/configuration.md) ·
+  [UDP semantics](https://github.com/aggyomfg/bevy_slinet/blob/main/docs/udp.md) · [Migration to 0.19](https://github.com/aggyomfg/bevy_slinet/blob/main/docs/019-migration.md) ·
+  [Benchmarks](https://github.com/aggyomfg/bevy_slinet/blob/main/docs/benchmarks.md).
 
 ## Bevy compatibility
 

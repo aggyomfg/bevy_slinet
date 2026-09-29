@@ -40,6 +40,56 @@ async fn client_setup_and_close_send_nothing() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn client_survives_port_unreachable_until_server_starts() {
+    let reserved = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = reserved.local_addr().unwrap();
+    drop(reserved);
+
+    let client = UdpClientStream::connect(server_addr).await.unwrap();
+    let client_addr = client.local_addr();
+    let (mut read, mut write) = client.into_split().await.unwrap();
+    let serializer = Arc::new(Bytes);
+    let length = Length::default();
+    let limits = ReceiveLimits::default();
+
+    let mut receiving = Box::pin(read.receive(Arc::clone(&serializer), &length, &limits));
+    assert!(futures::poll!(receiving.as_mut()).is_pending());
+    write
+        .send(vec![1], Arc::clone(&serializer), &length)
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut receiving)
+            .await
+            .is_err(),
+        "transient port unreachable must not close the UDP peer"
+    );
+
+    let server = UdpSocket::bind(server_addr).await.unwrap();
+    server.send_to(&[3], client_addr).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), receiving)
+            .await
+            .unwrap()
+            .unwrap(),
+        vec![3]
+    );
+
+    write
+        .send(vec![2], Arc::clone(&serializer), &length)
+        .await
+        .unwrap();
+    let mut buffer = [0; 16];
+    let (len, source) = tokio::time::timeout(Duration::from_secs(1), server.recv_from(&mut buffer))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&buffer[..len], &[2]);
+    assert_eq!(source, client_addr);
+}
+
 #[tokio::test]
 async fn wire_is_exact_serializer_output_in_both_directions() {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();

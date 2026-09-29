@@ -4,7 +4,7 @@
     clippy::cast_possible_truncation
 )]
 use bevy_slinet::{
-    bench_support::{lossy_channel, ClientFixture, RawPeer, Scenario, ServerFixture},
+    bench_utils::{lossy_channel, ClientFixture, RawPeer, Scenario, ServerFixture},
     connection::OverflowPolicy,
 };
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};

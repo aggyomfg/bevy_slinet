@@ -205,6 +205,14 @@ where
 /// Client and server endpoints allocate independent IDs from the process-wide counter.
 #[derive(Clone, bevy::ecs::component::Component, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ConnectionId(usize);
+
+
+impl From<ConnectionId> for usize {
+    fn from(id: ConnectionId) -> Self {
+        id.0
+    }
+}
+
 impl Debug for ConnectionId {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "#{}", self.0)
@@ -224,6 +232,7 @@ impl ConnectionId {
         self.0
     }
 }
+
 
 /// Limits incoming serialized payload sizes in bytes.
 ///

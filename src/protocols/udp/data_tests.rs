@@ -54,7 +54,7 @@ impl Serializer<Vec<u8>, Vec<u8>> for Raw {
     reason = "The stream is consumed by into_split and its halves must remain live"
 )]
 async fn receive_limit_and_malformed_payloads_are_counted_per_peer() {
-    super::test_support::wall_timeout(async {
+    super::test_utils::wall_timeout(async {
         let listener =
             UdpNetworkListener::bind("127.0.0.1:0".parse().unwrap(), UdpOptions::DEFAULT)
                 .await
@@ -151,7 +151,7 @@ async fn live_rate_update_and_close_wake_a_paced_send() {
     reason = "The stream is consumed by into_split and its halves must remain live"
 )]
 async fn closing_server_read_counts_undelivered_raw_datagrams() {
-    super::test_support::wall_timeout(async {
+    super::test_utils::wall_timeout(async {
         let listener =
             UdpNetworkListener::bind("127.0.0.1:0".parse().unwrap(), UdpOptions::DEFAULT)
                 .await
@@ -185,7 +185,7 @@ async fn closing_server_read_counts_undelivered_raw_datagrams() {
     reason = "The accepted stream is split so its read half can cancel a paced write"
 )]
 async fn handle_updates_live_writer_rate_and_read_close_cancels_wait() {
-    super::test_support::wall_timeout(async {
+    super::test_utils::wall_timeout(async {
         use crate::protocols::protocol::PacketWriter;
 
         let listener = UdpNetworkListener::bind(
@@ -242,7 +242,7 @@ async fn handle_updates_live_writer_rate_and_read_close_cancels_wait() {
 
 #[tokio::test]
 async fn unsplit_server_stream_counts_undelivered_raw_datagrams() {
-    super::test_support::wall_timeout(async {
+    super::test_utils::wall_timeout(async {
         let listener =
             UdpNetworkListener::bind("127.0.0.1:0".parse().unwrap(), UdpOptions::DEFAULT)
                 .await
@@ -266,7 +266,7 @@ async fn unsplit_server_stream_counts_undelivered_raw_datagrams() {
     reason = "The accepted stream is split to inspect queued datagram order and timestamps"
 )]
 async fn raw_drop_oldest_evicts_exact_datagram_and_preserves_timestamp() {
-    super::test_support::wall_timeout(async {
+    super::test_utils::wall_timeout(async {
         use crate::connection::OverflowPolicy;
 
         let listener = UdpNetworkListener::bind(
@@ -326,7 +326,7 @@ async fn raw_drop_oldest_evicts_exact_datagram_and_preserves_timestamp() {
     reason = "The accepted streams are split to verify byte-bounded queue contents"
 )]
 async fn raw_byte_budget_obeys_both_policies_without_eviction_for_oversized_item() {
-    super::test_support::wall_timeout(async {
+    super::test_utils::wall_timeout(async {
         use crate::connection::OverflowPolicy;
 
         for policy in [OverflowPolicy::DropNewest, OverflowPolicy::DropOldest] {
@@ -402,7 +402,7 @@ async fn raw_byte_budget_obeys_both_policies_without_eviction_for_oversized_item
     reason = "The accepted stream is split so the writer can recover after a socket error"
 )]
 async fn socket_send_error_is_counted_and_followed_by_healthy_send() {
-    super::test_support::wall_timeout(async {
+    super::test_utils::wall_timeout(async {
         use crate::protocols::protocol::PacketWriter;
 
         let listener =

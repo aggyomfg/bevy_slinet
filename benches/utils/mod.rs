@@ -1,6 +1,6 @@
 //! Internal benchmark fixtures. No compatibility guarantees.
 #![allow(missing_docs, clippy::missing_errors_doc, clippy::must_use_candidate)]
-pub use crate::client::bench_support::Fixture as ClientFixture;
+pub use crate::client::bench_utils::Fixture as ClientFixture;
 use crate::connection::OverflowPolicy;
 use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 
@@ -36,8 +36,8 @@ pub fn lossy_channel<T>(
     let (tx, rx) = crate::packet_queue::lossy_channel(items, bytes, policy);
     (Sender(tx), Receiver(rx))
 }
-pub use crate::protocols::udp::bench_support::RawPeer;
-pub use crate::server::bench_support::Fixture as ServerFixture;
+pub use crate::protocols::udp::bench_utils::RawPeer;
+pub use crate::server::bench_utils::Fixture as ServerFixture;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Scenario {

@@ -767,5 +767,5 @@ mod udp_lifecycle_tests {
 
 #[cfg(feature = "bench-internals")]
 #[doc(hidden)]
-#[path = "benchmarks/server.rs"]
-pub mod bench_support;
+#[path = "../benches/utils/server.rs"]
+pub mod bench_utils;

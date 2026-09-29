@@ -78,7 +78,22 @@ impl Incoming {
                 })
             }
             Self::Socket { socket, buffer } => {
-                let len = socket.recv(buffer).await?;
+                let len = loop {
+                    match socket.recv(buffer).await {
+                        Ok(len) => break len,
+                        Err(err)
+                            if matches!(
+                                err.kind(),
+                                ErrorKind::ConnectionReset | ErrorKind::ConnectionRefused
+                            ) =>
+                        {
+                            // A previous datagram can provoke ICMP without closing this socket.
+                            // Yield so the caller can observe cancellation before another retry.
+                            tokio::task::yield_now().await;
+                        }
+                        Err(err) => return Err(err),
+                    }
+                };
                 Ok(ReceivedDatagram {
                     bytes: buffer
                         .get(..len)

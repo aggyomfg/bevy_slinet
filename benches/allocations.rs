@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::cast_precision_loss)]
 use bevy_slinet::{
-    bench_support::{lossy_channel, ClientFixture, RawPeer, Scenario, ServerFixture},
+    bench_utils::{lossy_channel, ClientFixture, RawPeer, Scenario, ServerFixture},
     connection::OverflowPolicy,
 };
 use stats_alloc::{Region, StatsAlloc, INSTRUMENTED_SYSTEM};

@@ -112,4 +112,5 @@ pub trait ClientConfig: Send + Sync + 'static {
 /// Unstable fixtures for this repository's benchmarks, excluded from normal builds.
 #[cfg(feature = "bench-internals")]
 #[doc(hidden)]
-pub mod bench_support;
+#[path = "../benches/utils/mod.rs"]
+pub mod bench_utils;

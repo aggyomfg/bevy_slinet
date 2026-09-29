@@ -23,7 +23,7 @@ pub use stream::{
 };
 
 #[cfg(test)]
-pub(crate) mod test_support;
+pub(crate) mod test_utils;
 #[cfg(test)]
 mod tests;
 
@@ -35,4 +35,5 @@ mod contract_tests;
 
 #[cfg(feature = "bench-internals")]
 #[doc(hidden)]
-pub mod bench_support;
+#[path = "../../../benches/utils/udp.rs"]
+pub mod bench_utils;

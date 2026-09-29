@@ -8,7 +8,7 @@
 )]
 #[allow(clippy::wildcard_imports)]
 use super::*;
-use crate::bench_support::{Delivery, Scenario};
+use crate::bench_utils::{Delivery, Scenario};
 use crate::protocols::tcp::TcpProtocol;
 use crate::serializers::{
     bitcode::BitcodeSerializer, packet_length_serializer::LittleEndian,
@@ -18,7 +18,7 @@ use std::convert::Infallible;
 use std::sync::atomic::AtomicBool;
 
 struct Config;
-impl ServerConfig for Config {
+impl ClientConfig for Config {
     type ClientPacket = u64;
     type ServerPacket = u64;
     type Protocol = TcpProtocol;
@@ -34,8 +34,8 @@ struct Counts(Delivery);
 
 pub struct Fixture {
     app: App,
-    sender: Sender<ServerLifecycle<Config>>,
-    connections: Vec<ServerConnection<Config>>,
+    sender: Sender<ClientLifecycle<Config>>,
+    connections: Vec<ClientConnection<Config>>,
     _outgoing: Vec<OutgoingReceiver<u64, ()>>,
     scenario: Scenario,
     packets_per_connection: usize,
@@ -61,10 +61,10 @@ impl Fixture {
         app.insert_resource(settings)
             .insert_resource(LifecycleReceiver::<Config>(receiver.into()))
             .insert_resource(PacketReceiver::<Config> { receiver: packets })
-            .insert_resource(ServerConnections::<Config>::new())
+            .insert_resource(ClientConnections::<Config>::new())
             .init_resource::<Counts>()
             .add_observer(
-                |_: On<NewConnectionEvent<Config>>, mut counts: ResMut<Counts>| {
+                |_: On<ConnectionEstablishEvent<Config>>, mut counts: ResMut<Counts>| {
                     counts.0.established += 1;
                 },
             )
@@ -115,10 +115,10 @@ impl Fixture {
         }
         result
     }
-    fn establish(&self, connection: &ServerConnection<Config>) {
+    fn establish(&self, connection: &ClientConnection<Config>) {
         assert!(self
             .sender
-            .try_send(ServerLifecycle::Established(NewConnectionEvent {
+            .try_send(ClientLifecycle::Established(ConnectionEstablishEvent {
                 address: connection.peer_addr(),
                 connection: connection.clone()
             }))
@@ -134,7 +134,7 @@ impl Fixture {
             for packet in 0..self.packets_per_connection {
                 assert!(self
                     .sender
-                    .try_send(ServerLifecycle::Packet(PacketReceiveEvent {
+                    .try_send(ClientLifecycle::Packet(PacketReceiveEvent {
                         connection: connection.clone(),
                         packet: packet as u64,
                         received_at: Instant::now(),
@@ -142,11 +142,12 @@ impl Fixture {
                     .is_ok());
             }
             if matches!(self.scenario, Scenario::Interleaved) {
-                let event = DisconnectionEvent {
-                    error: ReceiveError::IntentionalDisconnection,
-                    connection: connection.clone(),
-                };
-                assert!(self.sender.try_send(ServerLifecycle::Closed(event)).is_ok());
+                let event = ConnectionClosed::new(
+                    ReceiveError::IntentionalDisconnection,
+                    connection.peer_addr(),
+                    Some(connection.id()),
+                );
+                assert!(self.sender.try_send(ClientLifecycle::Closed(event)).is_ok());
             }
         }
     }
@@ -205,8 +206,8 @@ mod tests {
         let mut fixture = Fixture::new(256, 2, 1, Scenario::Interleaved);
         fixture.app.init_resource::<Order>();
         fixture.app.add_observer(
-            |event: On<NewConnectionEvent<Config>>,
-             connections: Res<ServerConnections<Config>>,
+            |event: On<ConnectionEstablishEvent<Config>>,
+             connections: Res<ClientConnections<Config>>,
              mut order: ResMut<Order>| {
                 assert_eq!(connections.len(), 1);
                 assert_eq!(connections.first().unwrap().id(), event.connection.id());
@@ -215,7 +216,7 @@ mod tests {
         );
         fixture.app.add_observer(
             |event: On<PacketReceiveEvent<Config>>,
-             connections: Res<ServerConnections<Config>>,
+             connections: Res<ClientConnections<Config>>,
              mut order: ResMut<Order>| {
                 assert_eq!(connections.len(), 1);
                 assert_eq!(connections.first().unwrap().id(), event.connection.id());
@@ -224,11 +225,11 @@ mod tests {
         );
         fixture.app.add_observer(
             |event: On<DisconnectionEvent<Config>>,
-             connections: Res<ServerConnections<Config>>,
+             connections: Res<ClientConnections<Config>>,
              mut order: ResMut<Order>| {
                 assert!(connections
                     .iter()
-                    .all(|connection| connection.id() != event.connection.id()));
+                    .all(|connection| connection.id() != event.connection_id.unwrap()));
                 order.0.push("close");
             },
         );

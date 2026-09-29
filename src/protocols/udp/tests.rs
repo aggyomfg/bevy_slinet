@@ -155,7 +155,7 @@ async fn zero_outgoing_budget_allows_empty_and_drops_nonempty() {
 
 #[tokio::test]
 async fn ipv6_peer_preserves_datagrams_and_exposes_full_payload_budget() {
-    super::test_support::wall_timeout(async {
+    super::test_utils::wall_timeout(async {
         let listener =
             match UdpNetworkListener::bind("[::1]:0".parse().unwrap(), UdpOptions::DEFAULT).await {
                 Ok(listener) => listener,
