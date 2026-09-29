@@ -1,6 +1,6 @@
 //! Server part of the plugin. You can enable it by adding `server` feature.
 
-use crate::connection::settings::EndpointReceiveLimits;
+use crate::connection::settings::{EndpointReceiveLimits, EndpointSetup};
 use crate::connection::NetworkSettings;
 
 /// Optional settings for this server config, overriding app-wide defaults.
@@ -182,27 +182,16 @@ struct PacketReceiver<Config: ServerConfig> {
 }
 
 impl<Config: ServerConfig> ServerPlugin<Config> {
-    #[expect(
-        clippy::type_complexity,
-        reason = "Typed Bevy system parameters for endpoint startup"
-    )]
-    fn setup_system(
-        address: SocketAddr,
-    ) -> impl Fn(
-        Commands,
-        Option<Res<NetworkQueueSettings>>,
-        Option<Res<ServerSettings<Config>>>,
-        Res<EndpointReceiveLimits<Self>>,
-    ) {
+    fn setup_system(address: SocketAddr) -> impl Fn(Commands, EndpointSetup<Self>) {
         #[cfg(target_family = "wasm")]
         compile_error!("Why would you run a bevy_slinet server on WASM? If you really need this, please open an issue (https://github.com/aggyomfg/bevy_slinet/issues/new)");
 
-        move |commands, queues, settings, limits: Res<EndpointReceiveLimits<Self>>| {
+        move |commands, endpoint| {
             Self::setup(
                 commands,
                 address,
-                ServerSettings::<Config>::resolve_queues(settings.as_deref(), queues.as_deref()),
-                limits.limits.clone(),
+                endpoint.queues(),
+                endpoint.receive_limits(),
             );
         }
     }

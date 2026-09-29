@@ -1,6 +1,6 @@
 //! Client part of the plugin. You can enable it by adding `client` feature.
 
-use crate::connection::settings::EndpointReceiveLimits;
+use crate::connection::settings::{EndpointReceiveLimits, EndpointSetup};
 use crate::connection::NetworkSettings;
 
 /// Optional settings for this client config, overriding app-wide defaults.
@@ -140,7 +140,7 @@ impl<Config: ClientConfig> Plugin for ClientPlugin<Config> {
             .add_systems(
                 Startup,
                 (
-                    Self::setup_system()
+                    Self::setup_system
                         .after(SystemSets::SetMaxPacketSize)
                         .before(AddInitialConnectionRequestEventLabel),
                     (move |mut commands: Commands| {
@@ -285,23 +285,8 @@ struct ConnectionAttempt<Config: ClientConfig> {
 }
 
 impl<Config: ClientConfig> ClientPlugin<Config> {
-    #[expect(
-        clippy::type_complexity,
-        reason = "Typed Bevy system parameters for endpoint startup"
-    )]
-    fn setup_system() -> impl Fn(
-        Commands,
-        Option<Res<NetworkQueueSettings>>,
-        Option<Res<ClientSettings<Config>>>,
-        Res<EndpointReceiveLimits<Self>>,
-    ) {
-        move |commands, queues, settings, limits: Res<EndpointReceiveLimits<Self>>| {
-            Self::setup(
-                commands,
-                ClientSettings::<Config>::resolve_queues(settings.as_deref(), queues.as_deref()),
-                limits.limits.clone(),
-            );
-        }
+    fn setup_system(commands: Commands, endpoint: EndpointSetup<Self>) {
+        Self::setup(commands, endpoint.queues(), endpoint.receive_limits());
     }
 
     fn setup(mut commands: Commands, queues: NetworkQueueSettings, limits: ReceiveLimits) {

@@ -1,5 +1,6 @@
 //! Optional endpoint-specific overrides of app-wide network settings.
 use super::{MaxPacketSize, NetworkQueueSettings, ReceiveLimits};
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::{Res, Resource};
 use std::marker::PhantomData;
 
@@ -79,5 +80,26 @@ impl<E: Send + Sync + 'static> Default for EndpointReceiveLimits<E> {
             limits: ReceiveLimits::default(),
             marker: PhantomData,
         }
+    }
+}
+
+/// Resolves the resources needed to start one client or server endpoint.
+#[derive(SystemParam)]
+pub struct EndpointSetup<'w, E: Send + Sync + 'static> {
+    global_queues: Option<Res<'w, NetworkQueueSettings>>,
+    settings: Option<Res<'w, NetworkSettings<E>>>,
+    limits: Res<'w, EndpointReceiveLimits<E>>,
+}
+
+impl<E: Send + Sync + 'static> EndpointSetup<'_, E> {
+    pub(crate) fn queues(&self) -> NetworkQueueSettings {
+        NetworkSettings::<E>::resolve_queues(
+            self.settings.as_deref(),
+            self.global_queues.as_deref(),
+        )
+    }
+
+    pub(crate) fn receive_limits(&self) -> ReceiveLimits {
+        self.limits.limits.clone()
     }
 }
