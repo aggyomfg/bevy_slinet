@@ -1,5 +1,11 @@
 //! Client part of the plugin. You can enable it by adding `client` feature.
 
+use crate::connection::settings::EndpointReceiveLimits;
+use crate::connection::NetworkSettings;
+
+/// Optional settings for this client config, overriding app-wide defaults.
+pub type ClientSettings<Config> = NetworkSettings<ClientPlugin<Config>>;
+
 use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
@@ -109,18 +115,27 @@ impl<Config: ClientConfig> Plugin for ClientPlugin<Config> {
         let address = self.address;
 
         app.init_resource::<ReceiveLimits>()
+            .init_resource::<EndpointReceiveLimits<Self>>()
             .insert_resource(ClientConnections::<Config>::new())
             .add_systems(
                 Startup,
-                MaxPacketSize::warning_system.in_set(SystemSets::MaxPacketSizeWarning),
+                ClientSettings::<Config>::warning_system.in_set(SystemSets::MaxPacketSizeWarning),
             )
             .add_systems(
                 Startup,
-                MaxPacketSize::set_system.in_set(SystemSets::SetMaxPacketSize),
+                (
+                    MaxPacketSize::set_system,
+                    ClientSettings::<Config>::sync_limits,
+                )
+                    .in_set(SystemSets::SetMaxPacketSize),
             )
             .add_systems(
                 Update,
-                MaxPacketSize::set_system.in_set(SystemSets::SetMaxPacketSize),
+                (
+                    MaxPacketSize::set_system,
+                    ClientSettings::<Config>::sync_limits,
+                )
+                    .in_set(SystemSets::SetMaxPacketSize),
             )
             .add_systems(
                 Startup,
@@ -267,12 +282,21 @@ struct ConnectionAttempt<Config: ClientConfig> {
 }
 
 impl<Config: ClientConfig> ClientPlugin<Config> {
-    fn setup_system() -> impl Fn(Commands, Option<Res<NetworkQueueSettings>>, Res<ReceiveLimits>) {
-        move |commands, queues, limits: Res<ReceiveLimits>| {
+    #[expect(
+        clippy::type_complexity,
+        reason = "Typed Bevy system parameters for endpoint startup"
+    )]
+    fn setup_system() -> impl Fn(
+        Commands,
+        Option<Res<NetworkQueueSettings>>,
+        Option<Res<ClientSettings<Config>>>,
+        Res<EndpointReceiveLimits<Self>>,
+    ) {
+        move |commands, queues, settings, limits: Res<EndpointReceiveLimits<Self>>| {
             Self::setup(
                 commands,
-                queues.as_deref().copied().unwrap_or_default(),
-                limits.clone(),
+                ClientSettings::<Config>::resolve_queues(settings.as_deref(), queues.as_deref()),
+                limits.limits.clone(),
             );
         }
     }
@@ -633,12 +657,10 @@ impl<Config: ClientConfig> ConnectionRequestSender<Config> {
 fn packet_receive_system<Config: ClientConfig>(
     mut packets: ResMut<PacketReceiver<Config>>,
     queues: Option<Res<NetworkQueueSettings>>,
+    settings: Option<Res<ClientSettings<Config>>>,
     mut commands: Commands,
 ) {
-    let budget = queues
-        .as_deref()
-        .copied()
-        .unwrap_or_default()
+    let budget = ClientSettings::<Config>::resolve_queues(settings.as_deref(), queues.as_deref())
         .events_per_frame;
     if !Config::Protocol::DATAGRAM {
         return;
@@ -674,12 +696,10 @@ fn packet_receive_system<Config: ClientConfig>(
 fn lifecycle_system<Config: ClientConfig>(
     mut lifecycle: ResMut<LifecycleReceiver<Config>>,
     queues: Option<Res<NetworkQueueSettings>>,
+    settings: Option<Res<ClientSettings<Config>>>,
     mut commands: Commands,
 ) {
-    let budget = queues
-        .as_deref()
-        .copied()
-        .unwrap_or_default()
+    let budget = ClientSettings::<Config>::resolve_queues(settings.as_deref(), queues.as_deref())
         .events_per_frame;
     for _ in 0..budget {
         match lifecycle.0.try_recv() {
@@ -828,6 +848,30 @@ mod udp_lifecycle_tests {
     struct PacketEvents(usize);
 
     #[test]
+    fn startup_uses_endpoint_queue_capacity() {
+        let mut app = App::new();
+        app.insert_resource(NetworkQueueSettings {
+            receive_capacity: 11,
+            ..Default::default()
+        });
+        app.insert_resource(ClientSettings::<Config>::default().with_queues(
+            NetworkQueueSettings {
+                receive_capacity: 3,
+                ..Default::default()
+            },
+        ));
+        app.add_plugins(ClientPlugin::<Config>::new());
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<ConnectionRequestSender<Config>>()
+                .0
+                .max_capacity(),
+            3
+        );
+    }
+
+    #[test]
     fn cancelled_udp_packet_is_dropped_while_close_waits_behind_establish() {
         let settings = NetworkQueueSettings {
             events_per_frame: 1,
@@ -887,6 +931,20 @@ mod udp_lifecycle_tests {
                 events.0 += 1;
             },
         );
+
+        app.insert_resource(ClientSettings::<Config>::default().with_queues(
+            NetworkQueueSettings {
+                events_per_frame: 0,
+                ..settings
+            },
+        ));
+        app.update();
+        assert!(app
+            .world()
+            .resource::<ClientConnections<Config>>()
+            .is_empty());
+        assert_eq!(udp.stats().dropped_closed_before_delivery, 0);
+        app.world_mut().remove_resource::<ClientSettings<Config>>();
 
         app.update();
         assert_eq!(app.world().resource::<ClientConnections<Config>>().len(), 1);

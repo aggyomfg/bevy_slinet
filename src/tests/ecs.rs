@@ -127,3 +127,56 @@ fn lifecycle_budget_publishes_each_connection_before_its_packets() {
         2
     );
 }
+
+#[test]
+fn endpoint_limits_are_isolated_and_restore_global_defaults() {
+    use crate::client::ClientSettings;
+    use crate::connection::settings::EndpointReceiveLimits;
+    use crate::server::ServerSettings;
+    test_config!(OtherConfig, TcpProtocol);
+    let mut app = App::new();
+    app.insert_resource(MaxPacketSize(64));
+    app.insert_resource(ClientSettings::<EcsTcpConfig>::default().with_max_packet_size(8));
+    app.insert_resource(ServerSettings::<EcsTcpConfig>::default().with_max_packet_size(16));
+    app.add_plugins((
+        ClientPlugin::<EcsTcpConfig>::new(),
+        ClientPlugin::<OtherConfig>::new(),
+        ServerPlugin::<EcsTcpConfig>::bind("127.0.0.1:0"),
+    ));
+    app.update();
+    let client = app
+        .world()
+        .resource::<EndpointReceiveLimits<ClientPlugin<EcsTcpConfig>>>()
+        .limits
+        .clone();
+    let server = app
+        .world()
+        .resource::<EndpointReceiveLimits<ServerPlugin<EcsTcpConfig>>>()
+        .limits
+        .clone();
+    let other = app
+        .world()
+        .resource::<EndpointReceiveLimits<ClientPlugin<OtherConfig>>>()
+        .limits
+        .clone();
+    assert_eq!(
+        (
+            client.max_packet_size(),
+            server.max_packet_size(),
+            other.max_packet_size()
+        ),
+        (8, 16, 64)
+    );
+    app.world_mut()
+        .remove_resource::<ClientSettings<EcsTcpConfig>>();
+    app.insert_resource(MaxPacketSize(128));
+    app.update();
+    assert_eq!(
+        (
+            client.max_packet_size(),
+            server.max_packet_size(),
+            other.max_packet_size()
+        ),
+        (128, 16, 128)
+    );
+}

@@ -20,6 +20,10 @@ mod queue;
 #[cfg(test)]
 mod raw_tests;
 mod send_error;
+#[cfg(any(feature = "client", feature = "server"))]
+pub(crate) mod settings;
+#[cfg(any(feature = "client", feature = "server"))]
+pub use settings::NetworkSettings;
 pub(crate) mod transport;
 
 #[cfg(any(feature = "client", feature = "server"))]
@@ -206,7 +210,6 @@ where
 #[derive(Clone, bevy::ecs::component::Component, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ConnectionId(usize);
 
-
 impl From<ConnectionId> for usize {
     fn from(id: ConnectionId) -> Self {
         id.0
@@ -233,7 +236,6 @@ impl ConnectionId {
     }
 }
 
-
 /// Limits incoming serialized payload sizes in bytes.
 ///
 /// Networking plugins apply changes before network tasks start to an app-local limit.
@@ -248,12 +250,6 @@ impl MaxPacketSize {
         limits: bevy::prelude::Res<ReceiveLimits>,
     ) {
         limits.set_max_packet_size(max_packet_size.map_or(usize::MAX, |res| res.0));
-    }
-
-    pub(crate) fn warning_system(max_packet_size: Option<bevy::prelude::Res<Self>>) {
-        if max_packet_size.is_none() {
-            bevy::log::warn!("You haven't set \"MaxPacketSize\" resource! This is a security risk, please insert it before using this in production.");
-        }
     }
 }
 

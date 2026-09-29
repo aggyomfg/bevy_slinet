@@ -1,5 +1,11 @@
 //! Server part of the plugin. You can enable it by adding `server` feature.
 
+use crate::connection::settings::EndpointReceiveLimits;
+use crate::connection::NetworkSettings;
+
+/// Optional settings for this server config, overriding app-wide defaults.
+pub type ServerSettings<Config> = NetworkSettings<ServerPlugin<Config>>;
+
 use std::future::Future;
 use std::marker::PhantomData;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -107,21 +113,31 @@ fn configure_receive_systems<Config: ServerConfig>(app: &mut App) {
 impl<Config: ServerConfig> Plugin for ServerPlugin<Config> {
     fn build(&self, app: &mut App) {
         app.init_resource::<ReceiveLimits>()
+            .init_resource::<EndpointReceiveLimits<Self>>()
             .insert_resource(ServerConnections::<Config>::new())
             .add_systems(
                 Startup,
                 (
                     Self::setup_system(self.address).after(SystemSets::SetMaxPacketSize),
-                    MaxPacketSize::warning_system.in_set(SystemSets::MaxPacketSizeWarning),
+                    ServerSettings::<Config>::warning_system
+                        .in_set(SystemSets::MaxPacketSizeWarning),
                 ),
             )
             .add_systems(
                 Startup,
-                MaxPacketSize::set_system.in_set(SystemSets::SetMaxPacketSize),
+                (
+                    MaxPacketSize::set_system,
+                    ServerSettings::<Config>::sync_limits,
+                )
+                    .in_set(SystemSets::SetMaxPacketSize),
             )
             .add_systems(
                 Update,
-                MaxPacketSize::set_system.in_set(SystemSets::SetMaxPacketSize),
+                (
+                    MaxPacketSize::set_system,
+                    ServerSettings::<Config>::sync_limits,
+                )
+                    .in_set(SystemSets::SetMaxPacketSize),
             );
         configure_receive_systems::<Config>(app);
     }
@@ -166,18 +182,27 @@ struct PacketReceiver<Config: ServerConfig> {
 }
 
 impl<Config: ServerConfig> ServerPlugin<Config> {
+    #[expect(
+        clippy::type_complexity,
+        reason = "Typed Bevy system parameters for endpoint startup"
+    )]
     fn setup_system(
         address: SocketAddr,
-    ) -> impl Fn(Commands, Option<Res<NetworkQueueSettings>>, Res<ReceiveLimits>) {
+    ) -> impl Fn(
+        Commands,
+        Option<Res<NetworkQueueSettings>>,
+        Option<Res<ServerSettings<Config>>>,
+        Res<EndpointReceiveLimits<Self>>,
+    ) {
         #[cfg(target_family = "wasm")]
         compile_error!("Why would you run a bevy_slinet server on WASM? If you really need this, please open an issue (https://github.com/aggyomfg/bevy_slinet/issues/new)");
 
-        move |commands, queues, limits: Res<ReceiveLimits>| {
+        move |commands, queues, settings, limits: Res<EndpointReceiveLimits<Self>>| {
             Self::setup(
                 commands,
                 address,
-                queues.as_deref().copied().unwrap_or_default(),
-                limits.clone(),
+                ServerSettings::<Config>::resolve_queues(settings.as_deref(), queues.as_deref()),
+                limits.limits.clone(),
             );
         }
     }
@@ -587,12 +612,10 @@ pub struct PacketReceiveEvent<Config: ServerConfig> {
 fn lifecycle_system<Config: ServerConfig>(
     mut lifecycle: ResMut<LifecycleReceiver<Config>>,
     queues: Option<Res<NetworkQueueSettings>>,
+    settings: Option<Res<ServerSettings<Config>>>,
     mut commands: Commands,
 ) {
-    let budget = queues
-        .as_deref()
-        .copied()
-        .unwrap_or_default()
+    let budget = ServerSettings::<Config>::resolve_queues(settings.as_deref(), queues.as_deref())
         .events_per_frame;
     for _ in 0..budget {
         match lifecycle.0.try_recv() {
@@ -623,12 +646,10 @@ fn lifecycle_system<Config: ServerConfig>(
 fn accept_new_packets<Config: ServerConfig>(
     mut packets: ResMut<PacketReceiver<Config>>,
     queues: Option<Res<NetworkQueueSettings>>,
+    settings: Option<Res<ServerSettings<Config>>>,
     mut commands: Commands,
 ) {
-    let budget = queues
-        .as_deref()
-        .copied()
-        .unwrap_or_default()
+    let budget = ServerSettings::<Config>::resolve_queues(settings.as_deref(), queues.as_deref())
         .events_per_frame;
     if !Config::Protocol::DATAGRAM {
         return;
@@ -751,6 +772,20 @@ mod udp_lifecycle_tests {
                 events.0 += 1;
             },
         );
+
+        app.insert_resource(ServerSettings::<Config>::default().with_queues(
+            NetworkQueueSettings {
+                events_per_frame: 0,
+                ..settings
+            },
+        ));
+        app.update();
+        assert!(app
+            .world()
+            .resource::<ServerConnections<Config>>()
+            .is_empty());
+        assert_eq!(udp.stats().dropped_closed_before_delivery, 0);
+        app.world_mut().remove_resource::<ServerSettings<Config>>();
 
         app.update();
         assert_eq!(app.world().resource::<ServerConnections<Config>>().len(), 1);
