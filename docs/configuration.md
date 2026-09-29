@@ -45,3 +45,33 @@ Unlike `into_stream()`, it preserves queued packets. A custom task must observe
 `disconnect_task` and use `receive_limits` when calling `PacketReader::receive`.
 Dropping the receiver closes the queue and records undelivered queued packets;
 extracting parts does not itself cancel the connection.
+
+## Configured sockets
+
+The built-in transports can wrap sockets created by your own `Protocol` factories:
+
+- TCP: `TcpNetworkStream::from_stream(tokio_stream)` preserves socket options.
+  `socket()` lets you inspect or set options before splitting. Wrap an existing
+  listener with `TcpNetworkListener::from_listener(tokio_listener)` and use
+  `.with_nodelay(true)` to apply `TCP_NODELAY` to every accepted connection.
+- UDP: `UdpClientStream::from_socket(connected_socket, options)` preserves a chosen
+  source address/port. Bind, configure and connect the Tokio socket first.
+  `UdpNetworkListener::from_socket(bound_socket, options)` requires an unconnected
+  socket so it can receive from multiple peers. Both constructors validate options.
+  Runtime options are also accepted by `UdpNetworkListener::bind` and
+  `UdpClientStream::connect_with_options`.
+
+Use these constructors inside `Protocol::bind` and `Protocol::connect_to_server`,
+then select that protocol in your client/server config. A custom UDP protocol must
+set `const DATAGRAM: bool = true` so the plugin uses datagram queue and event
+semantics. The [TCP module](../src/protocols/tcp.rs)
+contains a complete factory example. Existing packet framing and UDP queues,
+limits, pacing and diagnostics are reused. Creating a wrapper alone does not
+attach it to an already-running plugin; the plugin calls your protocol factories
+on its own Tokio runtime.
+
+For OS-specific keepalive, buffer sizes or bind options, configure the socket
+before passing it to the constructor. Standard-library sockets must be put into
+nonblocking mode before converting them to Tokio sockets. Server-side per-connection
+options beyond `TCP_NODELAY` can be applied by a custom `Listener` before wrapping
+its accepted stream.

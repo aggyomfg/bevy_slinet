@@ -176,17 +176,44 @@ pub struct ConfiguredUdpClientStream<C: UdpConfig> {
 pub type UdpClientStream = ConfiguredUdpClientStream<DefaultUdpConfig>;
 
 impl<C: UdpConfig> ConfiguredUdpClientStream<C> {
-    pub(super) async fn connect_with_options(
+    /// Connects using runtime options instead of `C::OPTIONS`.
+    ///
+    /// # Errors
+    /// Returns an error for invalid options or failed socket setup.
+    pub async fn connect_with_options(
         address: SocketAddr,
         options: UdpOptions,
     ) -> io::Result<Self> {
-        let options = ValidatedOptions::new(options)?;
+        ValidatedOptions::new(options)?;
         let local: SocketAddr = match address {
             SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
             SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
         };
-        let socket = Arc::new(UdpSocket::bind(local).await?);
+        let socket = UdpSocket::bind(local).await?;
         socket.connect(address).await?;
+        Self::from_socket(socket, options)
+    }
+
+    /// Wraps an already connected socket with explicit runtime UDP options.
+    /// Bind and configure the socket before connecting to choose an interface,
+    /// source port or OS socket options. This constructor sends no datagrams.
+    ///
+    /// ```no_run
+    /// # async fn connect() -> std::io::Result<()> {
+    /// use bevy_slinet::protocols::udp::{UdpClientStream, UdpOptions};
+    /// let socket = tokio::net::UdpSocket::bind("127.0.0.1:5000").await?;
+    /// socket.connect("127.0.0.1:6000").await?;
+    /// let stream = UdpClientStream::from_socket(socket, UdpOptions::DEFAULT)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    /// Returns an error for invalid options, an unconnected socket, or failed
+    /// local/peer address queries.
+    pub fn from_socket(socket: UdpSocket, options: UdpOptions) -> io::Result<Self> {
+        let options = ValidatedOptions::new(options)?;
+        let socket = Arc::new(socket);
         let state = PeerState::new(options);
         Ok(Self {
             _config: PhantomData,

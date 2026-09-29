@@ -20,9 +20,29 @@ pub struct UdpNetworkListener {
     slots: Arc<Semaphore>,
 }
 impl UdpNetworkListener {
-    pub(super) async fn bind(address: SocketAddr, options: UdpOptions) -> io::Result<Self> {
+    /// Binds a socket with runtime UDP options.
+    ///
+    /// # Errors
+    /// Returns an error for invalid options or a failed bind.
+    pub async fn bind(address: SocketAddr, options: UdpOptions) -> io::Result<Self> {
+        ValidatedOptions::new(options)?;
+        Self::from_socket(UdpSocket::bind(address).await?, options)
+    }
+
+    /// Wraps a bound, unconnected socket, preserving its local address and options.
+    ///
+    /// # Errors
+    /// Rejects connected sockets (which filter out other peers), invalid UDP options,
+    /// or sockets whose local address cannot be queried.
+    pub fn from_socket(socket: UdpSocket, options: UdpOptions) -> io::Result<Self> {
         let options = ValidatedOptions::new(options)?;
-        let socket = Arc::new(UdpSocket::bind(address).await?);
+        if socket.peer_addr().is_ok() {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "UDP listener socket must be unconnected",
+            ));
+        }
+        let socket = Arc::new(socket);
         Ok(Self {
             local_addr: socket.local_addr()?,
             socket,
