@@ -1,6 +1,6 @@
 use super::diagnostics::{UdpConnectionHandle, UdpDropReason};
 use super::settings::ValidatedOptions;
-use crate::packet_queue::LossySender;
+use crate::connection::LossySender;
 use bevy::platform::time::Instant;
 use std::{
     collections::HashMap,

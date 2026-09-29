@@ -3,8 +3,8 @@ use super::pacing::DataPacer;
 use super::peer::{PeerRegistration, PeerState, QueuedDatagram};
 use super::settings::{DefaultUdpConfig, UdpConfig, UdpOptions, ValidatedOptions, BUFFER_SIZE};
 use crate::{
+    connection::LossyReceiver,
     connection::ReceiveLimits,
-    packet_queue::LossyReceiver,
     protocols::protocol::{
         ClientStream, NetworkStream, PacketReader, PacketWriter, ReceiveError, ServerStream,
     },

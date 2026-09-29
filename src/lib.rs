@@ -11,8 +11,6 @@ use serializers::serializer::SerializerAdapter;
 #[cfg(feature = "client")]
 pub mod client;
 pub mod connection;
-#[cfg(any(feature = "client", feature = "server", feature = "protocol_udp", test))]
-pub(crate) mod packet_queue;
 pub mod protocols;
 mod scheduling;
 pub mod serializers;

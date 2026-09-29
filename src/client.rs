@@ -36,11 +36,11 @@ use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::connection::tasks::{PacketCodecs, ReceiveTaskState, SendTaskState};
 use crate::connection::transport::PendingPacket;
+use crate::connection::{lossy_channel, LossyReceiver, LossySender};
 use crate::connection::{
     ConnectionId, EcsConnection, NetworkQueueSettings, OutgoingReceiver, OutgoingSender,
     PacketForwarder, RawConnection, ReceiveLimits,
 };
-use crate::packet_queue::{lossy_channel, LossyReceiver, LossySender};
 use crate::protocols::protocol::{
     NetworkStream, PacketReader, PacketWriter, QueueDropReason, ReceiveError,
 };
@@ -859,8 +859,8 @@ impl<Config: ClientConfig> ClientPlugin<Config> {
 #[cfg(all(test, feature = "protocol_udp", feature = "serializer_bitcode_serde"))]
 mod udp_lifecycle_tests {
     use super::*;
+    use crate::connection::lossy_channel;
     use crate::connection::OverflowPolicy;
-    use crate::packet_queue::lossy_channel;
     use crate::protocols::protocol::{FramedWriter, WriteStream};
     use crate::protocols::udp::{UdpConnectionHandle, UdpProtocol};
     use crate::serializers::bitcode_serde::BitcodeSerdeSerializer;
@@ -1167,7 +1167,7 @@ mod udp_lifecycle_tests {
 #[cfg(all(test, feature = "protocol_tcp", feature = "serializer_bitcode_serde"))]
 mod tcp_lifecycle_tests {
     use super::*;
-    use crate::packet_queue::lossy_channel;
+    use crate::connection::lossy_channel;
     use crate::protocols::tcp::TcpProtocol;
     use crate::serializers::bitcode_serde::BitcodeSerdeSerializer;
     use crate::serializers::packet_length_serializer::LittleEndian;

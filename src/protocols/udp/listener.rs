@@ -1,7 +1,7 @@
 use super::peer::{Peer, PeerRegistration, PeerState, Peers, QueuedDatagram};
 use super::settings::{UdpOptions, ValidatedOptions, BUFFER_SIZE};
 use super::stream::UdpServerStream;
-use crate::{packet_queue::lossy_channel, protocols::protocol::Listener};
+use crate::{connection::lossy_channel, protocols::protocol::Listener};
 use async_trait::async_trait;
 use bevy::platform::time::Instant;
 use std::{

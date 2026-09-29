@@ -18,7 +18,9 @@ use crate::serializers::serializer::Serializer;
 
 mod parts;
 pub use parts::RawConnectionParts;
-mod queue;
+pub(crate) mod queue;
+#[cfg(any(feature = "client", feature = "server", feature = "protocol_udp"))]
+pub(crate) use queue::lossy::{lossy_channel, LossyReceiver, LossySender};
 #[cfg(test)]
 mod raw_tests;
 mod send_error;

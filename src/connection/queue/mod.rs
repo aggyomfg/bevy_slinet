@@ -5,7 +5,10 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 #[cfg(any(feature = "client", feature = "server"))]
-use crate::packet_queue::{lossy_channel, LossyReceiver, LossySender};
+use self::lossy::{lossy_channel, LossyReceiver, LossySender};
+
+#[cfg(any(feature = "client", feature = "server", feature = "protocol_udp", test))]
+pub(crate) mod lossy;
 
 use super::SendError;
 use crate::protocols::protocol::{QueueDropReason, TransportHandle};
@@ -290,5 +293,4 @@ impl<T, H: TransportHandle> PacketForwarder<T, H> {
 }
 
 #[cfg(test)]
-#[path = "queue_tests.rs"]
 mod tests;

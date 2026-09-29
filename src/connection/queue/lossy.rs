@@ -138,14 +138,7 @@ impl<T> LossySender<T> {
             let notified = shared.space.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            let ready = {
-                let state = shared.lock();
-                if !state.receiver_open {
-                    return Err(TrySendError::Closed(value));
-                }
-                state.items.len() < shared.max_items && state.bytes <= shared.max_bytes - bytes
-            };
-            if ready {
+            {
                 let mut state = shared.lock();
                 if !state.receiver_open {
                     return Err(TrySendError::Closed(value));
