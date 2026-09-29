@@ -41,8 +41,9 @@
   in `FramedReader` / `FramedWriter`, or move custom packet methods to the new
   traits. `receive` takes `&ReceiveLimits`; enforce it before allocation/decoding.
   TCP halves are now framed adapters too: update explicit types and trait imports.
-- `RawConnection` fields are private: use its constructor and accessors.
-  Replace its unbounded MPSC channel with `mpsc::channel(capacity)` and bounded
-  sends. Set receive limits through `raw.receive_limits()` if needed.
-- `DisconnectTask` is removed. Use `CancellationToken::cancelled()` for standalone
-  cancellation; raw connections expose `disconnect()`, not their internal signal.
+- `RawConnection` fields are private: use its constructor and accessors, or
+  `into_parts()` to transfer state to a custom task. Replace its unbounded MPSC
+  channel with `mpsc::channel(capacity)` and bounded sends. Custom tasks must
+  observe the cancellation token and pass receive limits to packet readers.
+- `DisconnectTask` is replaced by `CancellationToken`; replace `task.await`
+  with `task.cancelled().await`.

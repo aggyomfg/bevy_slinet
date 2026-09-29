@@ -242,3 +242,98 @@ async fn extracting_parts_keeps_queue_codecs_and_shared_controls_alive() {
         [QueueDropReason::ClosedBeforeDelivery]
     );
 }
+
+#[cfg(any(feature = "client", feature = "server"))]
+#[tokio::test]
+async fn ecs_queue_snapshot_tracks_drain_eviction_and_close() {
+    use super::{OverflowPolicy, QueueSnapshot};
+    for (datagram, policy) in [
+        (false, OverflowPolicy::DropNewest),
+        (true, OverflowPolicy::DropNewest),
+        (true, OverflowPolicy::DropOldest),
+    ] {
+        let settings = NetworkQueueSettings {
+            send_capacity: 2,
+            datagram_send_overflow: policy,
+            ..Default::default()
+        };
+        let (tx, rx) = settings.outgoing_channel(datagram);
+        let raw = RawConnection::with_limits(
+            TestStream::new(SharedHandle(Arc::default())),
+            Arc::new(ByteSerializer),
+            LittleEndian::<u32>::default(),
+            rx,
+            ReceiveLimits::default(),
+        );
+        let connection = raw.ecs_connection(tx);
+        let retained = connection.clone();
+        let mut parts = raw.into_parts();
+        assert!(!connection.is_closed());
+        assert_eq!(
+            connection.outgoing_queue(),
+            QueueSnapshot {
+                queued: 0,
+                capacity: 2
+            }
+        );
+        connection.send(1).unwrap();
+        retained.send(2).unwrap();
+        if datagram && policy == OverflowPolicy::DropOldest {
+            connection.send(3).unwrap();
+        } else {
+            assert_eq!(connection.send(3), Err(SendError::Full(3)));
+        }
+        assert_eq!(
+            retained.outgoing_queue(),
+            QueueSnapshot {
+                queued: 2,
+                capacity: 2
+            }
+        );
+        assert_eq!(
+            parts.packets_rx.recv().await,
+            Some(if datagram && policy == OverflowPolicy::DropOldest {
+                2
+            } else {
+                1
+            })
+        );
+        assert_eq!(connection.outgoing_queue().queued, 1);
+        drop(parts);
+        assert!(connection.is_closed());
+        assert!(retained.is_closed());
+        assert_eq!(retained.send(4), Err(SendError::Closed(4)));
+    }
+}
+
+#[cfg(any(feature = "client", feature = "server"))]
+#[test]
+fn ecs_connection_component_removal_preserves_retained_handle() {
+    use super::EcsConnection;
+    let (tx, rx) = NetworkQueueSettings::default().outgoing_channel(false);
+    let raw = RawConnection::with_limits(
+        TestStream::new(SharedHandle(Arc::default())),
+        Arc::new(ByteSerializer),
+        LittleEndian::<u32>::default(),
+        rx,
+        ReceiveLimits::default(),
+    );
+    let retained = raw.ecs_connection(tx);
+    let mut world = bevy::prelude::World::new();
+    let entity = world.spawn(retained.clone()).id();
+    let mut query = world.query::<&EcsConnection<u8, SharedHandle>>();
+    let connection = query.single(&world).unwrap();
+    assert_eq!(connection.id(), retained.id());
+    connection.send(7).unwrap();
+    world
+        .entity_mut(entity)
+        .remove::<EcsConnection<u8, SharedHandle>>();
+    assert!(!retained.is_closed());
+    retained.send(8).unwrap();
+    retained.disconnect();
+    assert!(retained.is_closed());
+    assert_eq!(retained.send(9), Err(SendError::Closed(9)));
+    // Receiver still exists: cancellation alone must be enough to report closure.
+    assert_eq!(retained.outgoing_queue().queued, 2);
+    drop(raw);
+}

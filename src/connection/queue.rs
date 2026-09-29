@@ -22,6 +22,18 @@ pub enum OverflowPolicy {
     DropOldest,
 }
 
+/// A momentary view of an outgoing packet queue.
+///
+/// This is diagnostic information, not a reservation or delivery acknowledgement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueueSnapshot {
+    /// Occupied packet slots. Concurrent sends can transiently occupy a slot
+    /// before publishing its packet. Excludes packets already taken by the writer.
+    pub queued: usize,
+    /// Maximum packet slots, including occupied slots.
+    pub capacity: usize,
+}
+
 /// Sending endpoint for a transport-specific outgoing packet queue.
 pub struct OutgoingSender<T>(OutgoingSenderInner<T>);
 
@@ -43,6 +55,28 @@ impl<T> Clone for OutgoingSender<T> {
 }
 
 impl<T> OutgoingSender<T> {
+    pub(super) fn is_closed(&self) -> bool {
+        match &self.0 {
+            OutgoingSenderInner::Reliable(tx) => tx.is_closed(),
+            #[cfg(any(feature = "client", feature = "server"))]
+            OutgoingSenderInner::Lossy(tx) => tx.is_closed(),
+        }
+    }
+
+    pub(super) fn snapshot(&self) -> QueueSnapshot {
+        match &self.0 {
+            OutgoingSenderInner::Reliable(tx) => {
+                let capacity = tx.max_capacity();
+                QueueSnapshot {
+                    queued: capacity - tx.capacity(),
+                    capacity,
+                }
+            }
+            #[cfg(any(feature = "client", feature = "server"))]
+            OutgoingSenderInner::Lossy(tx) => tx.snapshot(),
+        }
+    }
+
     #[cfg(any(feature = "client", feature = "server", test))]
     const fn reliable(tx: Sender<T>) -> Self {
         Self(OutgoingSenderInner::Reliable(tx))

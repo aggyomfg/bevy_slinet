@@ -30,7 +30,9 @@ pub(crate) mod transport;
 
 #[cfg(any(feature = "client", feature = "server"))]
 pub(crate) use queue::PacketForwarder;
-pub use queue::{NetworkQueueSettings, OutgoingReceiver, OutgoingSender, OverflowPolicy};
+pub use queue::{
+    NetworkQueueSettings, OutgoingReceiver, OutgoingSender, OverflowPolicy, QueueSnapshot,
+};
 pub use send_error::SendError;
 
 /// A live packet size limit shared by receive tasks in one Bevy app.
@@ -63,6 +65,9 @@ impl ReceiveLimits {
 }
 
 /// Provides a cloneable ECS handle to a transport task through a bounded packet queue.
+///
+/// May be stored as a resource or on an entity. Removing the component does not
+/// disconnect retained clones; use [`Self::disconnect`] to request local closure.
 #[derive(Resource)]
 pub struct EcsConnection<SendingPacket, H: TransportHandle>
 where
@@ -133,6 +138,24 @@ where
     #[must_use]
     pub const fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// Reports local cancellation or closure of the outgoing queue's receiver.
+    ///
+    /// `false` does not establish remote reachability, including for UDP.
+    /// State can change immediately; always handle errors from [`Self::send`].
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.disconnect_task.is_cancelled() || self.packet_tx.is_closed()
+    }
+
+    /// Samples outgoing queue occupancy in packets.
+    ///
+    /// Excludes packets already taken by the network task, including writes waiting
+    /// on the socket or pacing. Available space does not reserve a subsequent send.
+    #[must_use]
+    pub fn outgoing_queue(&self) -> QueueSnapshot {
+        self.packet_tx.snapshot()
     }
 
     /// Queues a packet for the remote peer.

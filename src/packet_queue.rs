@@ -52,6 +52,21 @@ impl<T> Drop for LossySender<T> {
 }
 
 impl<T> LossySender<T> {
+    /// Reports whether the receiver has closed.
+    #[cfg(any(feature = "client", feature = "server"))]
+    pub fn is_closed(&self) -> bool {
+        !self.0.lock().receiver_open
+    }
+
+    /// Samples outgoing packet occupancy under the queue lock.
+    #[cfg(any(feature = "client", feature = "server"))]
+    pub fn snapshot(&self) -> crate::connection::QueueSnapshot {
+        crate::connection::QueueSnapshot {
+            queued: self.0.lock().items.len(),
+            capacity: self.0.max_items,
+        }
+    }
+
     /// Tries to enqueue an item with its exact byte weight, returning any evicted items.
     /// An individually oversized item never evicts an existing item.
     pub fn try_send(&self, value: T, bytes: usize) -> Result<Vec<T>, TrySendError<T>> {
