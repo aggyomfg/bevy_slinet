@@ -106,3 +106,8 @@ pub trait ClientConfig: Send + Sync + 'static {
     /// A packet length serializer
     type LengthSerializer: PacketLengthSerializer + Default;
 }
+
+/// Unstable fixtures for this repository's benchmarks, excluded from normal builds.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub mod bench_support;

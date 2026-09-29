@@ -46,10 +46,14 @@ async-trait = "0.1"
 futures = { version = "0.3" }
 
 [dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+stats_alloc = "0.1.10"
 getrandom = "0.3"
 tokio = { version = "1", features = ["time", "test-util"] }
 
 [features]
+# Internal fixtures only; not a supported application API.
+bench-internals = ["client", "server", "protocol_tcp", "protocol_udp", "serializer_bitcode"]
 serializer_bitcode = ["bitcode"]
 serializer_bitcode_serde = ["bitcode", "bitcode/serde", "serde"]
 serializer_bincode = ["bincode"]
@@ -94,6 +98,21 @@ required-features = [
     "serializer_bitcode",
 ]
 
+[[example]]
+name = "udp_application_sessions"
+path = "examples/udp_application_sessions.rs"
+required-features = ["client", "server", "protocol_udp", "serializer_bitcode"]
+
+[[bench]]
+name = "network"
+harness = false
+required-features = ["bench-internals"]
+
+[[bench]]
+name = "allocations"
+harness = false
+required-features = ["bench-internals"]
+
 [lints.rust]
 unused = { level = "deny", priority = -1 }
 dead_code = "deny"
@@ -116,7 +135,3 @@ exit = "deny"
 needless_pass_by_value = "allow"
 future_not_send = "allow"
 
-[[example]]
-name = "udp_application_sessions"
-path = "examples/udp_application_sessions.rs"
-required-features = ["client", "server", "protocol_udp", "serializer_bitcode"]

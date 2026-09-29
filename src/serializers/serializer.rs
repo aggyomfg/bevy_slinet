@@ -1,3 +1,5 @@
+//! Packet codecs and adapters for shared or mutable access.
+
 use core::fmt::Debug;
 use std::{
     error::Error,

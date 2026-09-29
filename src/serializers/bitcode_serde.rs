@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 pub struct BitcodeSerdeSerializer;
 
 impl BitcodeSerdeSerializer {
+    /// Creates a serializer with its default configuration.
     #[must_use]
     pub const fn new() -> Self {
         Self

@@ -32,3 +32,7 @@ mod data_tests;
 
 #[cfg(test)]
 mod contract_tests;
+
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub mod bench_support;

@@ -24,6 +24,7 @@ Note: with TCP, you should implement keep-alive and disconnection systems yourse
 - [API migration: typed transport handles and connection APIs](docs/019-migration.md)
 - [UDP: configuration, diagnostics, pacing, and application sessions](docs/udp.md)
 - [API reference](https://docs.rs/bevy_slinet)
+- [Networking benchmarks](docs/benchmarks.md)
 
 ## [More Examples](https://github.com/aggyomfg/bevy_slinet/tree/main/examples)
 

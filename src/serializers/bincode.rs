@@ -15,6 +15,7 @@ pub struct BincodeSerializer {
 }
 
 impl BincodeSerializer {
+    /// Creates a serializer with its default configuration.
     #[must_use]
     pub fn new() -> Self {
         Self::default()

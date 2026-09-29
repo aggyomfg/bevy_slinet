@@ -758,3 +758,8 @@ mod udp_lifecycle_tests {
         assert_eq!(app.world().resource::<PacketEvents>().0, 0);
     }
 }
+
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[path = "benchmarks/server.rs"]
+pub mod bench_support;

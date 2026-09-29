@@ -9,6 +9,7 @@ use crate::serializers::serializer::ReadOnlySerializer;
 pub struct BitcodeSerializer;
 
 impl BitcodeSerializer {
+    /// Creates a serializer with its default configuration.
     #[must_use]
     pub const fn new() -> Self {
         Self
