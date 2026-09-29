@@ -9,6 +9,7 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 use crate::bench_utils::{Delivery, Scenario};
+use crate::connection::OutgoingReceiver;
 use crate::protocols::tcp::TcpProtocol;
 use crate::serializers::{
     bitcode::BitcodeSerializer, packet_length_serializer::LittleEndian,
@@ -16,6 +17,7 @@ use crate::serializers::{
 };
 use std::convert::Infallible;
 use std::sync::atomic::AtomicBool;
+use tokio_util::sync::CancellationToken;
 
 struct Config;
 impl ServerConfig for Config {

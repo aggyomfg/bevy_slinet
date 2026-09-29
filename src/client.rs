@@ -18,8 +18,8 @@ use bevy::platform::time::Instant;
 use bevy::prelude::*;
 use futures::StreamExt;
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio_util::sync::CancellationToken;
 
+use crate::connection::tasks::{PacketCodecs, ReceiveTaskState, SendTaskState};
 use crate::connection::transport::PendingPacket;
 use crate::connection::{
     ConnectionId, EcsConnection, MaxPacketSize, NetworkQueueSettings, OutgoingReceiver,
@@ -494,41 +494,51 @@ impl<Config: ClientConfig> ConnectedTransport<Config> {
         tokio::spawn(Self::receive_packets(
             read,
             self.ecs_connection,
-            Arc::clone(&serializer),
-            Arc::clone(&packet_length_serializer),
+            ReceiveTaskState {
+                codecs: PacketCodecs {
+                    serializer: Arc::clone(&serializer),
+                    packet_length_serializer: Arc::clone(&packet_length_serializer),
+                },
+                receive_limits,
+                send_error: send_error_rx,
+            },
             packets,
             lifecycle,
             peer_addr,
-            receive_limits,
-            send_error_rx,
         ));
         tokio::spawn(Self::send_packets(
             write,
-            packets_rx,
-            serializer,
-            packet_length_serializer,
-            disconnect_task,
-            id,
-            transport,
-            send_error_tx,
+            PacketCodecs {
+                serializer,
+                packet_length_serializer,
+            },
+            SendTaskState {
+                packets_rx,
+                disconnect_task,
+                id,
+                transport,
+                send_error: send_error_tx,
+            },
         ));
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Receive task needs transport, queue and lifecycle endpoints"
-    )]
     async fn receive_packets(
         mut read: impl PacketReader,
         ecs_conn: ClientConnection<Config>,
-        serializer: Arc<ClientSerializer<Config>>,
-        packet_length_serializer: Arc<Config::LengthSerializer>,
+        state: ReceiveTaskState<ClientSerializer<Config>, Config::LengthSerializer>,
         packets: LossySender<PacketReceiveEvent<Config>>,
         lifecycle: Sender<ClientLifecycle<Config>>,
         peer_addr: SocketAddr,
-        receive_limits: ReceiveLimits,
-        mut send_error: tokio::sync::oneshot::Receiver<std::io::Error>,
     ) {
+        let ReceiveTaskState {
+            codecs:
+                PacketCodecs {
+                    serializer,
+                    packet_length_serializer,
+                },
+            receive_limits,
+            mut send_error,
+        } = state;
         let disconnect_task = &ecs_conn.disconnect_task;
         let id = ecs_conn.id();
         let _guard = disconnect_task.clone().drop_guard();
@@ -589,23 +599,22 @@ impl<Config: ClientConfig> ConnectedTransport<Config> {
         }
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Send task owns transport, codec, cancellation and error reporting"
-    )]
     async fn send_packets(
         mut write: impl PacketWriter,
-        mut packets_rx: OutgoingReceiver<
-            Config::ClientPacket,
-            <Config::Protocol as Protocol>::Handle,
-        >,
-        serializer: Arc<ClientSerializer<Config>>,
-        packet_length_serializer: Arc<Config::LengthSerializer>,
-        disconnect_task: CancellationToken,
-        id: ConnectionId,
-        transport: <Config::Protocol as Protocol>::Handle,
-        send_error: tokio::sync::oneshot::Sender<std::io::Error>,
+        codecs: PacketCodecs<ClientSerializer<Config>, Config::LengthSerializer>,
+        state: SendTaskState<Config::ClientPacket, <Config::Protocol as Protocol>::Handle>,
     ) {
+        let PacketCodecs {
+            serializer,
+            packet_length_serializer,
+        } = codecs;
+        let SendTaskState {
+            mut packets_rx,
+            disconnect_task,
+            id,
+            transport,
+            send_error,
+        } = state;
         let _guard = disconnect_task.clone().drop_guard();
         let sending = async {
             while let Some(packet) = packets_rx.recv().await {
@@ -836,6 +845,7 @@ mod udp_lifecycle_tests {
     use crate::serializers::bitcode_serde::BitcodeSerdeSerializer;
     use crate::serializers::packet_length_serializer::LittleEndian;
     use crate::serializers::serializer::SerializerAdapter;
+    use tokio_util::sync::CancellationToken;
 
     struct Config;
     impl ClientConfig for Config {
@@ -998,13 +1008,17 @@ mod udp_lifecycle_tests {
         let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let task = tokio::spawn(ConnectedTransport::<Config>::send_packets(
             FramedWriter::new(PendingWrite(Arc::clone(&entered))),
-            packets_rx,
-            Arc::new(Config::build_serializer()),
-            Arc::new(LittleEndian::<u32>::default()),
-            connection.disconnect_task.clone(),
-            connection.id(),
-            udp.clone(),
-            tokio::sync::oneshot::channel().0,
+            PacketCodecs {
+                serializer: Arc::new(Config::build_serializer()),
+                packet_length_serializer: Arc::new(LittleEndian::<u32>::default()),
+            },
+            SendTaskState {
+                packets_rx,
+                disconnect_task: connection.disconnect_task.clone(),
+                id: connection.id(),
+                transport: udp.clone(),
+                send_error: tokio::sync::oneshot::channel().0,
+            },
         ));
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while !entered.load(std::sync::atomic::Ordering::Acquire) {
@@ -1087,6 +1101,7 @@ mod tcp_lifecycle_tests {
     use crate::serializers::bitcode_serde::BitcodeSerdeSerializer;
     use crate::serializers::packet_length_serializer::LittleEndian;
     use crate::serializers::serializer::SerializerAdapter;
+    use tokio_util::sync::CancellationToken;
 
     struct Config;
     impl ClientConfig for Config {

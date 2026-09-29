@@ -26,6 +26,8 @@ mod send_error;
 pub(crate) mod settings;
 #[cfg(any(feature = "client", feature = "server"))]
 pub use settings::NetworkSettings;
+#[cfg(any(feature = "client", feature = "server"))]
+pub(crate) mod tasks;
 pub(crate) mod transport;
 
 #[cfg(any(feature = "client", feature = "server"))]

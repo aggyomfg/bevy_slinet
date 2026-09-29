@@ -15,12 +15,12 @@ use bevy::platform::time::Instant;
 use bevy::{log, prelude::*};
 use tokio::select;
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio_util::sync::CancellationToken;
 
+use crate::connection::tasks::{PacketCodecs, ReceiveTaskState, SendTaskState};
 use crate::connection::transport::PendingPacket;
 use crate::connection::{
-    ConnectionId, EcsConnection, MaxPacketSize, NetworkQueueSettings, OutgoingReceiver,
-    PacketForwarder, RawConnection, ReceiveLimits,
+    ConnectionId, EcsConnection, MaxPacketSize, NetworkQueueSettings, PacketForwarder,
+    RawConnection, ReceiveLimits,
 };
 use crate::packet_queue::{lossy_channel, LossyReceiver, LossySender};
 use crate::protocols::protocol::{
@@ -418,41 +418,51 @@ impl<Config: ServerConfig> ConnectedTransport<Config> {
         tokio::spawn(Self::receive_packets(
             read,
             self.ecs_connection,
-            Arc::clone(&serializer),
-            Arc::clone(&packet_length_serializer),
+            ReceiveTaskState {
+                codecs: PacketCodecs {
+                    serializer: Arc::clone(&serializer),
+                    packet_length_serializer: Arc::clone(&packet_length_serializer),
+                },
+                receive_limits,
+                send_error: send_error_rx,
+            },
             packets,
             lifecycle,
             disconnect_sender,
-            receive_limits,
-            send_error_rx,
         ));
         tokio::spawn(Self::send_packets(
             write,
-            packets_rx,
-            serializer,
-            packet_length_serializer,
-            disconnect_task,
-            id,
-            transport,
-            send_error_tx,
+            PacketCodecs {
+                serializer,
+                packet_length_serializer,
+            },
+            SendTaskState {
+                packets_rx,
+                disconnect_task,
+                id,
+                transport,
+                send_error: send_error_tx,
+            },
         ));
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Receive task needs transport, queue and lifecycle endpoints"
-    )]
     async fn receive_packets(
         mut read: impl PacketReader,
         ecs_conn: ServerConnection<Config>,
-        serializer: Arc<ServerSerializer<Config>>,
-        packet_length_serializer: Arc<Config::LengthSerializer>,
+        state: ReceiveTaskState<ServerSerializer<Config>, Config::LengthSerializer>,
         packets: LossySender<PacketReceiveEvent<Config>>,
         lifecycle: Sender<ServerLifecycle<Config>>,
         disconnect_sender: Sender<SocketAddr>,
-        receive_limits: ReceiveLimits,
-        mut send_error: tokio::sync::oneshot::Receiver<std::io::Error>,
     ) {
+        let ReceiveTaskState {
+            codecs:
+                PacketCodecs {
+                    serializer,
+                    packet_length_serializer,
+                },
+            receive_limits,
+            mut send_error,
+        } = state;
         let disconnect_task = &ecs_conn.disconnect_task;
         let id = ecs_conn.id();
         let _guard = disconnect_task.clone().drop_guard();
@@ -515,23 +525,22 @@ impl<Config: ServerConfig> ConnectedTransport<Config> {
         }
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Send task owns transport, codec, cancellation and error reporting"
-    )]
     async fn send_packets(
         mut write: impl PacketWriter,
-        mut packets_rx: OutgoingReceiver<
-            Config::ServerPacket,
-            <Config::Protocol as Protocol>::Handle,
-        >,
-        serializer: Arc<ServerSerializer<Config>>,
-        packet_length_serializer: Arc<Config::LengthSerializer>,
-        disconnect_task: CancellationToken,
-        id: ConnectionId,
-        transport: <Config::Protocol as Protocol>::Handle,
-        send_error: tokio::sync::oneshot::Sender<std::io::Error>,
+        codecs: PacketCodecs<ServerSerializer<Config>, Config::LengthSerializer>,
+        state: SendTaskState<Config::ServerPacket, <Config::Protocol as Protocol>::Handle>,
     ) {
+        let PacketCodecs {
+            serializer,
+            packet_length_serializer,
+        } = codecs;
+        let SendTaskState {
+            mut packets_rx,
+            disconnect_task,
+            id,
+            transport,
+            send_error,
+        } = state;
         let _guard = disconnect_task.clone().drop_guard();
         let sending = async {
             while let Some(packet) = packets_rx.recv().await {
@@ -694,6 +703,7 @@ mod udp_lifecycle_tests {
     use crate::serializers::bitcode_serde::BitcodeSerdeSerializer;
     use crate::serializers::packet_length_serializer::LittleEndian;
     use crate::serializers::serializer::SerializerAdapter;
+    use tokio_util::sync::CancellationToken;
 
     struct Config;
     impl ServerConfig for Config {

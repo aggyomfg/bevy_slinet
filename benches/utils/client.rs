@@ -16,6 +16,7 @@ use crate::serializers::{
 };
 use std::convert::Infallible;
 use std::sync::atomic::AtomicBool;
+use tokio_util::sync::CancellationToken;
 
 struct Config;
 impl ClientConfig for Config {
