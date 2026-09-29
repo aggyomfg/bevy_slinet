@@ -150,7 +150,8 @@ impl<T, H: TransportHandle> Drop for OutgoingReceiver<T, H> {
 pub struct NetworkQueueSettings {
     /// Outgoing packets per connection. Datagram `DropNewest` reports `Full` on overflow.
     pub send_capacity: usize,
-    /// Incoming packets and lifecycle events per plugin, each with its own bounded queue.
+    /// Incoming channel capacity per plugin. Streams share a FIFO for packets and
+    /// lifecycle; datagrams have a separate packet queue. ECS retains one lookahead event.
     pub receive_capacity: usize,
     /// Maximum items drained by each networking ECS system per frame. May change at runtime.
     pub events_per_frame: usize,

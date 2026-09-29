@@ -19,6 +19,8 @@ Changes from `cde760487dc7663c2328a81ec17804e349af4a1f` to 0.19.
   `NewConnectionEvent`, `DisconnectionEvent`, and `PacketReceiveEvent` are now
   `#[non_exhaustive]`: add `..` to destructuring patterns and stop constructing
   these events with struct literals.
+- TCP disconnection events now follow previously queued packet events. Their
+  publication may wait for later frames when packet processing is budget-limited.
 - Client `DisconnectionEvent` adds `connection_id: Option<ConnectionId>`:
   `Some(id)` for established connections, `None` for failed connection attempts.
 - `MaxPacketSize` now applies only within its Bevy App. Set it in each App that

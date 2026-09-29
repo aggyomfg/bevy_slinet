@@ -7,12 +7,14 @@
 Insert `connection::NetworkQueueSettings` before startup to configure outgoing
 packets per connection, incoming packets per plugin, and processing budgets.
 Defaults are 1024 outgoing packets, 4096 incoming packets/events per channel,
-and 256 events per system per frame. Establishment and closure share one FIFO
-lifecycle queue and one frame budget, so closure cannot overtake establishment.
+and 256 events per system per frame. Establishment and closure share one FIFO lifecycle queue and one frame budget.
+Stream transports also enqueue incoming packets in this FIFO, so closure cannot
+overtake previously queued packets. Packet and lifecycle systems retain their
+separate frame budgets; a phase boundary can defer the next event until the next
+frame. The ECS receiver retains at most one lookahead event outside the channel.
 Both lifecycle events are now published in `PreUpdate`. The establishment and
 removal system-set labels refer to that shared phase; application systems ordered
-around removal must also use `PreUpdate`. Already decoded TCP packets remain
-available after EOF; the closed-packet discard policy applies to UDP.
+around removal must also use `PreUpdate`. Queued TCP packets are delivered before the disconnection event after EOF; the closed-packet discard policy applies to UDP.
 
 `datagram_send_overflow` and `datagram_receive_overflow` select
 `OverflowPolicy::DropNewest` (the default) or `DropOldest`. The latter keeps

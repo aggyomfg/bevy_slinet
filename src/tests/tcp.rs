@@ -206,3 +206,57 @@ fn encode_error_preserves_disconnection_cause() {
     });
     assert_eq!(client.world().resource::<Outcome>().0, Some(true));
 }
+
+#[derive(Default, Resource)]
+struct EventOrder(Vec<&'static str>);
+
+#[test]
+fn tcp_eof_follows_all_buffered_packets() {
+    use crate::serializer::ReadOnlySerializer;
+    use std::io::Write;
+    let mut server = App::new();
+    server.insert_resource(crate::connection::NetworkQueueSettings {
+        events_per_frame: 1,
+        ..Default::default()
+    });
+    server.init_resource::<EventOrder>();
+    server.add_plugins(ServerPlugin::<TcpConfig>::bind("127.0.0.1:0"));
+    server.add_observer(
+        |_: On<NewConnectionEvent<TcpConfig>>, mut order: ResMut<EventOrder>| order.0.push("open"),
+    );
+    server.add_observer(
+        |_: On<server::PacketReceiveEvent<TcpConfig>>, mut order: ResMut<EventOrder>| {
+            order.0.push("packet")
+        },
+    );
+    server.add_observer(
+        |_: On<server::DisconnectionEvent<TcpConfig>>, mut order: ResMut<EventOrder>| {
+            order.0.push("close")
+        },
+    );
+    server.update();
+    let address = server
+        .world()
+        .resource::<ServerAddress<TcpConfig>>()
+        .address();
+    let mut socket = std::net::TcpStream::connect(address).unwrap();
+    for n in 0..3 {
+        let bytes =
+            ReadOnlySerializer::<Packet, Packet>::serialize(&BitcodeSerdeSerializer, Packet(n))
+                .unwrap();
+        socket
+            .write_all(&u32::try_from(bytes.len()).unwrap().to_le_bytes())
+            .unwrap();
+        socket.write_all(&bytes).unwrap();
+    }
+    socket.shutdown(std::net::Shutdown::Write).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    wait_until(|| {
+        server.update();
+        server.world().resource::<EventOrder>().0.len() == 5
+    });
+    assert_eq!(
+        server.world().resource::<EventOrder>().0,
+        ["open", "packet", "packet", "packet", "close"]
+    );
+}

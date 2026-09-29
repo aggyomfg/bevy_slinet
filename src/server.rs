@@ -11,7 +11,7 @@ use tokio::select;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_util::sync::CancellationToken;
 
-use crate::connection::transport::PendingPacket;
+use crate::connection::transport::{LifecycleQueue, PendingPacket};
 use crate::connection::{
     ConnectionId, EcsConnection, MaxPacketSize, NetworkQueueSettings, OutgoingReceiver,
     PacketForwarder, RawConnection, ReceiveLimits,
@@ -142,9 +142,10 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
 }
 
 #[derive(Resource)]
-struct LifecycleReceiver<Config: ServerConfig>(Receiver<ServerLifecycle<Config>>);
+struct LifecycleReceiver<Config: ServerConfig>(LifecycleQueue<ServerLifecycle<Config>>);
 
 enum ServerLifecycle<Config: ServerConfig> {
+    Packet(PacketReceiveEvent<Config>),
     Established(NewConnectionEvent<Config>),
     Closed(DisconnectionEvent<Config>),
 }
@@ -185,7 +186,7 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
             queues.datagram_receive_overflow,
         );
         let (disconnect_sender, incoming_disconnects) = queues.incoming_channel();
-        commands.insert_resource(LifecycleReceiver::<Config>(lifecycle_rx));
+        commands.insert_resource(LifecycleReceiver::<Config>(lifecycle_rx.into()));
         commands.insert_resource(PacketReceiver::<Config> { receiver: pack_rx });
         let (bound_tx, bound_rx) = std::sync::mpsc::sync_channel(1);
 
@@ -422,13 +423,23 @@ impl<Config: ServerConfig> ConnectedTransport<Config> {
                     match result {
                         Ok((packet, received_at)) => {
                             log::trace!("({id:?}) Received packet {packet:?}");
-                            if !packets.forward(PacketReceiveEvent::<Config> {
+                            let event = PacketReceiveEvent::<Config> {
                                 connection: ecs_conn.clone(),
                                 packet,
                                 received_at,
-                            }, |discarded| {
-                                discarded.connection.record_drop(QueueDropReason::ReceiveQueueEvicted);
-                            }).await {
+                            };
+                            let forwarded = if Config::Protocol::DATAGRAM {
+                                packets.forward(event, |discarded| {
+                                    discarded.connection.record_drop(QueueDropReason::ReceiveQueueEvicted);
+                                }).await
+                            } else {
+                                tokio::select! {
+                                    biased;
+                                    () = disconnect_task.cancelled() => false,
+                                    result = lifecycle.send(ServerLifecycle::Packet(event)) => result.is_ok(),
+                                }
+                            };
+                            if !forwarded {
                                 break ReceiveError::IntentionalDisconnection;
                             }
                         }
@@ -562,23 +573,27 @@ fn lifecycle_system<Config: ServerConfig>(
         .unwrap_or_default()
         .events_per_frame;
     for _ in 0..budget {
-        match lifecycle.0.try_recv() {
-            Ok(ServerLifecycle::Established(event)) => {
+        match lifecycle
+            .0
+            .try_recv_if(|event| !matches!(event, ServerLifecycle::Packet(_)))
+        {
+            Some(ServerLifecycle::Established(event)) => {
                 event.connection.mark_published();
                 connections.register(event.connection.clone());
                 commands.trigger(event);
             }
-            Ok(ServerLifecycle::Closed(event)) => {
+            Some(ServerLifecycle::Closed(event)) => {
                 connections.remove_connection(event.connection.id());
                 commands.trigger(event);
             }
-            Err(_) => break,
+            Some(ServerLifecycle::Packet(_)) | None => break,
         }
     }
 }
 
 fn accept_new_packets<Config: ServerConfig>(
     mut packets: ResMut<PacketReceiver<Config>>,
+    mut lifecycle: ResMut<LifecycleReceiver<Config>>,
     queues: Option<Res<NetworkQueueSettings>>,
     mut commands: Commands,
 ) {
@@ -587,6 +602,18 @@ fn accept_new_packets<Config: ServerConfig>(
         .copied()
         .unwrap_or_default()
         .events_per_frame;
+    if !Config::Protocol::DATAGRAM {
+        for _ in 0..budget {
+            let Some(ServerLifecycle::Packet(packet)) = lifecycle
+                .0
+                .try_recv_if(|event| matches!(event, ServerLifecycle::Packet(_)))
+            else {
+                break;
+            };
+            commands.trigger(packet);
+        }
+        return;
+    }
     for _ in 0..budget {
         let next = packets.receiver.try_recv_if(|packet| {
             packet.connection.is_published()
@@ -688,7 +715,7 @@ mod udp_lifecycle_tests {
         let mut app = App::new();
         app.insert_resource(settings);
         app.insert_resource(ServerConnections::<Config>::new());
-        app.insert_resource(LifecycleReceiver::<Config>(lifecycle_rx));
+        app.insert_resource(LifecycleReceiver::<Config>(lifecycle_rx.into()));
         app.insert_resource(PacketReceiver::<Config> {
             receiver: packet_rx,
         });
