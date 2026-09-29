@@ -30,7 +30,7 @@ use crate::protocols::protocol::{
     NetworkStream, PacketReader, PacketWriter, QueueDropReason, ReceiveError,
 };
 use crate::serializers::serializer::Serializer;
-use crate::{ClientConfig, Protocol, SystemSets};
+use crate::{ClientConfig, PacketLengthSerializer, Protocol, SystemSets};
 
 /// Client-side connection to a server.
 pub type ClientConnection<Config> = EcsConnection<
@@ -254,7 +254,10 @@ struct ConnectionClosed<Config: ClientConfig> {
 
 impl<Config: ClientConfig> ConnectionClosed<Config> {
     const fn new(
-        error: ReceiveError<Config::DecodeError, Config::LengthSerializer>,
+        error: ReceiveError<
+            Config::DecodeError,
+            <Config::LengthSerializer as PacketLengthSerializer>::Error,
+        >,
         address: SocketAddr,
         id: Option<ConnectionId>,
     ) -> Self {
@@ -749,7 +752,10 @@ pub struct ConnectionEstablishEvent<Config: ClientConfig> {
 #[derive(Event)]
 pub struct DisconnectionEvent<Config: ClientConfig> {
     /// The error.
-    pub error: ReceiveError<Config::DecodeError, Config::LengthSerializer>,
+    pub error: ReceiveError<
+        Config::DecodeError,
+        <Config::LengthSerializer as PacketLengthSerializer>::Error,
+    >,
     /// A server's IP address.
     pub address: SocketAddr,
     /// Local identity of the closed connection; absent for failed attempts.

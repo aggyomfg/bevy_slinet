@@ -261,7 +261,7 @@ async fn timestamp_fallback_preserves_custom_receive() {
             serializer: Arc<S>,
             _length_serializer: &LS,
             _limits: &ReceiveLimits,
-        ) -> Result<ReceivingPacket, ReceiveError<S::DecodeError, LS>>
+        ) -> Result<ReceivingPacket, ReceiveError<S::DecodeError, LS::Error>>
         where
             ReceivingPacket: Send + Sync + Debug + 'static,
             SendingPacket: Send + Sync + Debug + 'static,

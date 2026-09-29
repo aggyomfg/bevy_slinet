@@ -310,7 +310,7 @@ impl PacketReader for UdpReadHalf {
         serializer: Arc<Ser>,
         length: &LS,
         limits: &ReceiveLimits,
-    ) -> Result<R, ReceiveError<Ser::DecodeError, LS>>
+    ) -> Result<R, ReceiveError<Ser::DecodeError, LS::Error>>
     where
         R: Send + Sync + Debug + 'static,
         S: Send + Sync + Debug + 'static,
@@ -326,7 +326,7 @@ impl PacketReader for UdpReadHalf {
         serializer: Arc<Ser>,
         _: &LS,
         limits: &ReceiveLimits,
-    ) -> Result<(R, Instant), ReceiveError<Ser::DecodeError, LS>>
+    ) -> Result<(R, Instant), ReceiveError<Ser::DecodeError, LS::Error>>
     where
         R: Send + Sync + Debug + 'static,
         S: Send + Sync + Debug + 'static,

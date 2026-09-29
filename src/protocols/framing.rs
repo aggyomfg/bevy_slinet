@@ -102,7 +102,7 @@ impl<R: ReadStream> PacketReader for FramedReader<R> {
         serializer: Arc<S>,
         length_serializer: &LS,
         limits: &ReceiveLimits,
-    ) -> Result<ReceivingPacket, ReceiveError<S::DecodeError, LS>>
+    ) -> Result<ReceivingPacket, ReceiveError<S::DecodeError, LS::Error>>
     where
         ReceivingPacket: Send + Sync + Debug + 'static,
         SendingPacket: Send + Sync + Debug + 'static,
@@ -119,7 +119,7 @@ impl<R: ReadStream> PacketReader for FramedReader<R> {
         serializer: Arc<S>,
         length_serializer: &LS,
         limits: &ReceiveLimits,
-    ) -> Result<(ReceivingPacket, Instant), ReceiveError<S::DecodeError, LS>>
+    ) -> Result<(ReceivingPacket, Instant), ReceiveError<S::DecodeError, LS::Error>>
     where
         ReceivingPacket: Send + Sync + Debug + 'static,
         SendingPacket: Send + Sync + Debug + 'static,
@@ -148,7 +148,7 @@ impl<R: ReadStream> FramedReader<R> {
     async fn read_length<DecErr, LS>(
         &mut self,
         length_serializer: &LS,
-    ) -> Result<usize, ReceiveError<DecErr, LS>>
+    ) -> Result<usize, ReceiveError<DecErr, LS::Error>>
     where
         DecErr: Error + Send + Sync,
         LS: PacketLengthSerializer,

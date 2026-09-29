@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use bevy::platform::time::Instant;
 use std::error::Error;
-use std::fmt::{Debug, Formatter};
+use std::fmt::Debug;
 use std::io;
 use std::sync::Arc;
 
@@ -31,7 +31,7 @@ pub trait PacketReader: Send + Sync + 'static {
         serializer: Arc<S>,
         length_serializer: &LS,
         limits: &ReceiveLimits,
-    ) -> Result<ReceivingPacket, ReceiveError<S::DecodeError, LS>>
+    ) -> Result<ReceivingPacket, ReceiveError<S::DecodeError, LS::Error>>
     where
         ReceivingPacket: Send + Sync + Debug + 'static,
         SendingPacket: Send + Sync + Debug + 'static,
@@ -48,7 +48,7 @@ pub trait PacketReader: Send + Sync + 'static {
         serializer: Arc<S>,
         length_serializer: &LS,
         limits: &ReceiveLimits,
-    ) -> Result<(ReceivingPacket, Instant), ReceiveError<S::DecodeError, LS>>
+    ) -> Result<(ReceivingPacket, Instant), ReceiveError<S::DecodeError, LS::Error>>
     where
         ReceivingPacket: Send + Sync + Debug + 'static,
         SendingPacket: Send + Sync + Debug + 'static,
@@ -87,11 +87,13 @@ pub trait PacketWriter: Send + Sync + 'static {
 }
 
 /// Reports transport and decoding failures, including an explicitly closed connection.
-#[derive(thiserror::Error)]
-pub enum ReceiveError<SerializationError, LS>
+///
+/// `LengthError` is the length codec's [`PacketLengthSerializer::Error`] type.
+#[derive(Debug, thiserror::Error)]
+pub enum ReceiveError<SerializationError, LengthError>
 where
     SerializationError: Error + Send + Sync,
-    LS: PacketLengthSerializer,
+    LengthError: Error + Send + Sync,
 {
     /// Stops reception when the transport cannot supply a complete packet.
     #[error("Failed to receive packet: {0}")]
@@ -101,7 +103,7 @@ where
     Deserialization(#[source] SerializationError),
     /// Stops framing because the prefix cannot be decoded.
     #[error("Failed to decode packet length: {0}")]
-    LengthDeserialization(#[source] LS::Error),
+    LengthDeserialization(#[source] LengthError),
     /// Exceeds the app-local [`MaxPacketSize`](crate::connection::MaxPacketSize).
     #[error("Packet exceeds the configured size limit")]
     PacketTooBig,
@@ -111,25 +113,4 @@ where
     /// Follows an explicit [`disconnect`](crate::connection::EcsConnection::disconnect) request.
     #[error("Connection was explicitly closed")]
     IntentionalDisconnection,
-}
-
-impl<SerializationError, LS> Debug for ReceiveError<SerializationError, LS>
-where
-    SerializationError: Error + Send + Sync,
-    LS: PacketLengthSerializer,
-{
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(error) => write!(f, "ReceiveError::Io({error:?})"),
-            Self::Deserialization(error) => {
-                write!(f, "ReceiveError::Deserialization({error:?})")
-            }
-            Self::LengthDeserialization(error) => {
-                write!(f, "ReceiveError::LengthDeserialization({error:?})")
-            }
-            Self::PacketTooBig => write!(f, "ReceiveError::PacketTooBig"),
-            Self::NoConnection(error) => write!(f, "ReceiveError::NoConnection({error:?})"),
-            Self::IntentionalDisconnection => write!(f, "IntentionalDisconnection"),
-        }
-    }
 }

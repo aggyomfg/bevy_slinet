@@ -27,7 +27,7 @@ use crate::protocols::protocol::{
     Listener, NetworkStream, PacketReader, PacketWriter, Protocol, QueueDropReason, ReceiveError,
 };
 use crate::serializers::serializer::Serializer;
-use crate::{ServerConfig, SystemSets};
+use crate::{PacketLengthSerializer, ServerConfig, SystemSets};
 
 /// Represents the server side of a client connection.
 pub type ServerConnection<Config> = EcsConnection<
@@ -591,7 +591,10 @@ pub struct NewConnectionEvent<Config: ServerConfig> {
 #[non_exhaustive]
 pub struct DisconnectionEvent<Config: ServerConfig> {
     /// The error.
-    pub error: ReceiveError<Config::DecodeError, Config::LengthSerializer>,
+    pub error: ReceiveError<
+        Config::DecodeError,
+        <Config::LengthSerializer as PacketLengthSerializer>::Error,
+    >,
     /// The connection.
     pub connection: ServerConnection<Config>,
 }
