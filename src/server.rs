@@ -365,6 +365,7 @@ impl<Config: ServerConfig> ConnectedTransport<Config> {
             }
         };
         let transport = self.ecs_connection.transport().clone();
+        let (send_error_tx, send_error_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(Self::receive_packets(
             read,
             self.ecs_connection,
@@ -374,6 +375,7 @@ impl<Config: ServerConfig> ConnectedTransport<Config> {
             lifecycle,
             disconnect_sender,
             receive_limits,
+            send_error_rx,
         ));
         tokio::spawn(Self::send_packets(
             write,
@@ -383,6 +385,7 @@ impl<Config: ServerConfig> ConnectedTransport<Config> {
             disconnect_task,
             id,
             transport,
+            send_error_tx,
         ));
     }
 
@@ -399,6 +402,7 @@ impl<Config: ServerConfig> ConnectedTransport<Config> {
         lifecycle: Sender<ServerLifecycle<Config>>,
         disconnect_sender: Sender<SocketAddr>,
         receive_limits: ReceiveLimits,
+        mut send_error: tokio::sync::oneshot::Receiver<std::io::Error>,
     ) {
         let disconnect_task = &ecs_conn.disconnect_task;
         let id = ecs_conn.id();
@@ -412,6 +416,7 @@ impl<Config: ServerConfig> ConnectedTransport<Config> {
         let error = loop {
             tokio::select! {
                 biased;
+                Ok(error) = &mut send_error => break ReceiveError::Io(error),
                 () = disconnect_task.cancelled() => break ReceiveError::IntentionalDisconnection,
                 result = read.receive_with_timestamp(Arc::clone(&serializer), &*packet_length_serializer, &receive_limits) => {
                     match result {
@@ -432,6 +437,9 @@ impl<Config: ServerConfig> ConnectedTransport<Config> {
                 }
             }
         };
+        // A failed writer cancels forwarding too; retain its cause even if the
+        // receive task was waiting for ECS queue capacity when cancellation arrived.
+        let error = send_error.try_recv().map_or(error, ReceiveError::Io);
         disconnect_task.cancel();
         read.close();
         if let Err(err) = lifecycle
@@ -448,6 +456,10 @@ impl<Config: ServerConfig> ConnectedTransport<Config> {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Send task owns transport, codec, cancellation and error reporting"
+    )]
     async fn send_packets(
         mut write: impl PacketWriter,
         mut packets_rx: OutgoingReceiver<
@@ -459,6 +471,7 @@ impl<Config: ServerConfig> ConnectedTransport<Config> {
         disconnect_task: CancellationToken,
         id: ConnectionId,
         transport: <Config::Protocol as Protocol>::Handle,
+        send_error: tokio::sync::oneshot::Sender<std::io::Error>,
     ) {
         let _guard = disconnect_task.clone().drop_guard();
         let sending = async {
@@ -474,6 +487,7 @@ impl<Config: ServerConfig> ConnectedTransport<Config> {
                 pending.finish(&result);
                 if let Err(err) = result {
                     log::error!("({id:?}) Error sending packet: {err}");
+                    let _ = send_error.send(err);
                     break;
                 }
             }

@@ -158,3 +158,51 @@ fn tcp_disconnect_is_reported_while_ecs_queue_is_full() {
                 .is_empty()
     });
 }
+
+#[test]
+fn encode_error_preserves_disconnection_cause() {
+    struct BadCodec;
+    impl crate::serializer::ReadOnlySerializer<Packet, Packet> for BadCodec {
+        type EncodeError = std::io::Error;
+        type DecodeError = std::io::Error;
+        fn serialize(&self, _: Packet) -> std::io::Result<Vec<u8>> {
+            Err(std::io::Error::other("review encoding failure"))
+        }
+        fn deserialize(&self, _: &[u8]) -> std::io::Result<Packet> {
+            Ok(Packet(0))
+        }
+    }
+    struct BadConfig;
+    impl ClientConfig for BadConfig {
+        type ClientPacket = Packet;
+        type ServerPacket = Packet;
+        type Protocol = TcpProtocol;
+        type EncodeError = std::io::Error;
+        type DecodeError = std::io::Error;
+        type LengthSerializer = LittleEndian<u32>;
+        fn build_serializer() -> SerializerAdapter<Packet, Packet, std::io::Error, std::io::Error> {
+            SerializerAdapter::ReadOnly(Arc::new(BadCodec))
+        }
+    }
+    #[derive(Default, Resource)]
+    struct Outcome(Option<bool>);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = App::new();
+    client.init_resource::<Outcome>();
+    client.add_plugins(ClientPlugin::<BadConfig>::connect(
+        listener.local_addr().unwrap(),
+    ));
+    client.add_observer(|ev: On<ConnectionEstablishEvent<BadConfig>>| {
+        ev.connection.send(Packet(1)).unwrap();
+    });
+    client.add_observer(|ev: On<client::DisconnectionEvent<BadConfig>>, mut result: ResMut<Outcome>| {
+        result.0 = Some(matches!(&ev.error, crate::protocol::ReceiveError::Io(error) if error.to_string().contains("review encoding failure")));
+    });
+    client.update();
+    let (_socket, _) = listener.accept().unwrap();
+    wait_until(|| {
+        client.update();
+        client.world().resource::<Outcome>().0.is_some()
+    });
+    assert_eq!(client.world().resource::<Outcome>().0, Some(true));
+}
