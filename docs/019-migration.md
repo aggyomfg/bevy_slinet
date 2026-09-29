@@ -13,6 +13,12 @@ Changes from `cde760487dc7663c2328a81ec17804e349af4a1f` to 0.19.
   instead of Tokio's `SendError`. Replace `error.0` with `error.into_inner()`
   and handle queue overflow. Queues are bounded; configure them through
   [`NetworkQueueSettings`](configuration.md#queue-limits).
+- `disconnect()` cancels the connection without waiting for its outgoing queue
+  to drain. A successful `send()` only enqueues a packet; immediately calling
+  `disconnect()` may discard it before it reaches the socket. Keep the connection
+  alive until an application acknowledgement arrives when delivery matters.
+  With UDP, retry the exchange (including acknowledgements) to handle packet loss;
+  an arbitrary delay before disconnecting does not guarantee delivery.
 - Move systems ordered around `SystemSets::ClientConnectionRemove` or
   `SystemSets::ServerRemoveConnections` from `PostUpdate` to `PreUpdate`.
 - Client `ConnectionEstablishEvent` and `PacketReceiveEvent`, and server

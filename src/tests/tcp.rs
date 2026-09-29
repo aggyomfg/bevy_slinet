@@ -295,4 +295,3 @@ fn pending_accepts_are_bounded_while_ecs_is_paused() {
     assert!(BUILT.load(Ordering::SeqCst) <= 2);
     drop(sockets);
 }
-

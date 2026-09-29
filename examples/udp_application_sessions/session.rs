@@ -35,12 +35,13 @@ impl Sessions {
             return None;
         }
         if packet.body == Body::Hello {
-            match self.entries.get(&packet.channel) {
+            match self.entries.get_mut(&packet.channel) {
                 Some(entry) if packet.generation < entry.generation => return None,
                 Some(entry) if packet.generation == entry.generation => {
                     if entry.id != packet.id || !entry.active {
                         return None;
                     }
+                    entry.last_received = entry.last_received.max(received_at);
                 }
                 _ => {
                     if !self.entries.contains_key(&packet.channel) && self.entries.len() >= 8 {
@@ -154,6 +155,39 @@ mod tests {
             )
             .is_some());
         assert!(sessions.handle(&new, now).is_none());
+    }
+    #[test]
+    fn repeated_hello_keeps_handshake_alive_without_reviving_expired_sessions() {
+        let now = Instant::now();
+        let mut sessions = Sessions::default();
+        let hello = packet(1, 1, 48, Body::Hello);
+        let timeout = Duration::from_millis(500);
+        for millis in (0..=450).step_by(50) {
+            assert_eq!(
+                sessions
+                    .handle(&hello, now + Duration::from_millis(millis))
+                    .unwrap()
+                    .body,
+                Body::Welcome
+            );
+        }
+        // A delayed event must not move the last-received timestamp backwards.
+        sessions.handle(&hello, now);
+        sessions.expire(now + timeout, timeout);
+        assert!(sessions
+            .handle(&hello, now + Duration::from_millis(550))
+            .is_some());
+        // A different identifier must not refresh the active generation.
+        let mut invalid = hello.clone();
+        invalid.id = vec![9; 48];
+        assert!(sessions
+            .handle(&invalid, now + Duration::from_millis(1000))
+            .is_none());
+        sessions.expire(now + Duration::from_millis(1050), timeout);
+        assert_eq!(sessions.active(), 0);
+        assert!(sessions
+            .handle(&hello, now + Duration::from_millis(1100))
+            .is_none());
     }
     #[test]
     fn only_valid_fresh_packets_refresh_liveness() {

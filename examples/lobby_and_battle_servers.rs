@@ -123,6 +123,7 @@ enum LobbyServerPacket {
 #[derive(Debug, Decode, Encode, PartialEq)]
 enum BattleClientPacket {
     Play,
+    ResultReceived,
     KeepAlive,
 }
 
@@ -131,6 +132,7 @@ enum BattleServerPacket {
     BroadcastPlayerJoin,
     BattleStart,
     YouWon,
+    ResultConfirmed,
     KeepAlive,
 }
 
@@ -170,6 +172,9 @@ impl<Config: ServerConfig> ServerKeepAliveTimers<Config> {
             .is_some_and(|timer| timer.tick(elapsed).just_finished())
     }
 }
+
+#[derive(Resource, Default)]
+struct BattleResultReceived(bool);
 
 #[derive(Resource)]
 struct ClientKeepAliveTimeout(Timer);
@@ -212,6 +217,7 @@ impl<Config: ServerConfig> ServerLiveness<'_, Config> {
 struct ActiveServers<'w> {
     lobby: Option<Res<'w, ClientConnection<LobbyConfig>>>,
     battle: Option<Res<'w, ClientConnection<BattleConfig>>>,
+    result_received: Res<'w, BattleResultReceived>,
 }
 
 impl ActiveServers<'_> {
@@ -221,7 +227,12 @@ impl ActiveServers<'_> {
                 .send(LobbyClientPacket::KeepAlive)
                 .with_severity(Severity::Error)?,
             (None, Some(connection)) => connection
-                .send(BattleClientPacket::KeepAlive)
+                // Retry the exchange until the server confirms receipt of the result ACK.
+                .send(if self.result_received.0 {
+                    BattleClientPacket::ResultReceived
+                } else {
+                    BattleClientPacket::Play
+                })
                 .with_severity(Severity::Error)?,
             _ => (),
         }
@@ -256,6 +267,7 @@ fn main() {
         .add_observer(battle_server_accept_new_connections)
         .add_observer(battle_server_packet_handler)
         .init_resource::<ClientKeepAliveTimeout>()
+        .init_resource::<BattleResultReceived>()
         .init_resource::<ServerKeepAliveTimers<LobbyConfig>>()
         .init_resource::<ServerKeepAliveTimers<BattleConfig>>()
         .add_systems(
@@ -344,11 +356,17 @@ fn battle_server_accept_new_connections(
 fn battle_server_packet_handler(packet: On<server::PacketReceiveEvent<BattleConfig>>) -> Result {
     let event = packet.event();
     log::info!("Client -> Battle: {:?}", event.packet);
-    if event.packet == BattleClientPacket::Play {
-        let sent = event.connection.send(BattleServerPacket::YouWon);
-        event.connection.disconnect();
-        sent.with_severity(Severity::Error)?;
-    }
+    let response = match event.packet {
+        BattleClientPacket::Play => BattleServerPacket::YouWon,
+        BattleClientPacket::ResultReceived => BattleServerPacket::ResultConfirmed,
+        BattleClientPacket::KeepAlive => return Ok(()),
+    };
+    // Keep the peer until inactivity expires it: send() only enqueues, and UDP
+    // replies (including confirmation) may need to be sent again after loss.
+    event
+        .connection
+        .send(response)
+        .with_severity(Severity::Error)?;
     Ok(())
 }
 
@@ -382,6 +400,7 @@ fn lobby_client_packet_handler(
 
 fn battle_client_packet_handler(
     packet: On<client::PacketReceiveEvent<BattleConfig>>,
+    mut result_received: ResMut<BattleResultReceived>,
     mut commands: Commands,
 ) -> Result {
     let event = packet.event();
@@ -403,7 +422,16 @@ fn battle_client_packet_handler(
                 .with_severity(Severity::Error)?;
         }
         BattleServerPacket::YouWon => {
-            log::info!("[Client] I won!");
+            if !result_received.0 {
+                log::info!("[Client] I won!");
+                result_received.0 = true;
+            }
+            event
+                .connection
+                .send(BattleClientPacket::ResultReceived)
+                .with_severity(Severity::Error)?;
+        }
+        BattleServerPacket::ResultConfirmed => {
             event.connection.disconnect();
 
             std::thread::sleep(RECONNECT_DELAY);
@@ -431,7 +459,9 @@ fn lobby_client_connect_handler(
 fn battle_client_connect_handler(
     connection: On<ConnectionEstablishEvent<BattleConfig>>,
     mut timeout: ResMut<ClientKeepAliveTimeout>,
+    mut result_received: ResMut<BattleResultReceived>,
 ) -> Result {
+    result_received.0 = false;
     timeout.refresh();
     connection
         .connection
@@ -520,8 +550,65 @@ fn battle_server_keepalive_handler(
     mut keepalive: ResMut<ServerKeepAliveTimers<BattleConfig>>,
 ) {
     let event = packet.event();
-    if event.packet == BattleClientPacket::KeepAlive {
-        println!("KeepAlive from {:?}", event.connection.id());
-        keepalive.refresh(event.connection.id());
+    // Play and result acknowledgements also prove the client is still active.
+    keepalive.refresh(event.connection.id());
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use bevy_slinet::server::ServerAddress;
+    use std::net::UdpSocket;
+    use std::time::Instant;
+
+    #[test]
+    fn battle_result_exchange_survives_lost_replies() {
+        let mut app = App::new();
+        app.add_plugins(ServerPlugin::<BattleConfig>::bind("127.0.0.1:0"));
+        app.add_observer(battle_server_packet_handler);
+        app.update();
+        let address = app
+            .world()
+            .resource::<ServerAddress<BattleConfig>>()
+            .address();
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.connect(address).unwrap();
+        socket.set_nonblocking(true).unwrap();
+
+        // Discard the first result and the first confirmation, just as if UDP
+        // lost them. Repeating each request must yield the same response.
+        for (request, expected) in [
+            (BattleClientPacket::Play, BattleServerPacket::YouWon),
+            (BattleClientPacket::Play, BattleServerPacket::YouWon),
+            (
+                BattleClientPacket::ResultReceived,
+                BattleServerPacket::ResultConfirmed,
+            ),
+            (
+                BattleClientPacket::ResultReceived,
+                BattleServerPacket::ResultConfirmed,
+            ),
+        ] {
+            socket.send(&bitcode::encode(&request)).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut buffer = [0; 1200];
+            loop {
+                app.update();
+                match socket.recv(&mut buffer) {
+                    Ok(len) => {
+                        assert_eq!(
+                            bitcode::decode::<BattleServerPacket>(buffer.get(..len).unwrap())
+                                .unwrap(),
+                            expected
+                        );
+                        break;
+                    }
+                    Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock),
+                }
+                assert!(Instant::now() < deadline, "battle reply was not delivered");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
     }
 }
