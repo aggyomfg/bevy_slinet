@@ -66,3 +66,8 @@ Rejected connection requests emit a client `DisconnectionEvent` with no connecti
 ID and `ReceiveError::NoConnection`: `WouldBlock` when the request queue is full,
 or `BrokenPipe` when its worker has stopped. The notification comes from the
 request observer, independently of the network lifecycle queue.
+
+Server establishment tasks are capped at `receive_capacity.max(1)`, in addition
+to the bounded incoming channels. Excess accepted peers are dropped before
+creating their serializer or task. TCP peers observe closure; UDP sends no reply.
+The listener keeps polling so existing UDP peers continue receiving under load.

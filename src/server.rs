@@ -256,20 +256,33 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
         };
         let _ = bound_tx.send(listener.address());
         let mut warned = false;
+        // Do not pause UDP acceptance: accept() also dispatches existing peers.
+        // Reject excess new peers before allocating a serializer or spawning work.
+        let pending = Arc::new(tokio::sync::Semaphore::new(queues.receive_capacity.max(1)));
         loop {
             select! {
                 Ok(stream) = listener.accept() => {
+                    let Ok(permit) = Arc::clone(&pending).try_acquire_owned() else {
+                        drop(stream);
+                        continue;
+                    };
                     log::debug!("Accepting a connection from {:?}", stream.peer_addr());
                     let serializer = Config::build_serializer();
                     serializer.warn_if_stateful_over_datagrams::<Config::Protocol>(&mut warned);
-                    tokio::spawn(ConnectedTransport::<Config>::establish(
-                        stream,
-                        Arc::new(serializer),
-                        queues,
-                        limits.clone(),
-                        lifecycle.clone(),
-                        connection_sender.clone(),
-                    ));
+                    let limits = limits.clone();
+                    let lifecycle = lifecycle.clone();
+                    let connection_sender = connection_sender.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        ConnectedTransport::<Config>::establish(
+                            stream,
+                            Arc::new(serializer),
+                            queues,
+                            limits,
+                            lifecycle,
+                            connection_sender,
+                        ).await;
+                    });
                 }
                 Some(addr) = incoming_disconnects.recv() => {
                     listener.handle_disconnection(addr);

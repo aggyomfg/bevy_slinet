@@ -226,12 +226,12 @@ fn tcp_eof_follows_all_buffered_packets() {
     );
     server.add_observer(
         |_: On<server::PacketReceiveEvent<TcpConfig>>, mut order: ResMut<EventOrder>| {
-            order.0.push("packet")
+            order.0.push("packet");
         },
     );
     server.add_observer(
         |_: On<server::DisconnectionEvent<TcpConfig>>, mut order: ResMut<EventOrder>| {
-            order.0.push("close")
+            order.0.push("close");
         },
     );
     server.update();
@@ -260,3 +260,39 @@ fn tcp_eof_follows_all_buffered_packets() {
         ["open", "packet", "packet", "packet", "close"]
     );
 }
+
+#[test]
+fn pending_accepts_are_bounded_while_ecs_is_paused() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static BUILT: AtomicUsize = AtomicUsize::new(0);
+    struct Counted;
+    impl ServerConfig for Counted {
+        type ClientPacket = Packet;
+        type ServerPacket = Packet;
+        type Protocol = TcpProtocol;
+        type EncodeError = bitcode::Error;
+        type DecodeError = bitcode::Error;
+        type LengthSerializer = LittleEndian<u32>;
+        fn build_serializer() -> SerializerAdapter<Packet, Packet, bitcode::Error, bitcode::Error> {
+            BUILT.fetch_add(1, Ordering::SeqCst);
+            SerializerAdapter::ReadOnly(Arc::new(BitcodeSerdeSerializer))
+        }
+    }
+    let mut app = App::new();
+    app.insert_resource(crate::connection::NetworkQueueSettings {
+        receive_capacity: 1,
+        events_per_frame: 1,
+        ..Default::default()
+    });
+    app.add_plugins(ServerPlugin::<Counted>::bind("127.0.0.1:0"));
+    app.update();
+    let addr = app.world().resource::<ServerAddress<Counted>>().address();
+    let sockets: Vec<_> = (0..32)
+        .map(|_| std::net::TcpStream::connect(addr).unwrap())
+        .collect();
+    wait_until(|| BUILT.load(Ordering::SeqCst) >= 1);
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(BUILT.load(Ordering::SeqCst) <= 2);
+    drop(sockets);
+}
+
