@@ -108,14 +108,13 @@ impl<T> LossySender<T> {
                 remaining_items -= 1;
                 remaining_bytes -= old_bytes;
             }
-            while state.items.len() >= self.0.max_items || state.bytes > self.0.max_bytes - bytes {
-                if let Some((old, old_bytes)) = state.items.pop_front() {
-                    state.bytes -= old_bytes;
-                    evicted.push(old);
-                } else {
-                    break;
-                }
-            }
+            let evicted_count = state.items.len() - remaining_items;
+            evicted = state
+                .items
+                .drain(..evicted_count)
+                .map(|(old, _)| old)
+                .collect();
+            state.bytes = remaining_bytes;
         }
         if state.items.len() >= self.0.max_items || state.bytes > self.0.max_bytes - bytes {
             return Err(TrySendError::Full(value));

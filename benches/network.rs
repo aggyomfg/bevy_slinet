@@ -189,14 +189,14 @@ fn ecs(c: &mut Criterion) {
                     println!("delivery/{}/{scenario:?}/{budget}: {delivery:?}", $side);
                     group.bench_function(format!("{}/{scenario:?}/{budget}", $side), |b| {
                         b.iter_custom(|iters| {
-                            let mut elapsed = Duration::ZERO;
-                            for _ in 0..iters {
-                                fixture.enqueue();
-                                let started = Instant::now();
-                                black_box(fixture.drain());
-                                elapsed += started.elapsed();
-                            }
-                            elapsed
+                            (0..iters)
+                                .map(|_| {
+                                    fixture.enqueue();
+                                    let started = Instant::now();
+                                    black_box(fixture.drain());
+                                    started.elapsed()
+                                })
+                                .sum()
                         });
                     });
                 }};
@@ -215,14 +215,14 @@ fn ecs(c: &mut Criterion) {
         );
         group.bench_function(format!("udp_client_to_update/{budget}"), |b| {
             b.iter_custom(|iters| {
-                let mut elapsed = Duration::ZERO;
-                for _ in 0..iters {
-                    fixture.enqueue();
-                    let started = Instant::now();
-                    black_box(fixture.drain());
-                    elapsed += started.elapsed();
-                }
-                elapsed
+                (0..iters)
+                    .map(|_| {
+                        fixture.enqueue();
+                        let started = Instant::now();
+                        black_box(fixture.drain());
+                        started.elapsed()
+                    })
+                    .sum()
             });
         });
     }

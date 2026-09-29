@@ -84,21 +84,21 @@ impl Fixture {
             );
         configure_receive_systems::<Config>(&mut app);
         app.update(); // Initialize schedules outside measurements.
-        let mut connections = Vec::new();
-        let mut outgoing = Vec::new();
-        for _ in 0..peers {
-            let (packet_tx, rx) = settings.outgoing_channel(false);
-            outgoing.push(rx);
-            connections.push(EcsConnection {
-                disconnect_task: CancellationToken::new(),
-                id: ConnectionId::next(),
-                published: Arc::new(AtomicBool::new(false)),
-                packet_tx,
-                transport: (),
-                local_addr: ([127, 0, 0, 1], 1000).into(),
-                peer_addr: ([127, 0, 0, 1], 2000).into(),
-            });
-        }
+        let (connections, outgoing) = (0..peers)
+            .map(|_| {
+                let (packet_tx, rx) = settings.outgoing_channel(false);
+                let connection = EcsConnection {
+                    disconnect_task: CancellationToken::new(),
+                    id: ConnectionId::next(),
+                    published: Arc::new(AtomicBool::new(false)),
+                    packet_tx,
+                    transport: (),
+                    local_addr: ([127, 0, 0, 1], 1000).into(),
+                    peer_addr: ([127, 0, 0, 1], 2000).into(),
+                };
+                (connection, rx)
+            })
+            .unzip();
         let mut result = Self {
             app,
             sender,

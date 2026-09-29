@@ -8,7 +8,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use self::lossy::{lossy_channel, LossyReceiver, LossySender};
 
 #[cfg(any(feature = "client", feature = "server", feature = "protocol_udp", test))]
-pub(crate) mod lossy;
+pub mod lossy;
 
 use super::SendError;
 use crate::protocols::protocol::{QueueDropReason, TransportHandle};
@@ -270,9 +270,7 @@ impl<T, H: TransportHandle> PacketForwarder<T, H> {
         if self.datagram {
             match self.sender.try_send(packet, 1) {
                 Ok(evicted) => {
-                    for item in evicted {
-                        on_evict(item);
-                    }
+                    evicted.into_iter().for_each(on_evict);
                     true
                 }
                 Err(TrySendError::Closed(_)) => false,
