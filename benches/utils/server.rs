@@ -36,7 +36,7 @@ struct Counts(Delivery);
 
 pub struct Fixture {
     app: App,
-    sender: Sender<ServerLifecycle<Config>>,
+    incoming_sender: Sender<IncomingMessage<Config>>,
     connections: Vec<ServerConnection<Config>>,
     _outgoing: Vec<OutgoingReceiver<u64, ()>>,
     scenario: Scenario,
@@ -56,13 +56,10 @@ impl Fixture {
             events_per_frame: budget,
             ..Default::default()
         };
-        let (sender, receiver) = settings.incoming_channel();
-        let (_, packets) =
-            lossy_channel(1, usize::MAX, crate::connection::OverflowPolicy::DropNewest);
+        let (incoming_sender, incoming_receiver) = settings.incoming_channel();
         let mut app = App::new();
         app.insert_resource(settings)
-            .insert_resource(LifecycleReceiver::<Config>(receiver))
-            .insert_resource(PacketReceiver::<Config> { receiver: packets })
+            .insert_resource(IncomingReceiver::<Config>(incoming_receiver))
             .insert_resource(ServerConnections::<Config>::new())
             .init_resource::<Counts>()
             .add_observer(
@@ -101,7 +98,7 @@ impl Fixture {
             .unzip();
         let mut result = Self {
             app,
-            sender,
+            incoming_sender,
             connections,
             _outgoing: outgoing,
             scenario,
@@ -119,8 +116,8 @@ impl Fixture {
     }
     fn establish(&self, connection: &ServerConnection<Config>) {
         assert!(self
-            .sender
-            .try_send(ServerLifecycle::Established(NewConnectionEvent {
+            .incoming_sender
+            .try_send(IncomingMessage::Established(NewConnectionEvent {
                 address: connection.peer_addr(),
                 connection: connection.clone()
             }))
@@ -135,8 +132,8 @@ impl Fixture {
             }
             for packet in 0..self.packets_per_connection {
                 assert!(self
-                    .sender
-                    .try_send(ServerLifecycle::Packet(PacketReceiveEvent {
+                    .incoming_sender
+                    .try_send(IncomingMessage::StreamPacket(PacketReceiveEvent {
                         connection: connection.clone(),
                         packet: packet as u64,
                         received_at: Instant::now(),
@@ -148,7 +145,10 @@ impl Fixture {
                     error: ReceiveError::IntentionalDisconnection,
                     connection: connection.clone(),
                 };
-                assert!(self.sender.try_send(ServerLifecycle::Closed(event)).is_ok());
+                assert!(self
+                    .incoming_sender
+                    .try_send(IncomingMessage::Closed(event))
+                    .is_ok());
             }
         }
     }

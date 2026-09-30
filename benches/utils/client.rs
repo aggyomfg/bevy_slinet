@@ -38,10 +38,10 @@ struct UpdatePackets(usize);
 
 pub struct Fixture<P: Protocol = TcpProtocol> {
     app: App,
-    sender: Sender<ClientLifecycle<Config<P>>>,
+    incoming_sender: Sender<IncomingMessage<Config<P>>>,
     connections: Vec<ClientConnection<Config<P>>>,
     _outgoing: Vec<OutgoingReceiver<u64, P::Handle>>,
-    packets: LossySender<PacketReceiveEvent<Config<P>>>,
+    datagram_packets: LossySender<PacketReceiveEvent<Config<P>>>,
     scenario: Scenario,
     packets_per_connection: usize,
 }
@@ -82,8 +82,8 @@ impl<P: Protocol> Fixture<P> {
             events_per_frame: budget,
             ..Default::default()
         };
-        let (sender, receiver) = settings.incoming_channel();
-        let (packet_sender, packets) = lossy_channel(
+        let (incoming_sender, incoming_receiver) = settings.incoming_channel();
+        let (datagram_packet_sender, datagram_packet_receiver) = lossy_channel(
             if P::DATAGRAM {
                 peers * packets_per_connection
             } else {
@@ -94,8 +94,7 @@ impl<P: Protocol> Fixture<P> {
         );
         let mut app = App::new();
         app.insert_resource(settings)
-            .insert_resource(LifecycleReceiver::<Config<P>>(receiver))
-            .insert_resource(PacketReceiver::<Config<P>> { receiver: packets })
+            .insert_resource(IncomingReceiver::<Config<P>>(incoming_receiver))
             .insert_resource(ClientConnections::<Config<P>>::new())
             .init_resource::<Counts>()
             .add_observer(
@@ -115,6 +114,11 @@ impl<P: Protocol> Fixture<P> {
                     counts.0.last_close_frame = counts.0.frames;
                 },
             );
+        if P::DATAGRAM {
+            app.insert_resource(DatagramPacketReceiver::<Config<P>> {
+                receiver: datagram_packet_receiver,
+            });
+        }
         configure_receive_systems::<Config<P>>(&mut app);
         if P::DATAGRAM {
             app.init_resource::<UpdatePackets>().add_systems(
@@ -142,8 +146,8 @@ impl<P: Protocol> Fixture<P> {
             .unzip();
         let mut result = Self {
             app,
-            sender,
-            packets: packet_sender,
+            incoming_sender,
+            datagram_packets: datagram_packet_sender,
             connections,
             _outgoing: outgoing,
             scenario,
@@ -161,8 +165,8 @@ impl<P: Protocol> Fixture<P> {
     }
     fn establish(&self, connection: &ClientConnection<Config<P>>) {
         assert!(self
-            .sender
-            .try_send(ClientLifecycle::Established(ConnectionEstablishEvent {
+            .incoming_sender
+            .try_send(IncomingMessage::Established(ConnectionEstablishEvent {
                 address: connection.peer_addr(),
                 connection: connection.clone()
             }))
@@ -185,9 +189,15 @@ impl<P: Protocol> Fixture<P> {
                     received_at: Instant::now(),
                 };
                 if P::DATAGRAM {
-                    assert!(self.packets.try_send(event, size_of::<u64>()).is_ok());
+                    assert!(self
+                        .datagram_packets
+                        .try_send(event, size_of::<u64>())
+                        .is_ok());
                 } else {
-                    assert!(self.sender.try_send(ClientLifecycle::Packet(event)).is_ok());
+                    assert!(self
+                        .incoming_sender
+                        .try_send(IncomingMessage::StreamPacket(event))
+                        .is_ok());
                 }
             }
             if matches!(self.scenario, Scenario::Interleaved) {
@@ -196,7 +206,10 @@ impl<P: Protocol> Fixture<P> {
                     connection.peer_addr(),
                     Some(connection.id()),
                 );
-                assert!(self.sender.try_send(ClientLifecycle::Closed(event)).is_ok());
+                assert!(self
+                    .incoming_sender
+                    .try_send(IncomingMessage::Closed(event))
+                    .is_ok());
             }
         }
     }

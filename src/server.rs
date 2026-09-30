@@ -158,9 +158,9 @@ fn configure_receive_systems<Config: ServerConfig>(app: &mut App) {
                 .in_set(SystemSets::ServerAcceptNewPackets),
         ),
     );
-    let lifecycle = lifecycle_system::<Config>.in_set(ServerSystems::<Config>::LIFECYCLE);
+    let incoming = incoming_system::<Config>.in_set(ServerSystems::<Config>::LIFECYCLE);
     if Config::Protocol::DATAGRAM {
-        // Flush lifecycle commands before looking for packets of published peers.
+        // Apply connection commands before looking for packets of published peers.
         // The dependency is local to this config, not every plugin of this role.
         app.configure_sets(
             PreUpdate,
@@ -169,16 +169,13 @@ fn configure_receive_systems<Config: ServerConfig>(app: &mut App) {
         .add_systems(
             PreUpdate,
             (
-                lifecycle,
-                accept_new_packets::<Config>.in_set(ServerSystems::<Config>::PACKETS),
+                incoming,
+                receive_datagram_packets::<Config>.in_set(ServerSystems::<Config>::PACKETS),
             ),
         );
     } else {
         // Streams keep establishment, packets and closure in one budgeted FIFO.
-        app.add_systems(
-            PreUpdate,
-            lifecycle.in_set(ServerSystems::<Config>::PACKETS),
-        );
+        app.add_systems(PreUpdate, incoming.in_set(ServerSystems::<Config>::PACKETS));
     }
 }
 
@@ -207,16 +204,16 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
 }
 
 #[derive(Resource)]
-struct LifecycleReceiver<Config: ServerConfig>(Receiver<ServerLifecycle<Config>>);
+struct IncomingReceiver<Config: ServerConfig>(Receiver<IncomingMessage<Config>>);
 
-enum ServerLifecycle<Config: ServerConfig> {
-    Packet(PacketReceiveEvent<Config>),
+enum IncomingMessage<Config: ServerConfig> {
+    StreamPacket(PacketReceiveEvent<Config>),
     Established(NewConnectionEvent<Config>),
     Closed(DisconnectionEvent<Config>),
 }
 
 #[derive(Resource)]
-struct PacketReceiver<Config: ServerConfig> {
+struct DatagramPacketReceiver<Config: ServerConfig> {
     receiver: LossyReceiver<PacketReceiveEvent<Config>>,
 }
 
@@ -241,39 +238,44 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
         queues: NetworkQueueSettings,
         limits: ReceiveLimits,
     ) {
-        let (lifecycle_tx, lifecycle_rx) = queues.incoming_channel();
+        let (incoming_tx, incoming_rx) = queues.incoming_channel();
         let (connection_sender, incoming_connections) = queues.incoming_channel();
-        let (pack_tx, pack_rx) = lossy_channel(
+        let (datagram_packet_tx, datagram_packet_rx) = lossy_channel(
             queues.receive_capacity.max(1),
             usize::MAX,
             queues.datagram_receive_overflow,
         );
         let (disconnect_sender, incoming_disconnects) = queues.incoming_channel();
-        commands.insert_resource(LifecycleReceiver::<Config>(lifecycle_rx));
-        commands.insert_resource(PacketReceiver::<Config> { receiver: pack_rx });
-        let (bound_tx, bound_rx) = std::sync::mpsc::sync_channel(1);
+        commands.insert_resource(IncomingReceiver::<Config>(incoming_rx));
+        if Config::Protocol::DATAGRAM {
+            commands.insert_resource(DatagramPacketReceiver::<Config> {
+                receiver: datagram_packet_rx,
+            });
+        }
+        // Wait for the listener's actual address before Startup completes.
+        let (listener_address_tx, listener_address_rx) = std::sync::mpsc::sync_channel(1);
 
         Self::run_async(move || async move {
             tokio::spawn(Self::process_connections(
                 incoming_connections,
-                pack_tx,
-                lifecycle_tx.clone(),
+                datagram_packet_tx,
+                incoming_tx.clone(),
                 disconnect_sender,
             ));
             Self::accept_connections(
                 address,
                 queues,
                 limits,
-                lifecycle_tx,
+                incoming_tx,
                 connection_sender,
                 incoming_disconnects,
-                bound_tx,
+                listener_address_tx,
             )
             .await;
         });
 
         // Clients may connect right after Startup, so the listener must exist by then.
-        if let Ok(local_addr) = bound_rx.recv() {
+        if let Ok(local_addr) = listener_address_rx.recv() {
             commands.insert_resource(ServerAddress::<Config> {
                 address: local_addr,
                 _marker: PhantomData,
@@ -305,10 +307,10 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
         address: SocketAddr,
         queues: NetworkQueueSettings,
         limits: ReceiveLimits,
-        lifecycle: Sender<ServerLifecycle<Config>>,
+        incoming: Sender<IncomingMessage<Config>>,
         connection_sender: Sender<ConnectedTransport<Config>>,
         mut incoming_disconnects: Receiver<SocketAddr>,
-        bound_tx: std::sync::mpsc::SyncSender<SocketAddr>,
+        listener_address_tx: std::sync::mpsc::SyncSender<SocketAddr>,
     ) {
         let listener = match Config::Protocol::bind(address).await {
             Ok(listener) => listener,
@@ -317,7 +319,7 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
                 return;
             }
         };
-        let _ = bound_tx.send(listener.address());
+        let _ = listener_address_tx.send(listener.address());
         let mut warned = false;
         // Do not pause UDP acceptance: accept() also dispatches existing peers.
         // Reject excess new peers before allocating a serializer or spawning work.
@@ -333,7 +335,7 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
                     let serializer = Config::build_serializer();
                     serializer.warn_if_stateful_over_datagrams::<Config::Protocol>(&mut warned);
                     let limits = limits.clone();
-                    let lifecycle = lifecycle.clone();
+                    let incoming = incoming.clone();
                     let connection_sender = connection_sender.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
@@ -342,7 +344,7 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
                             Arc::new(serializer),
                             queues,
                             limits,
-                            lifecycle,
+                            incoming,
                             connection_sender,
                         ).await;
                     });
@@ -357,15 +359,15 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
 
     async fn process_connections(
         mut incoming_connections: Receiver<ConnectedTransport<Config>>,
-        packets: LossySender<PacketReceiveEvent<Config>>,
-        lifecycle: Sender<ServerLifecycle<Config>>,
+        datagram_packets: LossySender<PacketReceiveEvent<Config>>,
+        incoming: Sender<IncomingMessage<Config>>,
         disconnect_sender: Sender<SocketAddr>,
     ) {
         while let Some(connection) = incoming_connections.recv().await {
             connection
                 .run(
-                    packets.clone(),
-                    lifecycle.clone(),
+                    datagram_packets.clone(),
+                    incoming.clone(),
                     disconnect_sender.clone(),
                 )
                 .await;
@@ -379,7 +381,7 @@ impl<Config: ServerConfig> ConnectedTransport<Config> {
         serializer: Arc<ServerSerializer<Config>>,
         queues: NetworkQueueSettings,
         limits: ReceiveLimits,
-        lifecycle: Sender<ServerLifecycle<Config>>,
+        incoming: Sender<IncomingMessage<Config>>,
         connection_sender: Sender<Self>,
     ) {
         let (tx, rx) = queues.outgoing_channel(Config::Protocol::DATAGRAM);
@@ -391,8 +393,8 @@ impl<Config: ServerConfig> ConnectedTransport<Config> {
             limits,
         );
         let ecs_conn = connection.ecs_connection(tx);
-        if let Err(err) = lifecycle
-            .send(ServerLifecycle::Established(NewConnectionEvent::<Config> {
+        if let Err(err) = incoming
+            .send(IncomingMessage::Established(NewConnectionEvent::<Config> {
                 address: ecs_conn.peer_addr,
                 connection: ecs_conn.clone(),
             }))
@@ -414,8 +416,8 @@ impl<Config: ServerConfig> ConnectedTransport<Config> {
 
     async fn run(
         self,
-        packets: LossySender<PacketReceiveEvent<Config>>,
-        lifecycle: Sender<ServerLifecycle<Config>>,
+        datagram_packets: LossySender<PacketReceiveEvent<Config>>,
+        incoming: Sender<IncomingMessage<Config>>,
         disconnect_sender: Sender<SocketAddr>,
     ) {
         let RawConnection {
@@ -432,8 +434,8 @@ impl<Config: ServerConfig> ConnectedTransport<Config> {
             Err(err) => {
                 log::error!("({:?}) Couldn't split stream: {}", id, err);
                 self.ecs_connection.disconnect_task.cancel();
-                let _ = lifecycle
-                    .send(ServerLifecycle::Closed(DisconnectionEvent {
+                let _ = incoming
+                    .send(IncomingMessage::Closed(DisconnectionEvent {
                         error: ReceiveError::Io(err),
                         connection: self.ecs_connection,
                     }))
@@ -454,8 +456,8 @@ impl<Config: ServerConfig> ConnectedTransport<Config> {
                 receive_limits,
                 send_error: send_error_rx,
             },
-            packets,
-            lifecycle,
+            datagram_packets,
+            incoming,
             disconnect_sender,
         ));
         tokio::spawn(Self::send_packets(
@@ -478,8 +480,8 @@ impl<Config: ServerConfig> ConnectedTransport<Config> {
         mut read: impl PacketReader,
         ecs_conn: ServerConnection<Config>,
         state: ReceiveTaskState<ServerSerializer<Config>, Config::LengthSerializer>,
-        packets: LossySender<PacketReceiveEvent<Config>>,
-        lifecycle: Sender<ServerLifecycle<Config>>,
+        datagram_packets: LossySender<PacketReceiveEvent<Config>>,
+        incoming: Sender<IncomingMessage<Config>>,
         disconnect_sender: Sender<SocketAddr>,
     ) {
         let ReceiveTaskState {
@@ -494,8 +496,8 @@ impl<Config: ServerConfig> ConnectedTransport<Config> {
         let disconnect_task = &ecs_conn.disconnect_task;
         let id = ecs_conn.id();
         let _guard = disconnect_task.clone().drop_guard();
-        let packets = PacketForwarder::new(
-            packets,
+        let datagram_packets = PacketForwarder::new(
+            datagram_packets,
             Config::Protocol::DATAGRAM,
             disconnect_task.clone(),
             ecs_conn.transport().clone(),
@@ -515,14 +517,14 @@ impl<Config: ServerConfig> ConnectedTransport<Config> {
                                 received_at,
                             };
                             let forwarded = if Config::Protocol::DATAGRAM {
-                                packets.forward(event, |discarded| {
+                                datagram_packets.forward(event, |discarded| {
                                     discarded.connection.record_drop(QueueDropReason::ReceiveQueueEvicted);
                                 }).await
                             } else {
                                 tokio::select! {
                                     biased;
                                     () = disconnect_task.cancelled() => false,
-                                    result = lifecycle.send(ServerLifecycle::Packet(event)) => result.is_ok(),
+                                    result = incoming.send(IncomingMessage::StreamPacket(event)) => result.is_ok(),
                                 }
                             };
                             if !forwarded {
@@ -539,8 +541,8 @@ impl<Config: ServerConfig> ConnectedTransport<Config> {
         let error = send_error.try_recv().map_or(error, ReceiveError::Io);
         disconnect_task.cancel();
         read.close();
-        if let Err(err) = lifecycle
-            .send(ServerLifecycle::Closed(DisconnectionEvent::<Config> {
+        if let Err(err) = incoming
+            .send(IncomingMessage::Closed(DisconnectionEvent::<Config> {
                 error,
                 connection: ecs_conn.clone(),
             }))
@@ -649,8 +651,8 @@ pub struct PacketReceiveEvent<Config: ServerConfig> {
     pub received_at: Instant,
 }
 
-fn lifecycle_system<Config: ServerConfig>(
-    mut lifecycle: ResMut<LifecycleReceiver<Config>>,
+fn incoming_system<Config: ServerConfig>(
+    mut incoming: ResMut<IncomingReceiver<Config>>,
     queues: Option<Res<NetworkQueueSettings>>,
     settings: Option<Res<ServerSettings<Config>>>,
     mut commands: Commands,
@@ -658,8 +660,8 @@ fn lifecycle_system<Config: ServerConfig>(
     let budget = ServerSettings::<Config>::resolve_queues(settings.as_deref(), queues.as_deref())
         .events_per_frame;
     for _ in 0..budget {
-        match lifecycle.0.try_recv() {
-            Ok(ServerLifecycle::Established(event)) => {
+        match incoming.0.try_recv() {
+            Ok(IncomingMessage::Established(event)) => {
                 // Registry changes and observers share the same command order as packets.
                 commands.queue(move |world: &mut World| {
                     world
@@ -669,8 +671,8 @@ fn lifecycle_system<Config: ServerConfig>(
                     world.trigger(event);
                 });
             }
-            Ok(ServerLifecycle::Packet(packet)) => commands.trigger(packet),
-            Ok(ServerLifecycle::Closed(closed)) => {
+            Ok(IncomingMessage::StreamPacket(packet)) => commands.trigger(packet),
+            Ok(IncomingMessage::Closed(closed)) => {
                 commands.queue(move |world: &mut World| {
                     world
                         .resource_mut::<ServerConnections<Config>>()
@@ -683,8 +685,8 @@ fn lifecycle_system<Config: ServerConfig>(
     }
 }
 
-fn accept_new_packets<Config: ServerConfig>(
-    mut packets: ResMut<PacketReceiver<Config>>,
+fn receive_datagram_packets<Config: ServerConfig>(
+    mut datagram_packets: ResMut<DatagramPacketReceiver<Config>>,
     queues: Option<Res<NetworkQueueSettings>>,
     settings: Option<Res<ServerSettings<Config>>>,
     mut commands: Commands,
@@ -695,7 +697,7 @@ fn accept_new_packets<Config: ServerConfig>(
         return;
     }
     for _ in 0..budget {
-        let next = packets.receiver.try_recv_if(|packet| {
+        let next = datagram_packets.receiver.try_recv_if(|packet| {
             packet.connection.is_published()
                 || (Config::Protocol::DATAGRAM && packet.connection.disconnect_task.is_cancelled())
         });
@@ -755,7 +757,7 @@ mod udp_lifecycle_tests {
             events_per_frame: 1,
             ..Default::default()
         };
-        let (lifecycle_tx, lifecycle_rx) = settings.incoming_channel();
+        let (incoming_tx, incoming_rx) = settings.incoming_channel();
         let (packet_tx, packet_rx) = lossy_channel(1, usize::MAX, OverflowPolicy::DropNewest);
         let (outgoing, _rx) = settings.outgoing_channel::<_, UdpConnectionHandle>(true);
         let udp = UdpConnectionHandle::new(128, None);
@@ -769,14 +771,14 @@ mod udp_lifecycle_tests {
             local_addr: address,
             peer_addr: address,
         };
-        assert!(lifecycle_tx
-            .try_send(ServerLifecycle::Established(NewConnectionEvent {
+        assert!(incoming_tx
+            .try_send(IncomingMessage::Established(NewConnectionEvent {
                 address,
                 connection: connection.clone(),
             }))
             .is_ok());
-        assert!(lifecycle_tx
-            .try_send(ServerLifecycle::Closed(DisconnectionEvent {
+        assert!(incoming_tx
+            .try_send(IncomingMessage::Closed(DisconnectionEvent {
                 error: ReceiveError::IntentionalDisconnection,
                 connection: connection.clone(),
             }))
@@ -796,8 +798,8 @@ mod udp_lifecycle_tests {
         let mut app = App::new();
         app.insert_resource(settings);
         app.insert_resource(ServerConnections::<Config>::new());
-        app.insert_resource(LifecycleReceiver::<Config>(lifecycle_rx));
-        app.insert_resource(PacketReceiver::<Config> {
+        app.insert_resource(IncomingReceiver::<Config>(incoming_rx));
+        app.insert_resource(DatagramPacketReceiver::<Config> {
             receiver: packet_rx,
         });
         app.insert_resource(PacketEvents::default());

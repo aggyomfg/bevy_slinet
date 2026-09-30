@@ -167,9 +167,9 @@ fn configure_receive_systems<Config: ClientConfig>(app: &mut App) {
                 .in_set(SystemSets::ClientPacketReceive),
         ),
     );
-    let lifecycle = lifecycle_system::<Config>.in_set(ClientSystems::<Config>::LIFECYCLE);
+    let incoming = incoming_system::<Config>.in_set(ClientSystems::<Config>::LIFECYCLE);
     if Config::Protocol::DATAGRAM {
-        // Flush lifecycle commands before looking for packets of published peers.
+        // Apply connection commands before looking for packets of published peers.
         // The dependency is local to this config, not every plugin of this role.
         app.configure_sets(
             PreUpdate,
@@ -178,16 +178,13 @@ fn configure_receive_systems<Config: ClientConfig>(app: &mut App) {
         .add_systems(
             PreUpdate,
             (
-                lifecycle,
-                packet_receive_system::<Config>.in_set(ClientSystems::<Config>::PACKETS),
+                incoming,
+                receive_datagram_packets::<Config>.in_set(ClientSystems::<Config>::PACKETS),
             ),
         );
     } else {
         // Streams keep establishment, packets and closure in one budgeted FIFO.
-        app.add_systems(
-            PreUpdate,
-            lifecycle.in_set(ClientSystems::<Config>::PACKETS),
-        );
+        app.add_systems(PreUpdate, incoming.in_set(ClientSystems::<Config>::PACKETS));
     }
 }
 
@@ -270,16 +267,16 @@ impl<Config: ClientConfig> Clone for ConnectionRequestEvent<Config> {
 struct ConnectionRequestSender<Config: ClientConfig>(Sender<SocketAddr>, PhantomData<Config>);
 
 #[derive(Resource)]
-struct LifecycleReceiver<Config: ClientConfig>(Receiver<ClientLifecycle<Config>>);
+struct IncomingReceiver<Config: ClientConfig>(Receiver<IncomingMessage<Config>>);
 
-enum ClientLifecycle<Config: ClientConfig> {
-    Packet(PacketReceiveEvent<Config>),
+enum IncomingMessage<Config: ClientConfig> {
+    StreamPacket(PacketReceiveEvent<Config>),
     Established(ConnectionEstablishEvent<Config>),
     Closed(ConnectionClosed<Config>),
 }
 
 #[derive(Resource)]
-struct PacketReceiver<Config: ClientConfig> {
+struct DatagramPacketReceiver<Config: ClientConfig> {
     receiver: LossyReceiver<PacketReceiveEvent<Config>>,
 }
 
@@ -326,44 +323,51 @@ impl<Config: ClientConfig> ClientPlugin<Config> {
     }
 
     fn setup(mut commands: Commands, queues: NetworkQueueSettings, limits: ReceiveLimits) {
-        let (req_tx, req_rx) = queues.incoming_channel();
-        commands.insert_resource(ConnectionRequestSender::<Config>(req_tx, PhantomData));
+        let (connection_request_tx, connection_request_rx) = queues.incoming_channel();
+        commands.insert_resource(ConnectionRequestSender::<Config>(
+            connection_request_tx,
+            PhantomData,
+        ));
 
-        let (lifecycle_tx, lifecycle_rx) = queues.incoming_channel();
+        let (incoming_tx, incoming_rx) = queues.incoming_channel();
         let (connection_sender, incoming_connections) = queues.incoming_channel();
-        let (pack_tx, pack_rx) = lossy_channel(
+        let (datagram_packet_tx, datagram_packet_rx) = lossy_channel(
             queues.receive_capacity.max(1),
             usize::MAX,
             queues.datagram_receive_overflow,
         );
-        commands.insert_resource(LifecycleReceiver::<Config>(lifecycle_rx));
-        commands.insert_resource(PacketReceiver::<Config> { receiver: pack_rx });
+        commands.insert_resource(IncomingReceiver::<Config>(incoming_rx));
+        if Config::Protocol::DATAGRAM {
+            commands.insert_resource(DatagramPacketReceiver::<Config> {
+                receiver: datagram_packet_rx,
+            });
+        }
         commands.add_observer(ConnectionRequestSender::<Config>::observe);
 
         Self::run_async(Self::process_connection_requests(
-            req_rx,
+            connection_request_rx,
             queues,
             limits,
-            lifecycle_tx.clone(),
+            incoming_tx.clone(),
             connection_sender,
         ));
         Self::run_async(Self::process_connections(
             incoming_connections,
-            pack_tx,
-            lifecycle_tx,
+            datagram_packet_tx,
+            incoming_tx,
         ));
     }
 
     async fn process_connection_requests(
-        req_rx: Receiver<SocketAddr>,
+        connection_request_rx: Receiver<SocketAddr>,
         queues: NetworkQueueSettings,
         limits: ReceiveLimits,
-        lifecycle: Sender<ClientLifecycle<Config>>,
+        incoming: Sender<IncomingMessage<Config>>,
         connection_sender: Sender<ConnectedTransport<Config>>,
     ) {
         let mut warned = false;
         // Bound in-flight connection attempts while allowing other endpoints to connect.
-        let requests = futures::stream::unfold(req_rx, |mut requests| async move {
+        let requests = futures::stream::unfold(connection_request_rx, |mut requests| async move {
             requests.recv().await.map(|address| (address, requests))
         });
         let connections = requests
@@ -391,7 +395,7 @@ impl<Config: ClientConfig> ClientPlugin<Config> {
             .buffer_unordered(8);
         futures::pin_mut!(connections);
         while let Some(attempt) = connections.next().await {
-            if !attempt.publish(&lifecycle, &connection_sender).await {
+            if !attempt.publish(&incoming, &connection_sender).await {
                 return;
             }
         }
@@ -399,11 +403,13 @@ impl<Config: ClientConfig> ClientPlugin<Config> {
 
     async fn process_connections(
         mut incoming_connections: Receiver<ConnectedTransport<Config>>,
-        packets: LossySender<PacketReceiveEvent<Config>>,
-        lifecycle: Sender<ClientLifecycle<Config>>,
+        datagram_packets: LossySender<PacketReceiveEvent<Config>>,
+        incoming: Sender<IncomingMessage<Config>>,
     ) {
         while let Some(connection) = incoming_connections.recv().await {
-            connection.run(packets.clone(), lifecycle.clone()).await;
+            connection
+                .run(datagram_packets.clone(), incoming.clone())
+                .await;
         }
     }
 
@@ -428,7 +434,7 @@ impl<Config: ClientConfig> ConnectionAttempt<Config> {
     /// Returns false when the establishment receiver has closed and requests must stop.
     async fn publish(
         self,
-        lifecycle: &Sender<ClientLifecycle<Config>>,
+        incoming: &Sender<IncomingMessage<Config>>,
         connection_sender: &Sender<ConnectedTransport<Config>>,
     ) -> bool {
         let Self {
@@ -439,8 +445,8 @@ impl<Config: ClientConfig> ConnectionAttempt<Config> {
         match result {
             Ok(connection) => {
                 let ecs_conn = connection.ecs_connection(packets);
-                if let Err(err) = lifecycle
-                    .send(ClientLifecycle::Established(ConnectionEstablishEvent::<
+                if let Err(err) = incoming
+                    .send(IncomingMessage::Established(ConnectionEstablishEvent::<
                         Config,
                     > {
                         address,
@@ -463,8 +469,8 @@ impl<Config: ClientConfig> ConnectionAttempt<Config> {
             }
             Err(err) => {
                 log::warn!("Couldn't connect to server: {err:?}");
-                if let Err(send_err) = lifecycle
-                    .send(ClientLifecycle::Closed(ConnectionClosed::<Config>::new(
+                if let Err(send_err) = incoming
+                    .send(IncomingMessage::Closed(ConnectionClosed::<Config>::new(
                         ReceiveError::NoConnection(err),
                         address,
                         None,
@@ -482,8 +488,8 @@ impl<Config: ClientConfig> ConnectionAttempt<Config> {
 impl<Config: ClientConfig> ConnectedTransport<Config> {
     async fn run(
         self,
-        packets: LossySender<PacketReceiveEvent<Config>>,
-        lifecycle: Sender<ClientLifecycle<Config>>,
+        datagram_packets: LossySender<PacketReceiveEvent<Config>>,
+        incoming: Sender<IncomingMessage<Config>>,
     ) {
         let RawConnection {
             disconnect_task,
@@ -500,8 +506,8 @@ impl<Config: ClientConfig> ConnectedTransport<Config> {
             Err(err) => {
                 log::error!("({:?}) Couldn't split stream: {}", id, err);
                 self.ecs_connection.disconnect_task.cancel();
-                let _ = lifecycle
-                    .send(ClientLifecycle::Closed(ConnectionClosed::new(
+                let _ = incoming
+                    .send(IncomingMessage::Closed(ConnectionClosed::new(
                         ReceiveError::Io(err),
                         peer_addr,
                         Some(id),
@@ -523,8 +529,8 @@ impl<Config: ClientConfig> ConnectedTransport<Config> {
                 receive_limits,
                 send_error: send_error_rx,
             },
-            packets,
-            lifecycle,
+            datagram_packets,
+            incoming,
             peer_addr,
         ));
         tokio::spawn(Self::send_packets(
@@ -547,8 +553,8 @@ impl<Config: ClientConfig> ConnectedTransport<Config> {
         mut read: impl PacketReader,
         ecs_conn: ClientConnection<Config>,
         state: ReceiveTaskState<ClientSerializer<Config>, Config::LengthSerializer>,
-        packets: LossySender<PacketReceiveEvent<Config>>,
-        lifecycle: Sender<ClientLifecycle<Config>>,
+        datagram_packets: LossySender<PacketReceiveEvent<Config>>,
+        incoming: Sender<IncomingMessage<Config>>,
         peer_addr: SocketAddr,
     ) {
         let ReceiveTaskState {
@@ -563,8 +569,8 @@ impl<Config: ClientConfig> ConnectedTransport<Config> {
         let disconnect_task = &ecs_conn.disconnect_task;
         let id = ecs_conn.id();
         let _guard = disconnect_task.clone().drop_guard();
-        let packets = PacketForwarder::new(
-            packets,
+        let datagram_packets = PacketForwarder::new(
+            datagram_packets,
             Config::Protocol::DATAGRAM,
             disconnect_task.clone(),
             ecs_conn.transport().clone(),
@@ -584,14 +590,14 @@ impl<Config: ClientConfig> ConnectedTransport<Config> {
                                 received_at,
                             };
                             let forwarded = if Config::Protocol::DATAGRAM {
-                                packets.forward(event, |discarded| {
+                                datagram_packets.forward(event, |discarded| {
                                     discarded.connection.record_drop(QueueDropReason::ReceiveQueueEvicted);
                                 }).await
                             } else {
                                 tokio::select! {
                                     biased;
                                     () = disconnect_task.cancelled() => false,
-                                    result = lifecycle.send(ClientLifecycle::Packet(event)) => result.is_ok(),
+                                    result = incoming.send(IncomingMessage::StreamPacket(event)) => result.is_ok(),
                                 }
                             };
                             if !forwarded {
@@ -608,8 +614,8 @@ impl<Config: ClientConfig> ConnectedTransport<Config> {
         let error = send_error.try_recv().map_or(error, ReceiveError::Io);
         disconnect_task.cancel();
         read.close();
-        if let Err(err) = lifecycle
-            .send(ClientLifecycle::Closed(ConnectionClosed::<Config>::new(
+        if let Err(err) = incoming
+            .send(IncomingMessage::Closed(ConnectionClosed::<Config>::new(
                 error,
                 peer_addr,
                 Some(id),
@@ -687,8 +693,8 @@ impl<Config: ClientConfig> ConnectionRequestSender<Config> {
     }
 }
 
-fn packet_receive_system<Config: ClientConfig>(
-    mut packets: ResMut<PacketReceiver<Config>>,
+fn receive_datagram_packets<Config: ClientConfig>(
+    mut datagram_packets: ResMut<DatagramPacketReceiver<Config>>,
     queues: Option<Res<NetworkQueueSettings>>,
     settings: Option<Res<ClientSettings<Config>>>,
     mut commands: Commands,
@@ -699,7 +705,7 @@ fn packet_receive_system<Config: ClientConfig>(
         return;
     }
     for _ in 0..budget {
-        let next = packets.receiver.try_recv_if(|packet| {
+        let next = datagram_packets.receiver.try_recv_if(|packet| {
             packet.connection.is_published()
                 || (Config::Protocol::DATAGRAM && packet.connection.disconnect_task.is_cancelled())
         });
@@ -726,8 +732,8 @@ fn packet_receive_system<Config: ClientConfig>(
     }
 }
 
-fn lifecycle_system<Config: ClientConfig>(
-    mut lifecycle: ResMut<LifecycleReceiver<Config>>,
+fn incoming_system<Config: ClientConfig>(
+    mut incoming: ResMut<IncomingReceiver<Config>>,
     queues: Option<Res<NetworkQueueSettings>>,
     settings: Option<Res<ClientSettings<Config>>>,
     mut commands: Commands,
@@ -735,8 +741,8 @@ fn lifecycle_system<Config: ClientConfig>(
     let budget = ClientSettings::<Config>::resolve_queues(settings.as_deref(), queues.as_deref())
         .events_per_frame;
     for _ in 0..budget {
-        match lifecycle.0.try_recv() {
-            Ok(ClientLifecycle::Established(event)) => {
+        match incoming.0.try_recv() {
+            Ok(IncomingMessage::Established(event)) => {
                 // Registry changes and observers share the same command order as packets.
                 commands.queue(move |world: &mut World| {
                     world.insert_resource(event.connection.clone());
@@ -747,8 +753,8 @@ fn lifecycle_system<Config: ClientConfig>(
                     world.trigger(event);
                 });
             }
-            Ok(ClientLifecycle::Packet(packet)) => commands.trigger(packet),
-            Ok(ClientLifecycle::Closed(closed)) => {
+            Ok(IncomingMessage::StreamPacket(packet)) => commands.trigger(packet),
+            Ok(IncomingMessage::Closed(closed)) => {
                 commands.queue(move |world: &mut World| {
                     if let Some(id) = closed.id {
                         world.remove_resource::<ClientConnection<Config>>();
@@ -914,7 +920,7 @@ mod udp_lifecycle_tests {
             events_per_frame: 1,
             ..Default::default()
         };
-        let (lifecycle_tx, lifecycle_rx) = settings.incoming_channel();
+        let (incoming_tx, incoming_rx) = settings.incoming_channel();
         let (packet_tx, packet_rx) = lossy_channel(1, usize::MAX, OverflowPolicy::DropNewest);
         let (outgoing, _rx) = settings.outgoing_channel::<_, UdpConnectionHandle>(true);
         let udp = UdpConnectionHandle::new(128, None);
@@ -928,14 +934,14 @@ mod udp_lifecycle_tests {
             local_addr: address,
             peer_addr: address,
         };
-        assert!(lifecycle_tx
-            .try_send(ClientLifecycle::Established(ConnectionEstablishEvent {
+        assert!(incoming_tx
+            .try_send(IncomingMessage::Established(ConnectionEstablishEvent {
                 address,
                 connection: connection.clone(),
             }))
             .is_ok());
-        assert!(lifecycle_tx
-            .try_send(ClientLifecycle::Closed(ConnectionClosed::new(
+        assert!(incoming_tx
+            .try_send(IncomingMessage::Closed(ConnectionClosed::new(
                 ReceiveError::IntentionalDisconnection,
                 address,
                 Some(connection.id()),
@@ -956,8 +962,8 @@ mod udp_lifecycle_tests {
         let mut app = App::new();
         app.insert_resource(settings);
         app.insert_resource(ClientConnections::<Config>::new());
-        app.insert_resource(LifecycleReceiver::<Config>(lifecycle_rx));
-        app.insert_resource(PacketReceiver::<Config> {
+        app.insert_resource(IncomingReceiver::<Config>(incoming_rx));
+        app.insert_resource(DatagramPacketReceiver::<Config> {
             receiver: packet_rx,
         });
         app.insert_resource(PacketEvents::default());
@@ -997,7 +1003,7 @@ mod udp_lifecycle_tests {
     #[test]
     fn udp_packets_and_establishment_are_visible_in_update() {
         let settings = NetworkQueueSettings::default();
-        let (lifecycle_tx, lifecycle_rx) = settings.incoming_channel();
+        let (incoming_tx, incoming_rx) = settings.incoming_channel();
         let (packet_tx, packet_rx) = lossy_channel(1, usize::MAX, OverflowPolicy::DropNewest);
         let (outgoing, _rx) = settings.outgoing_channel::<_, UdpConnectionHandle>(true);
         let address = ([127, 0, 0, 1], 1234).into();
@@ -1010,8 +1016,8 @@ mod udp_lifecycle_tests {
             local_addr: address,
             peer_addr: address,
         };
-        assert!(lifecycle_tx
-            .try_send(ClientLifecycle::Established(ConnectionEstablishEvent {
+        assert!(incoming_tx
+            .try_send(IncomingMessage::Established(ConnectionEstablishEvent {
                 address,
                 connection: connection.clone(),
             }))
@@ -1028,8 +1034,8 @@ mod udp_lifecycle_tests {
             .is_ok());
         let mut app = App::new();
         app.insert_resource(ClientConnections::<Config>::new())
-            .insert_resource(LifecycleReceiver::<Config>(lifecycle_rx))
-            .insert_resource(PacketReceiver::<Config> {
+            .insert_resource(IncomingReceiver::<Config>(incoming_rx))
+            .insert_resource(DatagramPacketReceiver::<Config> {
                 receiver: packet_rx,
             })
             .init_resource::<PacketEvents>()
@@ -1110,7 +1116,7 @@ mod udp_lifecycle_tests {
             events_per_frame: 2,
             ..Default::default()
         };
-        let (lifecycle_tx, lifecycle_rx) = settings.incoming_channel();
+        let (incoming_tx, incoming_rx) = settings.incoming_channel();
         let (packet_tx, packet_rx) = lossy_channel(2, usize::MAX, OverflowPolicy::DropNewest);
         let (outgoing, _rx) = settings.outgoing_channel::<_, UdpConnectionHandle>(true);
         let udp = UdpConnectionHandle::new(128, None);
@@ -1124,8 +1130,8 @@ mod udp_lifecycle_tests {
             local_addr: address,
             peer_addr: address,
         };
-        assert!(lifecycle_tx
-            .try_send(ClientLifecycle::Established(ConnectionEstablishEvent {
+        assert!(incoming_tx
+            .try_send(IncomingMessage::Established(ConnectionEstablishEvent {
                 address,
                 connection: connection.clone(),
             }))
@@ -1146,8 +1152,8 @@ mod udp_lifecycle_tests {
         let mut app = App::new();
         app.insert_resource(settings);
         app.insert_resource(ClientConnections::<Config>::new());
-        app.insert_resource(LifecycleReceiver::<Config>(lifecycle_rx));
-        app.insert_resource(PacketReceiver::<Config> {
+        app.insert_resource(IncomingReceiver::<Config>(incoming_rx));
+        app.insert_resource(DatagramPacketReceiver::<Config> {
             receiver: packet_rx,
         });
         app.insert_resource(PacketEvents::default());
@@ -1167,7 +1173,6 @@ mod udp_lifecycle_tests {
 #[cfg(all(test, feature = "protocol_tcp", feature = "serializer_bitcode_serde"))]
 mod tcp_lifecycle_tests {
     use super::*;
-    use crate::connection::lossy_channel;
     use crate::protocols::tcp::TcpProtocol;
     use crate::serializers::bitcode_serde::BitcodeSerdeSerializer;
     use crate::serializers::packet_length_serializer::LittleEndian;
@@ -1196,9 +1201,7 @@ mod tcp_lifecycle_tests {
             events_per_frame: 2,
             ..Default::default()
         };
-        let (lifecycle_tx, lifecycle_rx) = settings.incoming_channel();
-        let (_packet_tx, packet_rx) =
-            lossy_channel(2, usize::MAX, settings.datagram_receive_overflow);
+        let (incoming_tx, incoming_rx) = settings.incoming_channel();
         let (outgoing, _rx) = settings.outgoing_channel::<_, ()>(false);
         let address: SocketAddr = "127.0.0.1:1234".parse().unwrap();
         let connection = EcsConnection {
@@ -1210,21 +1213,21 @@ mod tcp_lifecycle_tests {
             local_addr: address,
             peer_addr: address,
         };
-        assert!(lifecycle_tx
-            .try_send(ClientLifecycle::Established(ConnectionEstablishEvent {
+        assert!(incoming_tx
+            .try_send(IncomingMessage::Established(ConnectionEstablishEvent {
                 address,
                 connection: connection.clone(),
             }))
             .is_ok());
-        assert!(lifecycle_tx
-            .try_send(ClientLifecycle::Packet(PacketReceiveEvent {
+        assert!(incoming_tx
+            .try_send(IncomingMessage::StreamPacket(PacketReceiveEvent {
                 connection: connection.clone(),
                 packet: 9,
                 received_at: Instant::now(),
             }))
             .is_ok());
-        assert!(lifecycle_tx
-            .try_send(ClientLifecycle::Closed(ConnectionClosed::new(
+        assert!(incoming_tx
+            .try_send(IncomingMessage::Closed(ConnectionClosed::new(
                 ReceiveError::IntentionalDisconnection,
                 address,
                 Some(connection.id()),
@@ -1235,10 +1238,7 @@ mod tcp_lifecycle_tests {
         let mut app = App::new();
         app.insert_resource(settings);
         app.insert_resource(ClientConnections::<Config>::new());
-        app.insert_resource(LifecycleReceiver::<Config>(lifecycle_rx));
-        app.insert_resource(PacketReceiver::<Config> {
-            receiver: packet_rx,
-        });
+        app.insert_resource(IncomingReceiver::<Config>(incoming_rx));
         app.insert_resource(Packets::default());
         configure_receive_systems::<Config>(&mut app);
         app.add_observer(
