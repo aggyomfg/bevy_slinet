@@ -270,8 +270,8 @@ mod tests {
     #[tokio::test]
     async fn oldest_eviction_accounts_bytes_and_preserves_fifo() {
         let (tx, mut rx) = lossy_channel(2, 5, OverflowPolicy::DropOldest);
-        assert!(tx.try_send(1, 2).unwrap().is_empty());
-        assert!(tx.try_send(2, 3).unwrap().is_empty());
+        assert_eq!(tx.try_send(1, 2).unwrap(), [] as [i32; 0]);
+        assert_eq!(tx.try_send(2, 3).unwrap(), [] as [i32; 0]);
         assert!(matches!(tx.try_send(3, 6), Err(TrySendError::Full(3))));
         assert_eq!(tx.queued_bytes(), 5);
         assert_eq!(tx.try_send(4, 4).unwrap(), vec![1, 2]);

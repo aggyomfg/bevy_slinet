@@ -89,11 +89,12 @@ async fn listener_drop_wakes_reader_with_retained_writer() {
         .into_split()
         .await
         .unwrap();
-    assert!(read
-        .receive(Arc::new(Raw), &Length::default(), &ReceiveLimits::default())
-        .await
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        read.receive(Arc::new(Raw), &Length::default(), &ReceiveLimits::default())
+            .await
+            .unwrap(),
+        [] as [u8; 0]
+    );
     let length = Length::default();
     let limits = ReceiveLimits::default();
     let mut pending = Box::pin(read.receive(Arc::new(Raw), &length, &limits));

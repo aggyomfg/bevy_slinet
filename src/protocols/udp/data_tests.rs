@@ -68,15 +68,16 @@ async fn receive_limit_and_malformed_payloads_are_counted_per_peer() {
             UdpOptions::DEFAULT.max_payload_size().unwrap()
         );
         let (mut read, _write) = stream.into_split().await.unwrap();
-        assert!(read
-            .receive::<Vec<u8>, Vec<u8>, _, _>(
+        assert_eq!(
+            read.receive::<Vec<u8>, Vec<u8>, _, _>(
                 Arc::new(Raw),
                 &Length::default(),
                 &ReceiveLimits::default()
             )
             .await
-            .unwrap()
-            .is_empty());
+            .unwrap(),
+            [] as [u8; 0]
+        );
 
         for payload in [&[1, 2][..], &[255][..], &[7][..]] {
             listener.dispatch(payload, address, Instant::now());
@@ -161,15 +162,16 @@ async fn closing_server_read_counts_undelivered_raw_datagrams() {
         let stream = listener.dispatch(&[], address, Instant::now()).unwrap();
         let handle = stream.transport();
         let (mut read, _write) = stream.into_split().await.unwrap();
-        assert!(read
-            .receive::<Vec<u8>, Vec<u8>, _, _>(
+        assert_eq!(
+            read.receive::<Vec<u8>, Vec<u8>, _, _>(
                 Arc::new(Raw),
                 &Length::default(),
                 &ReceiveLimits::default()
             )
             .await
-            .unwrap()
-            .is_empty());
+            .unwrap(),
+            [] as [u8; 0]
+        );
         for _ in 0..2 {
             listener.dispatch(&[7], address, Instant::now());
         }
@@ -202,15 +204,16 @@ async fn handle_updates_live_writer_rate_and_read_close_cancels_wait() {
         let stream = listener.dispatch(&[], address, Instant::now()).unwrap();
         let handle = stream.transport();
         let (mut read, mut write) = stream.into_split().await.unwrap();
-        assert!(read
-            .receive::<Vec<u8>, Vec<u8>, _, _>(
+        assert_eq!(
+            read.receive::<Vec<u8>, Vec<u8>, _, _>(
                 Arc::new(Raw),
                 &Length::default(),
                 &ReceiveLimits::default()
             )
             .await
-            .unwrap()
-            .is_empty());
+            .unwrap(),
+            [] as [u8; 0]
+        );
         let length = Length::default();
         write
             .send::<Vec<u8>, Vec<u8>, _, _>(vec![7], Arc::new(Raw), &length)
@@ -285,15 +288,16 @@ async fn raw_drop_oldest_evicts_exact_datagram_and_preserves_timestamp() {
         let stream = listener.dispatch(&[], address, Instant::now()).unwrap();
         let handle = stream.transport();
         let (mut read, _write) = stream.into_split().await.unwrap();
-        assert!(read
-            .receive::<Vec<u8>, Vec<u8>, _, _>(
+        assert_eq!(
+            read.receive::<Vec<u8>, Vec<u8>, _, _>(
                 Arc::new(Raw),
                 &Length::default(),
                 &ReceiveLimits::default()
             )
             .await
-            .unwrap()
-            .is_empty());
+            .unwrap(),
+            [] as [u8; 0]
+        );
         let started = Instant::now();
         for (value, offset_ms) in [(1, 0), (2, 1), (3, 2)] {
             listener.dispatch(
@@ -346,15 +350,16 @@ async fn raw_byte_budget_obeys_both_policies_without_eviction_for_oversized_item
             let stream = listener.dispatch(&[], address, Instant::now()).unwrap();
             let handle = stream.transport();
             let (mut read, _write) = stream.into_split().await.unwrap();
-            assert!(read
-                .receive::<Vec<u8>, Vec<u8>, _, _>(
+            assert_eq!(
+                read.receive::<Vec<u8>, Vec<u8>, _, _>(
                     Arc::new(Raw),
                     &Length::default(),
                     &ReceiveLimits::default()
                 )
                 .await
-                .unwrap()
-                .is_empty());
+                .unwrap(),
+                [] as [u8; 0]
+            );
             let started = Instant::now();
             for (payload, offset_ms) in [(&[1, 1][..], 0), (&[2][..], 1), (&[3, 3][..], 2)] {
                 listener.dispatch(payload, address, started + Duration::from_millis(offset_ms));

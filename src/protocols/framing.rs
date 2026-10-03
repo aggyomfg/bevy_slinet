@@ -16,6 +16,10 @@ use crate::PacketLengthSerializer;
 /// Reads bytes from a continuous stream, without packet framing.
 #[cfg_attr(target_family = "wasm", async_trait(?Send))]
 #[cfg_attr(not(target_family = "wasm"), async_trait)]
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait adds must_use to methods returning an already must-use Future"
+)]
 pub trait ReadStream: Send + Sync + 'static {
     /// Fills the whole buffer, or returns a transport error.
     async fn read_exact(&mut self, buffer: &mut [u8]) -> io::Result<()>;
@@ -24,6 +28,10 @@ pub trait ReadStream: Send + Sync + 'static {
 /// Writes bytes to a continuous stream, without packet framing.
 #[cfg_attr(target_family = "wasm", async_trait(?Send))]
 #[cfg_attr(not(target_family = "wasm"), async_trait)]
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait adds must_use to methods returning an already must-use Future"
+)]
 pub trait WriteStream: Send + Sync + 'static {
     /// Writes the whole buffer, or returns a transport error.
     async fn write_all(&mut self, buffer: &[u8]) -> io::Result<()>;

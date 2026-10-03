@@ -1148,7 +1148,7 @@ mod tcp_lifecycle_tests {
              connections: Res<ClientConnections<Config>>,
              mut commands: Commands| {
                 assert_eq!(connections.len(), 1);
-                assert!(packets.0.is_empty());
+                assert_eq!(packets.0, [] as [u8; 0]);
                 commands.insert_resource(Packets(vec![event.event().packet]));
             },
         );

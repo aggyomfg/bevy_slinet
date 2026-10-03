@@ -52,7 +52,7 @@ async fn payload_encoding_failure_does_not_write() {
         error.to_string(),
         "Error serializing packet: encoding rejected"
     );
-    assert!(writer.get_ref().writes.is_empty());
+    assert_eq!(writer.get_ref().writes, [] as [Vec<u8>; 0]);
 }
 
 #[tokio::test]
@@ -73,7 +73,7 @@ async fn length_encoding_failure_does_not_write() {
         error.to_string(),
         "Error serializing packet length: The packet is too large (length: 256, max_length: 255)"
     );
-    assert!(writer.get_ref().writes.is_empty());
+    assert_eq!(writer.get_ref().writes, [] as [Vec<u8>; 0]);
 }
 
 #[tokio::test]

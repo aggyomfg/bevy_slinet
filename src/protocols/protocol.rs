@@ -36,6 +36,10 @@ pub use super::transport::{QueueDropReason, TransportHandle};
 /// Implement it or use built-in [`protocols`](crate::protocols).
 #[cfg_attr(target_family = "wasm", async_trait(?Send))]
 #[cfg_attr(not(target_family = "wasm"), async_trait)]
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait adds must_use to methods returning an already must-use Future"
+)]
 pub trait Protocol: Send + Sync + 'static {
     /// Shared controls and diagnostics for this protocol's connections.
     type Handle: TransportHandle;
@@ -63,6 +67,10 @@ pub trait Protocol: Send + Sync + 'static {
 /// A listener that accepts connections from clients.
 #[cfg_attr(target_family = "wasm", async_trait(?Send))]
 #[cfg_attr(not(target_family = "wasm"), async_trait)]
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait adds must_use to methods returning an already must-use Future"
+)]
 pub trait Listener {
     /// A [`ServerStream`] that is returned by [`Self::accept()`]
     type Stream: ServerStream;
@@ -80,6 +88,10 @@ pub trait Listener {
 /// A [NetworkStream](NetworkStream) that can be used client-side.
 #[cfg_attr(target_family = "wasm", async_trait(?Send))]
 #[cfg_attr(not(target_family = "wasm"), async_trait)]
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait adds must_use to methods returning an already must-use Future"
+)]
 pub trait ClientStream: NetworkStream {
     /// Connects to a server.
     async fn connect(addr: SocketAddr) -> io::Result<Self>
@@ -93,6 +105,10 @@ pub trait ServerStream: NetworkStream {}
 /// A connection that splits into packet receive and send halves.
 #[cfg_attr(target_family = "wasm", async_trait(?Send))]
 #[cfg_attr(not(target_family = "wasm"), async_trait)]
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait adds must_use to methods returning an already must-use Future"
+)]
 pub trait NetworkStream: Send + Sync + 'static {
     /// Shared controls and diagnostics for this connection.
     type Handle: TransportHandle;
