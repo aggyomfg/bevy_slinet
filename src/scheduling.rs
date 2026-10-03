@@ -1,5 +1,7 @@
-//! Public scheduling labels and shared app-wide limit synchronization.
+//! Public scheduling labels and shared endpoint schedule registration.
 use bevy::prelude::SystemSet;
+#[cfg(any(feature = "client", feature = "server"))]
+use bevy::{ecs::system::ScheduleSystem, prelude::*};
 use std::{
     fmt,
     hash::{Hash, Hasher},
@@ -120,11 +122,83 @@ pub enum SystemSets {
     MaxPacketSizeWarning,
 }
 
+#[cfg(any(feature = "client", feature = "server"))]
+pub struct ReceiveSets {
+    pub receive: SystemSets,
+    pub lifecycle: [SystemSets; 2],
+    pub packets: SystemSets,
+}
+
+#[cfg(any(feature = "client", feature = "server"))]
+impl<E: Send + Sync + 'static> NetworkSystems<E> {
+    pub(crate) fn configure_settings(app: &mut App) {
+        use crate::connection::{settings::EndpointReceiveLimits, NetworkSettings};
+
+        register_global_limits(app);
+        crate::runtime::register(app);
+        app.init_resource::<EndpointReceiveLimits<E>>()
+            .configure_sets(
+                Startup,
+                (
+                    Self::SETTINGS.in_set(SystemSets::SetMaxPacketSize),
+                    Self::SETUP
+                        .after(Self::SETTINGS)
+                        .after(crate::runtime::RuntimeSetup),
+                ),
+            )
+            .add_systems(
+                Startup,
+                (
+                    NetworkSettings::<E>::sync_limits.in_set(Self::SETTINGS),
+                    NetworkSettings::<E>::warning_system
+                        .after(Self::SETTINGS)
+                        .in_set(SystemSets::MaxPacketSizeWarning),
+                ),
+            )
+            .configure_sets(Update, Self::SETTINGS.in_set(SystemSets::SetMaxPacketSize))
+            .add_systems(
+                Update,
+                NetworkSettings::<E>::sync_limits.in_set(Self::SETTINGS),
+            );
+    }
+
+    // Fixtures use this graph too, including its deferred-command boundaries.
+    pub(crate) fn configure_receive<M, N>(
+        app: &mut App,
+        datagram: bool,
+        legacy: ReceiveSets,
+        incoming: impl IntoScheduleConfigs<ScheduleSystem, M>,
+        packets: impl IntoScheduleConfigs<ScheduleSystem, N>,
+    ) {
+        let [establish, remove] = legacy.lifecycle;
+        app.configure_sets(
+            PreUpdate,
+            (
+                Self::RECEIVE.in_set(legacy.receive),
+                Self::LIFECYCLE
+                    .in_set(Self::RECEIVE)
+                    .in_set(establish)
+                    .in_set(remove),
+                Self::PACKETS.in_set(Self::RECEIVE).in_set(legacy.packets),
+            ),
+        );
+        let incoming = incoming.in_set(Self::LIFECYCLE);
+        if datagram {
+            // Publish connections and apply observer commands before packets.
+            // Keep this dependency local to one endpoint.
+            app.configure_sets(PreUpdate, Self::PACKETS.after(Self::LIFECYCLE))
+                .add_systems(PreUpdate, (incoming, packets.in_set(Self::PACKETS)));
+        } else {
+            // Streams keep establishment, packets and closure in one budgeted FIFO.
+            app.add_systems(PreUpdate, incoming.in_set(Self::PACKETS));
+        }
+    }
+}
+
 /// Installs shared receive-limit synchronization once per App.
 #[cfg(any(feature = "client", feature = "server"))]
-pub fn register_global_limits(app: &mut bevy::prelude::App) {
+fn register_global_limits(app: &mut App) {
     use crate::connection::{MaxPacketSize, ReceiveLimits};
-    use bevy::prelude::*;
 
     struct GlobalLimitsPlugin;
     impl Plugin for GlobalLimitsPlugin {

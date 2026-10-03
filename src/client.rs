@@ -1,6 +1,6 @@
 //! Client part of the plugin. You can enable it by adding `client` feature.
 
-use crate::connection::settings::{EndpointReceiveLimits, EndpointSetup};
+use crate::connection::settings::EndpointSetup;
 use crate::connection::NetworkSettings;
 
 /// Optional settings for this client config, overriding app-wide defaults.
@@ -109,88 +109,40 @@ pub struct ClientPlugin<Config: ClientConfig> {
 
 impl<Config: ClientConfig> Plugin for ClientPlugin<Config> {
     fn build(&self, app: &mut App) {
-        let address = self.address;
-        crate::scheduling::register_global_limits(app);
-        crate::runtime::register(app);
-        app.init_resource::<EndpointReceiveLimits<Self>>()
-            .insert_resource(ClientConnections::<Config>::new())
-            // Startup: settings -> setup; warnings inspect the synchronized settings.
-            .configure_sets(
-                Startup,
-                (
-                    ClientSystems::<Config>::SETTINGS.in_set(SystemSets::SetMaxPacketSize),
-                    ClientSystems::<Config>::SETUP.after(ClientSystems::<Config>::SETTINGS),
-                ),
-            )
+        ClientSystems::<Config>::configure_settings(app);
+        app.insert_resource(ClientConnections::<Config>::new())
             .add_systems(
                 Startup,
-                (
-                    ClientSettings::<Config>::sync_limits.in_set(ClientSystems::<Config>::SETTINGS),
-                    ClientSettings::<Config>::warning_system
-                        .after(ClientSystems::<Config>::SETTINGS)
-                        .in_set(SystemSets::MaxPacketSizeWarning),
-                    Self::setup_system.in_set(ClientSystems::<Config>::SETUP),
-                    (move |mut commands: Commands| {
-                        if let Some(address) = address {
-                            commands.trigger(ConnectionRequestEvent::<Config>::new(address));
-                        }
-                    })
-                    .after(ClientSystems::<Config>::SETUP),
-                ),
-            )
-            // Update: synchronize runtime limit changes for this endpoint.
-            .configure_sets(
-                Update,
-                ClientSystems::<Config>::SETTINGS.in_set(SystemSets::SetMaxPacketSize),
-            )
-            .add_systems(
-                Update,
-                ClientSettings::<Config>::sync_limits.in_set(ClientSystems::<Config>::SETTINGS),
+                Self::setup_system.in_set(ClientSystems::<Config>::SETUP),
             );
-        // PreUpdate: all incoming events, using the protocol-specific graph below.
+        if let Some(address) = self.address {
+            app.add_systems(
+                Startup,
+                (move |mut commands: Commands| {
+                    commands.trigger(ConnectionRequestEvent::<Config>::new(address));
+                })
+                .after(ClientSystems::<Config>::SETUP),
+            );
+        }
         configure_receive_systems::<Config>(app);
-        app.configure_sets(
-            Startup,
-            ClientSystems::<Config>::SETUP.after(crate::runtime::RuntimeSetup),
-        );
     }
 }
 
-// This is also used by socket-free fixtures, so tests and benchmarks exercise
-// the plugin's actual set hierarchy and deferred-command boundaries.
 fn configure_receive_systems<Config: ClientConfig>(app: &mut App) {
-    app.configure_sets(
-        PreUpdate,
-        (
-            ClientSystems::<Config>::RECEIVE.in_set(SystemSets::ClientReceive),
-            ClientSystems::<Config>::LIFECYCLE
-                .in_set(ClientSystems::<Config>::RECEIVE)
-                .in_set(SystemSets::ClientConnectionEstablish)
-                .in_set(SystemSets::ClientConnectionRemove),
-            ClientSystems::<Config>::PACKETS
-                .in_set(ClientSystems::<Config>::RECEIVE)
-                .in_set(SystemSets::ClientPacketReceive),
-        ),
+    ClientSystems::<Config>::configure_receive(
+        app,
+        Config::Protocol::DATAGRAM,
+        crate::scheduling::ReceiveSets {
+            receive: SystemSets::ClientReceive,
+            lifecycle: [
+                SystemSets::ClientConnectionEstablish,
+                SystemSets::ClientConnectionRemove,
+            ],
+            packets: SystemSets::ClientPacketReceive,
+        },
+        incoming_system::<Config>,
+        receive_datagram_packets::<Config>,
     );
-    let incoming = incoming_system::<Config>.in_set(ClientSystems::<Config>::LIFECYCLE);
-    if Config::Protocol::DATAGRAM {
-        // Apply connection commands before looking for packets of published peers.
-        // The dependency is local to this config, not every plugin of this role.
-        app.configure_sets(
-            PreUpdate,
-            ClientSystems::<Config>::PACKETS.after(ClientSystems::<Config>::LIFECYCLE),
-        )
-        .add_systems(
-            PreUpdate,
-            (
-                incoming,
-                receive_datagram_packets::<Config>.in_set(ClientSystems::<Config>::PACKETS),
-            ),
-        );
-    } else {
-        // Streams keep establishment, packets and closure in one budgeted FIFO.
-        app.add_systems(PreUpdate, incoming.in_set(ClientSystems::<Config>::PACKETS));
-    }
 }
 
 impl<Config: ClientConfig> Default for ClientPlugin<Config> {
@@ -679,33 +631,25 @@ fn receive_datagram_packets<Config: ClientConfig>(
 ) {
     let budget = ClientSettings::<Config>::resolve_queues(settings.as_deref(), queues.as_deref())
         .events_per_frame;
-    if !Config::Protocol::DATAGRAM {
-        return;
-    }
     for _ in 0..budget {
         let next = datagram_packets.receiver.try_recv_if(|packet| {
-            packet.connection.is_published()
-                || (Config::Protocol::DATAGRAM && packet.connection.disconnect_task.is_cancelled())
+            packet.connection.is_published() || packet.connection.disconnect_task.is_cancelled()
         });
         let Ok(packet) = next else { break };
-        if Config::Protocol::DATAGRAM && packet.connection.disconnect_task.is_cancelled() {
+        if packet.connection.disconnect_task.is_cancelled() {
             packet
                 .connection
                 .record_drop(QueueDropReason::ClosedBeforeDelivery);
-        } else if packet.connection.is_published() {
-            if Config::Protocol::DATAGRAM {
-                commands.queue(move |world: &mut World| {
-                    if packet.connection.disconnect_task.is_cancelled() {
-                        packet
-                            .connection
-                            .record_drop(QueueDropReason::ClosedBeforeDelivery);
-                    } else {
-                        world.trigger(packet);
-                    }
-                });
-            } else {
-                commands.trigger(packet);
-            }
+        } else {
+            commands.queue(move |world: &mut World| {
+                if packet.connection.disconnect_task.is_cancelled() {
+                    packet
+                        .connection
+                        .record_drop(QueueDropReason::ClosedBeforeDelivery);
+                } else {
+                    world.trigger(packet);
+                }
+            });
         }
     }
 }
@@ -930,7 +874,7 @@ mod udp_lifecycle_tests {
     }
 
     #[test]
-    fn udp_packets_and_establishment_are_visible_in_update() {
+    fn udp_observer_commands_are_visible_after_receive() {
         let settings = NetworkQueueSettings::default();
         let (incoming_tx, incoming_rx) = settings.incoming_channel();
         let (packet_tx, packet_rx) = lossy_channel(1, usize::MAX, OverflowPolicy::DropNewest);
@@ -968,18 +912,29 @@ mod udp_lifecycle_tests {
             .insert_resource(DatagramPacketReceiver::<Config> {
                 receiver: packet_rx,
             })
-            .init_resource::<PacketEvents>()
+            .add_observer(
+                |_: On<ConnectionEstablishEvent<Config>>, mut commands: Commands| {
+                    commands.init_resource::<PacketEvents>();
+                },
+            )
             .add_observer(
                 |event: On<PacketReceiveEvent<Config>>,
                  connections: Res<ClientConnections<Config>>,
-                 mut events: ResMut<PacketEvents>| {
+                 events: Res<PacketEvents>,
+                 mut commands: Commands| {
                     assert_eq!(connections.first().unwrap().id(), event.connection.id());
-                    events.0 += 1;
+                    commands.insert_resource(PacketEvents(events.0 + 1));
                 },
+            )
+            .add_systems(
+                PreUpdate,
+                (|events: Res<PacketEvents>| assert_eq!(events.0, 1))
+                    .after(ClientSystems::<Config>::RECEIVE),
             )
             .add_systems(Update, |events: Res<PacketEvents>| assert_eq!(events.0, 1));
         configure_receive_systems::<Config>(&mut app);
         app.update();
+        assert_eq!(app.world().resource::<PacketEvents>().0, 1);
     }
 
     struct PendingWrite(Arc<std::sync::atomic::AtomicBool>);
@@ -1129,13 +1084,22 @@ mod tcp_lifecycle_tests {
 
     #[test]
     fn final_tcp_packet_precedes_registry_removal() {
+        for budget in [2, 3] {
+            assert_tcp_observer_command_order(budget);
+        }
+    }
+
+    fn assert_tcp_observer_command_order(budget: usize) {
+        #[derive(Resource)]
+        struct Closed;
+
         let settings = NetworkQueueSettings {
-            events_per_frame: 2,
+            events_per_frame: budget,
             ..Default::default()
         };
         let (incoming_tx, incoming_rx) = settings.incoming_channel();
         let (outgoing, _rx) = settings.outgoing_channel::<_, ()>(false);
-        let address: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let address = ([127, 0, 0, 1], 1234).into();
         let connection = EcsConnection {
             _endpoint: PhantomData,
             disconnect_task: CancellationToken::new(),
@@ -1172,24 +1136,55 @@ mod tcp_lifecycle_tests {
         app.insert_resource(settings);
         app.insert_resource(ClientConnections::<Config>::new());
         app.insert_resource(IncomingReceiver::<Config>(incoming_rx));
-        app.insert_resource(Packets::default());
         configure_receive_systems::<Config>(&mut app);
         app.add_observer(
-            |event: On<PacketReceiveEvent<Config>>,
-             mut packets: ResMut<Packets>,
-             connections: Res<ClientConnections<Config>>| {
-                assert_eq!(connections.len(), 1);
-                packets.0.push(event.event().packet);
+            |_: On<ConnectionEstablishEvent<Config>>, mut commands: Commands| {
+                commands.init_resource::<Packets>();
             },
+        );
+        app.add_observer(
+            |event: On<PacketReceiveEvent<Config>>,
+             packets: Res<Packets>,
+             connections: Res<ClientConnections<Config>>,
+             mut commands: Commands| {
+                assert_eq!(connections.len(), 1);
+                assert!(packets.0.is_empty());
+                commands.insert_resource(Packets(vec![event.event().packet]));
+            },
+        );
+        app.add_observer(
+            |_: On<DisconnectionEvent<Config>>,
+             packets: Res<Packets>,
+             connections: Res<ClientConnections<Config>>,
+             mut commands: Commands| {
+                assert_eq!(packets.0, [9]);
+                assert!(connections.is_empty());
+                commands.insert_resource(Closed);
+            },
+        );
+        app.add_systems(
+            PreUpdate,
+            (|packets: Res<Packets>,
+              connections: Res<ClientConnections<Config>>,
+              closed: Option<Res<Closed>>| {
+                assert_eq!(packets.0, [9]);
+                assert_eq!(closed.is_some(), connections.is_empty());
+            })
+            .after(ClientSystems::<Config>::RECEIVE),
         );
         app.update();
         assert_eq!(app.world().resource::<Packets>().0, [9]);
+        assert_eq!(
+            app.world().resource::<ClientConnections<Config>>().len(),
+            usize::from(budget == 2)
+        );
         app.update();
         assert!(app
             .world()
             .resource::<ClientConnections<Config>>()
             .is_empty());
         assert_eq!(app.world().resource::<Packets>().0, [9]);
+        assert!(app.world().contains_resource::<Closed>());
     }
 
     #[derive(Default, Resource)]

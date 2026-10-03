@@ -1,6 +1,6 @@
 //! Server part of the plugin. You can enable it by adding `server` feature.
 
-use crate::connection::settings::{EndpointReceiveLimits, EndpointSetup};
+use crate::connection::settings::EndpointSetup;
 use crate::connection::NetworkSettings;
 
 /// Optional settings for this server config, overriding app-wide defaults.
@@ -108,86 +108,36 @@ pub struct ServerPlugin<Config: ServerConfig> {
 
 impl<Config: ServerConfig> Plugin for ServerPlugin<Config> {
     fn build(&self, app: &mut App) {
-        crate::scheduling::register_global_limits(app);
-        crate::runtime::register(app);
-        app.init_resource::<EndpointReceiveLimits<Self>>()
-            .insert_resource(ServerConnections::<Config>::new())
-            // Startup: settings -> setup; warnings inspect the synchronized settings.
-            .configure_sets(
-                Startup,
-                (
-                    ServerSystems::<Config>::SETTINGS.in_set(SystemSets::SetMaxPacketSize),
-                    ServerSystems::<Config>::SETUP.after(ServerSystems::<Config>::SETTINGS),
-                ),
-            )
+        ServerSystems::<Config>::configure_settings(app);
+        app.insert_resource(ServerConnections::<Config>::new())
             .add_systems(
                 Startup,
-                (
-                    ServerSettings::<Config>::sync_limits.in_set(ServerSystems::<Config>::SETTINGS),
-                    ServerSettings::<Config>::warning_system
-                        .after(ServerSystems::<Config>::SETTINGS)
-                        .in_set(SystemSets::MaxPacketSizeWarning),
-                    Self::setup_system(self.address).in_set(ServerSystems::<Config>::SETUP),
-                ),
-            )
-            // Update: synchronize runtime limit changes for this endpoint.
-            .configure_sets(
-                Update,
-                ServerSystems::<Config>::SETTINGS.in_set(SystemSets::SetMaxPacketSize),
-            )
-            .add_systems(
-                Update,
-                ServerSettings::<Config>::sync_limits.in_set(ServerSystems::<Config>::SETTINGS),
+                Self::setup_system(self.address).in_set(ServerSystems::<Config>::SETUP),
             );
-        // PreUpdate: all incoming events, using the protocol-specific graph below.
         configure_receive_systems::<Config>(app);
         #[cfg(target_family = "wasm")]
         app.add_systems(
             PreUpdate,
             publish_server_address::<Config>.before(ServerSystems::<Config>::RECEIVE),
         );
-        app.configure_sets(
-            Startup,
-            ServerSystems::<Config>::SETUP.after(crate::runtime::RuntimeSetup),
-        );
     }
 }
 
-// This is also used by socket-free fixtures, so tests and benchmarks exercise
-// the plugin's actual set hierarchy and deferred-command boundaries.
 fn configure_receive_systems<Config: ServerConfig>(app: &mut App) {
-    app.configure_sets(
-        PreUpdate,
-        (
-            ServerSystems::<Config>::RECEIVE.in_set(SystemSets::ServerReceive),
-            ServerSystems::<Config>::LIFECYCLE
-                .in_set(ServerSystems::<Config>::RECEIVE)
-                .in_set(SystemSets::ServerAcceptNewConnections)
-                .in_set(SystemSets::ServerRemoveConnections),
-            ServerSystems::<Config>::PACKETS
-                .in_set(ServerSystems::<Config>::RECEIVE)
-                .in_set(SystemSets::ServerAcceptNewPackets),
-        ),
+    ServerSystems::<Config>::configure_receive(
+        app,
+        Config::Protocol::DATAGRAM,
+        crate::scheduling::ReceiveSets {
+            receive: SystemSets::ServerReceive,
+            lifecycle: [
+                SystemSets::ServerAcceptNewConnections,
+                SystemSets::ServerRemoveConnections,
+            ],
+            packets: SystemSets::ServerAcceptNewPackets,
+        },
+        incoming_system::<Config>,
+        receive_datagram_packets::<Config>,
     );
-    let incoming = incoming_system::<Config>.in_set(ServerSystems::<Config>::LIFECYCLE);
-    if Config::Protocol::DATAGRAM {
-        // Apply connection commands before looking for packets of published peers.
-        // The dependency is local to this config, not every plugin of this role.
-        app.configure_sets(
-            PreUpdate,
-            ServerSystems::<Config>::PACKETS.after(ServerSystems::<Config>::LIFECYCLE),
-        )
-        .add_systems(
-            PreUpdate,
-            (
-                incoming,
-                receive_datagram_packets::<Config>.in_set(ServerSystems::<Config>::PACKETS),
-            ),
-        );
-    } else {
-        // Streams keep establishment, packets and closure in one budgeted FIFO.
-        app.add_systems(PreUpdate, incoming.in_set(ServerSystems::<Config>::PACKETS));
-    }
 }
 
 impl<Config: ServerConfig> ServerPlugin<Config> {
@@ -700,33 +650,25 @@ fn receive_datagram_packets<Config: ServerConfig>(
 ) {
     let budget = ServerSettings::<Config>::resolve_queues(settings.as_deref(), queues.as_deref())
         .events_per_frame;
-    if !Config::Protocol::DATAGRAM {
-        return;
-    }
     for _ in 0..budget {
         let next = datagram_packets.receiver.try_recv_if(|packet| {
-            packet.connection.is_published()
-                || (Config::Protocol::DATAGRAM && packet.connection.disconnect_task.is_cancelled())
+            packet.connection.is_published() || packet.connection.disconnect_task.is_cancelled()
         });
         let Ok(packet) = next else { break };
-        if Config::Protocol::DATAGRAM && packet.connection.disconnect_task.is_cancelled() {
+        if packet.connection.disconnect_task.is_cancelled() {
             packet
                 .connection
                 .record_drop(QueueDropReason::ClosedBeforeDelivery);
-        } else if packet.connection.is_published() {
-            if Config::Protocol::DATAGRAM {
-                commands.queue(move |world: &mut World| {
-                    if packet.connection.disconnect_task.is_cancelled() {
-                        packet
-                            .connection
-                            .record_drop(QueueDropReason::ClosedBeforeDelivery);
-                    } else {
-                        world.trigger(packet);
-                    }
-                });
-            } else {
-                commands.trigger(packet);
-            }
+        } else {
+            commands.queue(move |world: &mut World| {
+                if packet.connection.disconnect_task.is_cancelled() {
+                    packet
+                        .connection
+                        .record_drop(QueueDropReason::ClosedBeforeDelivery);
+                } else {
+                    world.trigger(packet);
+                }
+            });
         }
     }
 }
@@ -845,6 +787,70 @@ mod udp_lifecycle_tests {
 
     #[derive(Default, Resource)]
     struct PacketEvents(usize);
+
+    #[test]
+    fn udp_observer_commands_are_visible_after_receive() {
+        let settings = NetworkQueueSettings::default();
+        let (incoming_tx, incoming_rx) = settings.incoming_channel();
+        let (packet_tx, packet_rx) = lossy_channel(1, usize::MAX, OverflowPolicy::DropNewest);
+        let (outgoing, _rx) = settings.outgoing_channel::<_, UdpConnectionHandle>(true);
+        let address = ([127, 0, 0, 1], 1234).into();
+        let connection = EcsConnection {
+            _endpoint: PhantomData,
+            disconnect_task: CancellationToken::new(),
+            id: ConnectionId::next(),
+            published: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            packet_tx: outgoing,
+            transport: UdpConnectionHandle::new(128, None),
+            local_addr: address,
+            peer_addr: address,
+        };
+        assert!(incoming_tx
+            .try_send(IncomingMessage::Established(NewConnectionEvent {
+                address,
+                connection: connection.clone(),
+            }))
+            .is_ok());
+        assert!(packet_tx
+            .try_send(
+                PacketReceiveEvent {
+                    connection,
+                    packet: 7,
+                    received_at: Instant::now(),
+                },
+                1,
+            )
+            .is_ok());
+
+        let mut app = App::new();
+        app.insert_resource(ServerConnections::<Config>::new())
+            .insert_resource(IncomingReceiver::<Config>(incoming_rx))
+            .insert_resource(DatagramPacketReceiver::<Config> {
+                receiver: packet_rx,
+            })
+            .add_observer(
+                |_: On<NewConnectionEvent<Config>>, mut commands: Commands| {
+                    commands.init_resource::<PacketEvents>();
+                },
+            )
+            .add_observer(
+                |event: On<PacketReceiveEvent<Config>>,
+                 connections: Res<ServerConnections<Config>>,
+                 events: Res<PacketEvents>,
+                 mut commands: Commands| {
+                    assert_eq!(connections.first().unwrap().id(), event.connection.id());
+                    commands.insert_resource(PacketEvents(events.0 + 1));
+                },
+            )
+            .add_systems(
+                PreUpdate,
+                (|events: Res<PacketEvents>| assert_eq!(events.0, 1))
+                    .after(ServerSystems::<Config>::RECEIVE),
+            );
+        configure_receive_systems::<Config>(&mut app);
+        app.update();
+        assert_eq!(app.world().resource::<PacketEvents>().0, 1);
+    }
 
     #[test]
     fn cancelled_udp_packet_is_dropped_while_server_close_waits() {
