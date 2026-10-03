@@ -75,7 +75,7 @@ pub trait Listener {
     /// A [`ServerStream`] that is returned by [`Self::accept()`]
     type Stream: ServerStream;
 
-    /// Returns a [ServerStream](ServerStream) when a client wants to connect.
+    /// Returns a [`ServerStream`] when a client wants to connect.
     async fn accept(&self) -> io::Result<Self::Stream>;
 
     /// Returns the bound endpoint, including the assigned port when bound to port zero.
@@ -85,7 +85,7 @@ pub trait Listener {
     fn handle_disconnection(&self, _peer_addr: SocketAddr) {}
 }
 
-/// A [NetworkStream](NetworkStream) that can be used client-side.
+/// A [`NetworkStream`] that can be used client-side.
 #[cfg_attr(target_family = "wasm", async_trait(?Send))]
 #[cfg_attr(not(target_family = "wasm"), async_trait)]
 #[allow(
