@@ -1,39 +1,90 @@
 //! Server part of the plugin. You can enable it by adding `server` feature.
 
+use crate::connection::settings::EndpointSetup;
+use crate::connection::NetworkSettings;
+
+/// Optional settings for this server config, overriding app-wide defaults.
+pub type ServerSettings<Config> = NetworkSettings<ServerPlugin<Config>>;
+
+/// Scheduling phases for one server config; see [`crate::NetworkSystems`].
+///
+/// ```
+/// use bevy::prelude::*;
+/// use bevy_slinet::{ServerConfig, server::ServerSystems};
+///
+/// fn configure<C: ServerConfig>(app: &mut App) {
+///     app.add_systems(PreUpdate,
+///         consume_network_state.after(ServerSystems::<C>::RECEIVE));
+/// }
+///
+/// fn consume_network_state() { /* Read state populated by packet observers. */ }
+/// ```
+pub type ServerSystems<Config> = crate::NetworkSystems<ServerPlugin<Config>>;
+
 use std::marker::PhantomData;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 
+use bevy::platform::time::Instant;
 use bevy::{log, prelude::*};
 use tokio::select;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::connection::{
-    max_packet_size_warning_system, set_max_packet_size_system, ConnectionId, DisconnectTask,
-    EcsConnection, RawConnection,
+use crate::connection::tasks::{
+    run_connections, send_packets, PacketCodecs, ReceiveTaskState, SendTaskState,
 };
-use crate::protocol::{Listener, NetworkStream, Protocol, ReadStream, ReceiveError, WriteStream};
-use crate::{ServerConfig, SystemSets};
+use crate::connection::{lossy_channel, LossyReceiver, LossySender};
+use crate::connection::{
+    ConnectionId, EcsConnection, NetworkQueueSettings, PacketForwarder, RawConnection,
+    ReceiveLimits,
+};
+use crate::protocols::protocol::{
+    Listener, NetworkStream, PacketReader, Protocol, QueueDropReason, ReceiveError,
+};
+use crate::serializers::serializer::Serializer;
+use crate::{PacketLengthSerializer, ServerConfig, SystemSets};
 
-/// Server-side connection to a server.
-pub type ServerConnection<Config> = EcsConnection<<Config as ServerConfig>::ServerPacket>;
-type RawServerConnection<Config> = (
-    RawConnection<
-        <Config as ServerConfig>::ClientPacket,
-        <Config as ServerConfig>::ServerPacket,
-        <<Config as ServerConfig>::Protocol as Protocol>::ServerStream,
-        <Config as ServerConfig>::EncodeError,
-        <Config as ServerConfig>::DecodeError,
-        <Config as ServerConfig>::LengthSerializer,
-    >,
-    ServerConnection<Config>,
-);
-/// List of server-side connections to a server.
+/// Represents the server side of a client connection.
+pub type ServerConnection<Config> = EcsConnection<
+    <Config as ServerConfig>::ServerPacket,
+    <<Config as ServerConfig>::Protocol as Protocol>::Handle,
+    ServerPlugin<Config>,
+>;
+type RawServerConnection<Config> = RawConnection<
+    <Config as ServerConfig>::ClientPacket,
+    <Config as ServerConfig>::ServerPacket,
+    <<Config as ServerConfig>::Protocol as Protocol>::ServerStream,
+    <Config as ServerConfig>::EncodeError,
+    <Config as ServerConfig>::DecodeError,
+    <Config as ServerConfig>::LengthSerializer,
+>;
+
+type ServerSerializer<Config> = dyn Serializer<
+    <Config as ServerConfig>::ClientPacket,
+    <Config as ServerConfig>::ServerPacket,
+    EncodeError = <Config as ServerConfig>::EncodeError,
+    DecodeError = <Config as ServerConfig>::DecodeError,
+>;
+
+struct ConnectedTransport<Config: ServerConfig> {
+    connection: RawServerConnection<Config>,
+    ecs_connection: ServerConnection<Config>,
+}
+
+/// Tracks client connections registered with this server plugin.
 #[derive(Resource)]
 pub struct ServerConnections<Config: ServerConfig>(Vec<ServerConnection<Config>>);
 impl<Config: ServerConfig> ServerConnections<Config> {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self(Vec::new())
+    }
+
+    fn register(&mut self, connection: ServerConnection<Config>) {
+        self.0.push(connection);
+    }
+
+    fn remove_connection(&mut self, id: ConnectionId) {
+        self.0.retain(|connection| connection.id() != id);
     }
 }
 impl<Config: ServerConfig> std::ops::Deref for ServerConnections<Config> {
@@ -57,42 +108,52 @@ pub struct ServerPlugin<Config: ServerConfig> {
 
 impl<Config: ServerConfig> Plugin for ServerPlugin<Config> {
     fn build(&self, app: &mut App) {
+        ServerSystems::<Config>::configure_settings(app);
         app.insert_resource(ServerConnections::<Config>::new())
             .add_systems(
                 Startup,
-                (
-                    create_setup_system::<Config>(self.address),
-                    max_packet_size_warning_system.in_set(SystemSets::MaxPacketSizeWarning),
-                ),
-            )
-            .add_systems(
-                Update,
-                set_max_packet_size_system.in_set(SystemSets::SetMaxPacketSize),
-            )
-            .add_systems(
-                PreUpdate,
-                (
-                    accept_new_connections::<Config>.in_set(SystemSets::ServerAcceptNewConnections),
-                    accept_new_packets::<Config>
-                        .in_set(SystemSets::ServerAcceptNewPackets)
-                        .after(SystemSets::ServerAcceptNewConnections),
-                ),
-            )
-            .add_systems(
-                PostUpdate,
-                (remove_connections::<Config>.in_set(SystemSets::ServerRemoveConnections),),
-            )
-            .add_observer(connection_add_system::<Config>);
+                Self::setup_system(self.address).in_set(ServerSystems::<Config>::SETUP),
+            );
+        configure_receive_systems::<Config>(app);
+        #[cfg(target_family = "wasm")]
+        app.add_systems(
+            PreUpdate,
+            publish_server_address::<Config>.before(ServerSystems::<Config>::RECEIVE),
+        );
     }
 }
 
+fn configure_receive_systems<Config: ServerConfig>(app: &mut App) {
+    ServerSystems::<Config>::configure_receive(
+        app,
+        Config::Protocol::DATAGRAM,
+        crate::scheduling::ReceiveSets {
+            receive: SystemSets::ServerReceive,
+            lifecycle: [
+                SystemSets::ServerAcceptNewConnections,
+                SystemSets::ServerRemoveConnections,
+            ],
+            packets: SystemSets::ServerAcceptNewPackets,
+        },
+        incoming_system::<Config>,
+        receive_datagram_packets::<Config>,
+    );
+}
+
 impl<Config: ServerConfig> ServerPlugin<Config> {
-    /// Bind to the specified address and return a [`ServerPlugin`].
-    pub fn bind<A>(address: A) -> ServerPlugin<Config>
+    /// Configures the endpoint to bind during startup.
+    ///
+    /// # Panics
+    /// Panics if the address cannot be resolved or resolves to no endpoints.
+    #[expect(
+        clippy::expect_used,
+        reason = "Preserve the documented panicking constructor API"
+    )]
+    pub fn bind<A>(address: A) -> Self
     where
         A: ToSocketAddrs,
     {
-        ServerPlugin {
+        Self {
             address: address
                 .to_socket_addrs()
                 .expect("Invalid address")
@@ -104,198 +165,392 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
 }
 
 #[derive(Resource)]
-struct ConnectionReceiver<Config: ServerConfig>(
-    UnboundedReceiver<(SocketAddr, ServerConnection<Config>)>,
-);
+struct IncomingReceiver<Config: ServerConfig>(Receiver<IncomingMessage<Config>>);
 
-#[allow(clippy::type_complexity)]
-#[derive(Resource)]
-struct DisconnectionReceiver<Config: ServerConfig>(
-    UnboundedReceiver<(
-        ReceiveError<Config::DecodeError, Config::LengthSerializer>,
-        ServerConnection<Config>,
-    )>,
-);
+enum IncomingMessage<Config: ServerConfig> {
+    StreamPacket(PacketReceiveEvent<Config>),
+    Established(NewConnectionEvent<Config>),
+    Closed(DisconnectionEvent<Config>),
+}
 
 #[derive(Resource)]
-struct PacketReceiver<Config: ServerConfig>(
-    UnboundedReceiver<(ServerConnection<Config>, Config::ClientPacket)>,
-);
+struct DatagramPacketReceiver<Config: ServerConfig> {
+    receiver: LossyReceiver<PacketReceiveEvent<Config>>,
+}
 
-fn create_setup_system<Config: ServerConfig>(address: SocketAddr) -> impl Fn(Commands) {
-    #[cfg(target_family = "wasm")]
-    compile_error!("Why would you run a bevy_slinet server on WASM? If you really need this, please open an issue (https://github.com/aggyomfg/bevy_slinet/issues/new)");
+// Browser bind completes asynchronously, so publish its result in a later frame.
+#[cfg(target_family = "wasm")]
+#[derive(Resource)]
+struct PendingServerAddress<Config: ServerConfig> {
+    receiver: std::sync::Mutex<std::sync::mpsc::Receiver<SocketAddr>>,
+    _marker: PhantomData<Config>,
+}
 
-    move |mut commands: Commands| {
-        let (conn_tx, conn_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (conn_tx2, mut conn_rx2): (
-            UnboundedSender<RawServerConnection<Config>>,
-            UnboundedReceiver<RawServerConnection<Config>>,
-        ) = tokio::sync::mpsc::unbounded_channel();
-        let (disc_tx, disc_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (pack_tx, pack_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (disc_tx2, mut disc_rx2) = tokio::sync::mpsc::unbounded_channel();
-        commands.insert_resource(ConnectionReceiver::<Config>(conn_rx));
-        commands.insert_resource(DisconnectionReceiver::<Config>(disc_rx));
-        commands.insert_resource(PacketReceiver::<Config>(pack_rx));
-        let (bound_tx, bound_rx) = std::sync::mpsc::sync_channel::<SocketAddr>(1);
-
-        std::thread::spawn(move || {
-            let runtime_result = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build();
-
-            let runtime = match runtime_result {
-                Ok(rt) => rt,
-                Err(err) => {
-                    log::error!("Failed to create tokio runtime: {}", err);
-                    return;
-                }
-            };
-
-            runtime.block_on(async move {
-                // Receiving packets
-                tokio::spawn(async move {
-                    while let Some((connection, ecs_conn)) = conn_rx2.recv().await {
-                        let RawConnection {
-                            disconnect_task,
-                            stream,
-                            serializer,
-                            packet_length_serializer,
-                            mut packets_rx,
-                            id,
-                        } = connection;
-                        let (mut read, mut write) = match stream.into_split().await {
-                            Ok(split) => split,
-                            Err(err) => {
-                                log::error!("({:?}) Couldn't split stream: {}", id, err);
-                                continue;
-                            }
-                        };
-                        let pack_tx2 = pack_tx.clone();
-                        let disc_tx_2 = disc_tx.clone();
-                        let serializer2 = Arc::clone(&serializer);
-                        let disc_tx2_2 = disc_tx2.clone();
-                        let packet_length_serializer2 = Arc::clone(&packet_length_serializer);
-                        tokio::spawn(async move {
-                            loop {
-                                // `select!` handles intentional disconnections (ecs_connection.disconnect()).
-                                // AsyncReadExt::read_exact is not cancel-safe and loses data, but we don't need that data anymore
-                                tokio::select! {
-                                    result = read.receive(Arc::clone(&serializer2), &*packet_length_serializer2) => {
-                                        match result {
-                                            Ok(packet) => {
-                                                log::trace!("({id:?}) Received packet {:?}", packet);
-                                                if let Err(err) = pack_tx2.send((ecs_conn.clone(), packet)) {
-                                                    log::error!("({id:?}) Failed to forward received packet: {err}");
-                                                }
-                                            }
-                                            Err(err) => {
-                                                if let Err(send_err) = disc_tx_2.send((err, ecs_conn.clone())) {
-                                                    log::error!("({id:?}) Failed to send disconnection event: {send_err}");
-                                                }
-                                                if let Err(send_err) = disc_tx2_2.send(ecs_conn.peer_addr) {
-                                                    log::error!("({id:?}) Failed to send address for disconnection handling: {send_err}");
-                                                }
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    _ = disconnect_task.clone() => {
-                                        log::debug!("({id:?}) Client was disconnected intentionally");
-                                        if let Err(send_err) = disc_tx_2.send((ReceiveError::IntentionalDisconnection, ecs_conn.clone())) {
-                                            log::error!("({id:?}) Failed to send intentional disconnection event: {send_err}");
-                                        }
-                                        if let Err(send_err) = disc_tx2_2.send(ecs_conn.peer_addr) {
-                                            log::error!("({id:?}) Failed to send address for intentional disconnection handling: {send_err}");
-                                        }
-                                        break;
-                                    }
-                                };
-                            }
-                        });
-                        // `select!` is not needed because `packets_rx` returns `None` when
-                        // all senders are be dropped, and `disc_tx2.send(...)` above should
-                        // remove all senders from ECS.
-                        tokio::spawn(async move {
-                            while let Some(packet) = packets_rx.recv().await {
-                                log::trace!("({id:?}) Sending packet {:?}", packet);
-                                match write
-                                    .send(packet, Arc::clone(&serializer), &*packet_length_serializer)
-                                    .await
-                                {
-                                    Ok(()) => (),
-                                    Err(err) => {
-                                        log::error!("({id:?}) Error sending packet: {err}");
-                                        break;
-                                    }
-                                }
-                            }
-                        });
-                    }
-                });
-
-                // New connections
-                let binding_result = Config::Protocol::bind(address).await;
-                let listener = match binding_result {
-                    Ok(listener) => listener,
-                    Err(err) => {
-                        log::error!("Couldn't create listener at {}: {}", address, err);
-                        return;
-                    }
-                };
-                let _ = bound_tx.send(listener.address());
-
-                loop {
-                    select! {
-                        Ok(connection) = listener.accept() => {
-                            log::debug!("Accepting a connection from {:?}", connection.peer_addr());
-                            let (conn_tx_2, conn_tx2_2) = (conn_tx.clone(), conn_tx2.clone());
-                            tokio::spawn(async move {
-                                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                                let disconnect_task = DisconnectTask::default();
-                                let connection = RawConnection {
-                                    disconnect_task: disconnect_task.clone(),
-                                    stream: connection,
-                                    serializer: Arc::new(Config::build_serializer()),
-                                    packet_length_serializer: Arc::new(Default::default()),
-                                    id: ConnectionId::next(),
-                                    packets_rx: rx,
-                                };
-                                let ecs_conn = EcsConnection {
-                                    disconnect_task,
-                                    id: connection.id(),
-                                    packet_tx: tx,
-                                    local_addr: connection.local_addr(),
-                                    peer_addr: connection.peer_addr(),
-                                };
-                                if let Err(err) = conn_tx_2.send((ecs_conn.peer_addr, ecs_conn.clone())) {
-                                    log::error!("Failed to send new connection to ECS: {}", err);
-                                    return;
-                                }
-                                if let Err(err) = conn_tx2_2.send((connection, ecs_conn)) {
-                                    log::error!("Failed to send new raw connection: {}", err);
-                                }
-                            });
-                        }
-                        Some(addr) = disc_rx2.recv() => {
-                            listener.handle_disconnection(addr);
-                        }
-                        else => {
-                            break;
-                        }
-                    }
-                }
+#[cfg(target_family = "wasm")]
+fn publish_server_address<Config: ServerConfig>(
+    pending: Option<Res<PendingServerAddress<Config>>>,
+    mut commands: Commands,
+) {
+    let Some(pending) = pending else { return };
+    let result = pending
+        .receiver
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .try_recv();
+    match result {
+        Ok(address) => {
+            commands.insert_resource(ServerAddress::<Config> {
+                address,
+                _marker: PhantomData,
             });
+            commands.remove_resource::<PendingServerAddress<Config>>();
+        }
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            commands.remove_resource::<PendingServerAddress<Config>>();
+        }
+        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+    }
+}
+
+impl<Config: ServerConfig> ServerPlugin<Config> {
+    fn setup_system(
+        address: SocketAddr,
+    ) -> impl Fn(Commands, EndpointSetup<Self>, Res<crate::runtime::NetworkRuntime>) {
+        move |commands, endpoint, runtime| {
+            Self::setup(
+                commands,
+                address,
+                endpoint.queues(),
+                endpoint.receive_limits(),
+                &runtime,
+            );
+        }
+    }
+
+    fn setup(
+        mut commands: Commands,
+        address: SocketAddr,
+        queues: NetworkQueueSettings,
+        limits: ReceiveLimits,
+        runtime: &crate::runtime::NetworkRuntime,
+    ) {
+        let (incoming_tx, incoming_rx) = queues.incoming_channel();
+        let (connection_sender, incoming_connections) = queues.incoming_channel();
+        let (datagram_packet_tx, datagram_packet_rx) = lossy_channel(
+            queues.receive_capacity.max(1),
+            usize::MAX,
+            queues.datagram_receive_overflow,
+        );
+        let (disconnect_sender, incoming_disconnects) = queues.incoming_channel();
+        commands.insert_resource(IncomingReceiver::<Config>(incoming_rx));
+        if Config::Protocol::DATAGRAM {
+            commands.insert_resource(DatagramPacketReceiver::<Config> {
+                receiver: datagram_packet_rx,
+            });
+        }
+        // Native startup waits for bind; browsers must return to their event loop.
+        let (listener_address_tx, listener_address_rx) = std::sync::mpsc::sync_channel(1);
+
+        runtime.spawn_local(move || async move {
+            crate::runtime::spawn(Self::process_connections(
+                incoming_connections,
+                queues.receive_capacity,
+                datagram_packet_tx,
+                incoming_tx.clone(),
+                disconnect_sender,
+            ));
+            Self::accept_connections(
+                address,
+                queues,
+                limits,
+                incoming_tx,
+                connection_sender,
+                incoming_disconnects,
+                listener_address_tx,
+            )
+            .await;
         });
 
-        // Clients may connect right after Startup, so the listener must exist by then.
-        // Returns Err (no hang) if binding failed or the thread exited.
-        if let Ok(local_addr) = bound_rx.recv() {
+        #[cfg(target_family = "wasm")]
+        commands.insert_resource(PendingServerAddress::<Config> {
+            receiver: std::sync::Mutex::new(listener_address_rx),
+            _marker: PhantomData,
+        });
+        // Native clients may connect right after Startup, so bind must finish first.
+        #[cfg(not(target_family = "wasm"))]
+        if let Ok(local_addr) = listener_address_rx.recv() {
             commands.insert_resource(ServerAddress::<Config> {
                 address: local_addr,
                 _marker: PhantomData,
             });
+        }
+    }
+
+    async fn accept_connections(
+        address: SocketAddr,
+        queues: NetworkQueueSettings,
+        limits: ReceiveLimits,
+        incoming: Sender<IncomingMessage<Config>>,
+        connection_sender: Sender<ConnectedTransport<Config>>,
+        mut incoming_disconnects: Receiver<SocketAddr>,
+        listener_address_tx: std::sync::mpsc::SyncSender<SocketAddr>,
+    ) {
+        let listener = match Config::Protocol::bind(address).await {
+            Ok(listener) => listener,
+            Err(err) => {
+                log::error!("Couldn't create listener at {}: {}", address, err);
+                return;
+            }
+        };
+        let _ = listener_address_tx.send(listener.address());
+        let mut warned = false;
+        // Do not pause UDP acceptance: accept() also dispatches existing peers.
+        // Reject excess new peers before allocating a serializer or spawning work.
+        let pending = Arc::new(tokio::sync::Semaphore::new(queues.receive_capacity.max(1)));
+        loop {
+            select! {
+                result = listener.accept() => {
+                    let stream = match result {
+                        Ok(stream) => stream,
+                        Err(error) if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::Interrupted
+                                | std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::ConnectionReset
+                        ) => {
+                            tokio::task::yield_now().await;
+                            continue;
+                        }
+                        Err(error) => {
+                            log::error!("Listener at {} failed to accept: {error}", listener.address());
+                            break;
+                        }
+                    };
+                    let Ok(permit) = Arc::clone(&pending).try_acquire_owned() else {
+                        drop(stream);
+                        continue;
+                    };
+                    log::debug!("Accepting a connection from {:?}", stream.peer_addr());
+                    let serializer = Config::build_serializer();
+                    serializer.warn_if_stateful_over_datagrams::<Config::Protocol>(&mut warned);
+                    let limits = limits.clone();
+                    let incoming = incoming.clone();
+                    let connection_sender = connection_sender.clone();
+                    crate::runtime::spawn(async move {
+                        let _permit = permit;
+                        ConnectedTransport::<Config>::establish(
+                            stream,
+                            Arc::new(serializer),
+                            queues,
+                            limits,
+                            incoming,
+                            connection_sender,
+                        ).await;
+                    });
+                }
+                Some(addr) = incoming_disconnects.recv() => {
+                    listener.handle_disconnection(addr);
+                }
+                else => break,
+            }
+        }
+    }
+
+    async fn process_connections(
+        incoming_connections: Receiver<ConnectedTransport<Config>>,
+        setup_limit: usize,
+        datagram_packets: LossySender<PacketReceiveEvent<Config>>,
+        incoming: Sender<IncomingMessage<Config>>,
+        disconnect_sender: Sender<SocketAddr>,
+    ) {
+        run_connections(incoming_connections, setup_limit, |connection| {
+            connection.run(
+                datagram_packets.clone(),
+                incoming.clone(),
+                disconnect_sender.clone(),
+            )
+        })
+        .await;
+    }
+}
+
+impl<Config: ServerConfig> ConnectedTransport<Config> {
+    async fn establish(
+        stream: <Config::Protocol as Protocol>::ServerStream,
+        serializer: Arc<ServerSerializer<Config>>,
+        queues: NetworkQueueSettings,
+        limits: ReceiveLimits,
+        incoming: Sender<IncomingMessage<Config>>,
+        connection_sender: Sender<Self>,
+    ) {
+        let (tx, rx) = queues.outgoing_channel(Config::Protocol::DATAGRAM);
+        let connection = RawConnection::with_limits(
+            stream,
+            serializer,
+            Config::LengthSerializer::default(),
+            rx,
+            limits,
+        );
+        let ecs_conn = connection.ecs_connection(tx);
+        if let Err(err) = incoming
+            .send(IncomingMessage::Established(NewConnectionEvent::<Config> {
+                address: ecs_conn.peer_addr,
+                connection: ecs_conn.clone(),
+            }))
+            .await
+        {
+            log::error!("Failed to send new connection to ECS: {}", err);
+            return;
+        }
+        if let Err(err) = connection_sender
+            .send(Self {
+                connection,
+                ecs_connection: ecs_conn,
+            })
+            .await
+        {
+            log::error!("Failed to send new raw connection: {}", err);
+        }
+    }
+
+    async fn run(
+        self,
+        datagram_packets: LossySender<PacketReceiveEvent<Config>>,
+        incoming: Sender<IncomingMessage<Config>>,
+        disconnect_sender: Sender<SocketAddr>,
+    ) {
+        let RawConnection {
+            disconnect_task,
+            stream,
+            serializer,
+            packet_length_serializer,
+            packets_rx,
+            receive_limits,
+            id,
+        } = self.connection;
+        let (read, write) = match stream.into_split().await {
+            Ok(split) => split,
+            Err(err) => {
+                log::error!("({:?}) Couldn't split stream: {}", id, err);
+                self.ecs_connection.disconnect_task.cancel();
+                let _ = incoming
+                    .send(IncomingMessage::Closed(DisconnectionEvent {
+                        error: ReceiveError::Io(err),
+                        connection: self.ecs_connection,
+                    }))
+                    .await;
+                return;
+            }
+        };
+        let transport = self.ecs_connection.transport().clone();
+        let (send_error_tx, send_error_rx) = tokio::sync::oneshot::channel();
+        crate::runtime::spawn(Self::receive_packets(
+            read,
+            self.ecs_connection,
+            ReceiveTaskState {
+                codecs: PacketCodecs {
+                    serializer: Arc::clone(&serializer),
+                    packet_length_serializer: Arc::clone(&packet_length_serializer),
+                },
+                receive_limits,
+                send_error: send_error_rx,
+            },
+            datagram_packets,
+            incoming,
+            disconnect_sender,
+        ));
+        crate::runtime::spawn(send_packets(
+            write,
+            PacketCodecs {
+                serializer,
+                packet_length_serializer,
+            },
+            SendTaskState {
+                packets_rx,
+                disconnect_task,
+                id,
+                transport,
+                send_error: send_error_tx,
+            },
+        ));
+    }
+
+    async fn receive_packets(
+        mut read: impl PacketReader,
+        ecs_conn: ServerConnection<Config>,
+        state: ReceiveTaskState<ServerSerializer<Config>, Config::LengthSerializer>,
+        datagram_packets: LossySender<PacketReceiveEvent<Config>>,
+        incoming: Sender<IncomingMessage<Config>>,
+        disconnect_sender: Sender<SocketAddr>,
+    ) {
+        let ReceiveTaskState {
+            codecs:
+                PacketCodecs {
+                    serializer,
+                    packet_length_serializer,
+                },
+            receive_limits,
+            mut send_error,
+        } = state;
+        let disconnect_task = &ecs_conn.disconnect_task;
+        let id = ecs_conn.id();
+        let _guard = disconnect_task.clone().drop_guard();
+        let datagram_packets = PacketForwarder::new(
+            datagram_packets,
+            Config::Protocol::DATAGRAM,
+            disconnect_task.clone(),
+            ecs_conn.transport().clone(),
+        );
+        let error = loop {
+            tokio::select! {
+                biased;
+                Ok(error) = &mut send_error => break ReceiveError::Io(error),
+                () = disconnect_task.cancelled() => break ReceiveError::IntentionalDisconnection,
+                result = read.receive_with_timestamp(Arc::clone(&serializer), &*packet_length_serializer, &receive_limits) => {
+                    match result {
+                        Ok((packet, received_at)) => {
+                            log::trace!("({id:?}) Received packet {packet:?}");
+                            let event = PacketReceiveEvent::<Config> {
+                                connection: ecs_conn.clone(),
+                                packet,
+                                received_at,
+                            };
+                            let forwarded = if Config::Protocol::DATAGRAM {
+                                datagram_packets.forward(event, |discarded| {
+                                    discarded.connection.record_drop(QueueDropReason::ReceiveQueueEvicted);
+                                }).await
+                            } else {
+                                tokio::select! {
+                                    biased;
+                                    () = disconnect_task.cancelled() => false,
+                                    result = incoming.send(IncomingMessage::StreamPacket(event)) => result.is_ok(),
+                                }
+                            };
+                            if !forwarded {
+                                break ReceiveError::IntentionalDisconnection;
+                            }
+                        }
+                        Err(err) => break err,
+                    }
+                }
+            }
+        };
+        // A failed writer cancels forwarding too; retain its cause even if the
+        // receive task was waiting for ECS queue capacity when cancellation arrived.
+        let error = send_error.try_recv().map_or(error, ReceiveError::Io);
+        disconnect_task.cancel();
+        read.close();
+        if let Err(err) = incoming
+            .send(IncomingMessage::Closed(DisconnectionEvent::<Config> {
+                error,
+                connection: ecs_conn.clone(),
+            }))
+            .await
+        {
+            log::debug!("({id:?}) Disconnection receiver closed: {err:?}");
+        }
+        if let Err(err) = disconnect_sender.send(ecs_conn.peer_addr).await {
+            log::debug!("({id:?}) Listener closed: {err}");
         }
     }
 }
@@ -310,13 +565,16 @@ pub struct ServerAddress<Config: ServerConfig> {
 
 impl<Config: ServerConfig> ServerAddress<Config> {
     /// The bound address.
-    pub fn address(&self) -> SocketAddr {
+    #[must_use]
+    pub const fn address(&self) -> SocketAddr {
         self.address
     }
 }
 
-/// A new client has connected.
+/// A transport peer is available.
+/// For UDP the first datagram creates a local peer; its sender is not validated.
 #[derive(Event)]
+#[non_exhaustive]
 pub struct NewConnectionEvent<Config: ServerConfig> {
     /// The connection.
     pub connection: ServerConnection<Config>,
@@ -326,57 +584,362 @@ pub struct NewConnectionEvent<Config: ServerConfig> {
 
 /// A client disconnected.
 #[derive(Event)]
+#[non_exhaustive]
 pub struct DisconnectionEvent<Config: ServerConfig> {
     /// The error.
-    pub error: ReceiveError<Config::DecodeError, Config::LengthSerializer>,
+    pub error: ReceiveError<
+        Config::DecodeError,
+        <Config::LengthSerializer as PacketLengthSerializer>::Error,
+    >,
     /// The connection.
     pub connection: ServerConnection<Config>,
 }
 
 /// Sent for every packet received.
 #[derive(Event)]
+#[non_exhaustive]
 pub struct PacketReceiveEvent<Config: ServerConfig> {
     /// The connection.
     pub connection: ServerConnection<Config>,
     /// The packet.
     pub packet: Config::ClientPacket,
+    /// When the built-in transport finished reading the packet, before decoding or queueing.
+    /// Custom protocols use [`PacketReader::receive_with_timestamp`] semantics.
+    pub received_at: Instant,
 }
 
-fn accept_new_connections<Config: ServerConfig>(
-    mut receiver: ResMut<ConnectionReceiver<Config>>,
+fn incoming_system<Config: ServerConfig>(
+    mut incoming: ResMut<IncomingReceiver<Config>>,
+    queues: Option<Res<NetworkQueueSettings>>,
+    settings: Option<Res<ServerSettings<Config>>>,
     mut commands: Commands,
 ) {
-    while let Ok((address, connection)) = receiver.0.try_recv() {
-        commands.trigger(NewConnectionEvent::<Config> {
-            connection,
-            address,
+    let budget = ServerSettings::<Config>::resolve_queues(settings.as_deref(), queues.as_deref())
+        .events_per_frame;
+    for _ in 0..budget {
+        match incoming.0.try_recv() {
+            Ok(IncomingMessage::Established(event)) => {
+                // Registry changes and observers share the same command order as packets.
+                commands.queue(move |world: &mut World| {
+                    world
+                        .resource_mut::<ServerConnections<Config>>()
+                        .register(event.connection.clone());
+                    event.connection.mark_published();
+                    world.trigger(event);
+                });
+            }
+            Ok(IncomingMessage::StreamPacket(packet)) => commands.trigger(packet),
+            Ok(IncomingMessage::Closed(closed)) => {
+                commands.queue(move |world: &mut World| {
+                    world
+                        .resource_mut::<ServerConnections<Config>>()
+                        .remove_connection(closed.connection.id());
+                    world.trigger(closed);
+                });
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn receive_datagram_packets<Config: ServerConfig>(
+    mut datagram_packets: ResMut<DatagramPacketReceiver<Config>>,
+    queues: Option<Res<NetworkQueueSettings>>,
+    settings: Option<Res<ServerSettings<Config>>>,
+    mut commands: Commands,
+) {
+    let budget = ServerSettings::<Config>::resolve_queues(settings.as_deref(), queues.as_deref())
+        .events_per_frame;
+    for _ in 0..budget {
+        let next = datagram_packets.receiver.try_recv_if(|packet| {
+            packet.connection.is_published() || packet.connection.disconnect_task.is_cancelled()
         });
+        let Ok(packet) = next else { break };
+        if packet.connection.disconnect_task.is_cancelled() {
+            packet
+                .connection
+                .record_drop(QueueDropReason::ClosedBeforeDelivery);
+        } else {
+            commands.queue(move |world: &mut World| {
+                if packet.connection.disconnect_task.is_cancelled() {
+                    packet
+                        .connection
+                        .record_drop(QueueDropReason::ClosedBeforeDelivery);
+                } else {
+                    world.trigger(packet);
+                }
+            });
+        }
     }
 }
 
-fn connection_add_system<Config: ServerConfig>(
-    new_connection: On<NewConnectionEvent<Config>>,
-    mut connections: ResMut<ServerConnections<Config>>,
-) {
-    connections.push(new_connection.event().connection.clone());
-}
+#[cfg(all(test, feature = "protocol_tcp", feature = "serializer_bitcode_serde"))]
+mod listener_tests {
+    use super::*;
+    use crate::protocols::tcp::TcpNetworkStream;
+    use crate::serializers::bitcode_serde::BitcodeSerdeSerializer;
+    use crate::serializers::packet_length_serializer::LittleEndian;
+    use crate::serializers::serializer::SerializerAdapter;
+    use std::io::{self, ErrorKind};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-fn accept_new_packets<Config: ServerConfig>(
-    mut receiver: ResMut<PacketReceiver<Config>>,
-    mut commands: Commands,
-) {
-    while let Ok((connection, packet)) = receiver.0.try_recv() {
-        commands.trigger(PacketReceiveEvent::<Config> { connection, packet });
+    static ACCEPTS: AtomicUsize = AtomicUsize::new(0);
+
+    struct ErrorListener(SocketAddr);
+
+    #[async_trait::async_trait]
+    impl Listener for ErrorListener {
+        type Stream = TcpNetworkStream;
+
+        async fn accept(&self) -> io::Result<Self::Stream> {
+            let error = match ACCEPTS.fetch_add(1, Ordering::SeqCst) {
+                0 => ErrorKind::Interrupted,
+                1 => ErrorKind::ConnectionAborted,
+                2 => ErrorKind::ConnectionReset,
+                _ => ErrorKind::PermissionDenied,
+            };
+            Err(error.into())
+        }
+
+        fn address(&self) -> SocketAddr {
+            self.0
+        }
+    }
+
+    struct ErrorProtocol;
+
+    #[async_trait::async_trait]
+    impl Protocol for ErrorProtocol {
+        type Handle = ();
+        type Listener = ErrorListener;
+        type ServerStream = TcpNetworkStream;
+        type ClientStream = TcpNetworkStream;
+
+        async fn bind(address: SocketAddr) -> io::Result<Self::Listener> {
+            Ok(ErrorListener(address))
+        }
+    }
+
+    struct Config;
+
+    impl ServerConfig for Config {
+        type ClientPacket = u8;
+        type ServerPacket = u8;
+        type Protocol = ErrorProtocol;
+        type EncodeError = bitcode::Error;
+        type DecodeError = bitcode::Error;
+        type LengthSerializer = LittleEndian<u32>;
+
+        fn build_serializer() -> SerializerAdapter<u8, u8, bitcode::Error, bitcode::Error> {
+            SerializerAdapter::ReadOnly(Arc::new(BitcodeSerdeSerializer))
+        }
+    }
+
+    #[tokio::test]
+    async fn listener_retries_transient_errors_and_stops_on_fatal_error() {
+        let queues = NetworkQueueSettings::default();
+        let (incoming, _messages) = queues.incoming_channel();
+        let (connections, _accepted) = queues.incoming_channel();
+        // Keep the channel open and empty, as it is before the first connection.
+        let (_disconnects, incoming_disconnects) = queues.incoming_channel();
+        let (address_tx, _address_rx) = std::sync::mpsc::sync_channel(1);
+        let task = ServerPlugin::<Config>::accept_connections(
+            ([127, 0, 0, 1], 1234).into(),
+            queues,
+            ReceiveLimits::default(),
+            incoming,
+            connections,
+            incoming_disconnects,
+            address_tx,
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                .await
+                .is_ok()
+        );
+        assert_eq!(ACCEPTS.load(Ordering::SeqCst), 4);
     }
 }
 
-fn remove_connections<Config: ServerConfig>(
-    mut connections: ResMut<ServerConnections<Config>>,
-    mut disconnections: ResMut<DisconnectionReceiver<Config>>,
-    mut commands: Commands,
-) {
-    while let Ok((error, connection)) = disconnections.0.try_recv() {
-        connections.retain(|conn| conn.id() != connection.id());
-        commands.trigger(DisconnectionEvent::<Config> { error, connection });
+#[cfg(all(test, feature = "protocol_udp", feature = "serializer_bitcode_serde"))]
+mod udp_lifecycle_tests {
+    use super::*;
+    use crate::connection::lossy_channel;
+    use crate::connection::OverflowPolicy;
+    use crate::protocols::udp::{UdpConnectionHandle, UdpProtocol};
+    use crate::serializers::bitcode_serde::BitcodeSerdeSerializer;
+    use crate::serializers::packet_length_serializer::LittleEndian;
+    use crate::serializers::serializer::SerializerAdapter;
+    use tokio_util::sync::CancellationToken;
+
+    struct Config;
+    impl ServerConfig for Config {
+        type ClientPacket = u8;
+        type ServerPacket = u8;
+        type Protocol = UdpProtocol;
+        type EncodeError = bitcode::Error;
+        type DecodeError = bitcode::Error;
+        type LengthSerializer = LittleEndian<u32>;
+        fn build_serializer() -> SerializerAdapter<u8, u8, bitcode::Error, bitcode::Error> {
+            SerializerAdapter::ReadOnly(Arc::new(BitcodeSerdeSerializer))
+        }
+    }
+
+    #[derive(Default, Resource)]
+    struct PacketEvents(usize);
+
+    #[test]
+    fn udp_observer_commands_are_visible_after_receive() {
+        let settings = NetworkQueueSettings::default();
+        let (incoming_tx, incoming_rx) = settings.incoming_channel();
+        let (packet_tx, packet_rx) = lossy_channel(1, usize::MAX, OverflowPolicy::DropNewest);
+        let (outgoing, _rx) = settings.outgoing_channel::<_, UdpConnectionHandle>(true);
+        let address = ([127, 0, 0, 1], 1234).into();
+        let connection = EcsConnection {
+            _endpoint: PhantomData,
+            disconnect_task: CancellationToken::new(),
+            id: ConnectionId::next(),
+            published: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            packet_tx: outgoing,
+            transport: UdpConnectionHandle::new(128, None),
+            local_addr: address,
+            peer_addr: address,
+        };
+        assert!(incoming_tx
+            .try_send(IncomingMessage::Established(NewConnectionEvent {
+                address,
+                connection: connection.clone(),
+            }))
+            .is_ok());
+        assert!(packet_tx
+            .try_send(
+                PacketReceiveEvent {
+                    connection,
+                    packet: 7,
+                    received_at: Instant::now(),
+                },
+                1,
+            )
+            .is_ok());
+
+        let mut app = App::new();
+        app.insert_resource(ServerConnections::<Config>::new())
+            .insert_resource(IncomingReceiver::<Config>(incoming_rx))
+            .insert_resource(DatagramPacketReceiver::<Config> {
+                receiver: packet_rx,
+            })
+            .add_observer(
+                |_: On<NewConnectionEvent<Config>>, mut commands: Commands| {
+                    commands.init_resource::<PacketEvents>();
+                },
+            )
+            .add_observer(
+                |event: On<PacketReceiveEvent<Config>>,
+                 connections: Res<ServerConnections<Config>>,
+                 events: Res<PacketEvents>,
+                 mut commands: Commands| {
+                    assert_eq!(connections.first().unwrap().id(), event.connection.id());
+                    commands.insert_resource(PacketEvents(events.0 + 1));
+                },
+            )
+            .add_systems(
+                PreUpdate,
+                (|events: Res<PacketEvents>| assert_eq!(events.0, 1))
+                    .after(ServerSystems::<Config>::RECEIVE),
+            );
+        configure_receive_systems::<Config>(&mut app);
+        app.update();
+        assert_eq!(app.world().resource::<PacketEvents>().0, 1);
+    }
+
+    #[test]
+    fn cancelled_udp_packet_is_dropped_while_server_close_waits() {
+        let settings = NetworkQueueSettings {
+            events_per_frame: 1,
+            ..Default::default()
+        };
+        let (incoming_tx, incoming_rx) = settings.incoming_channel();
+        let (packet_tx, packet_rx) = lossy_channel(1, usize::MAX, OverflowPolicy::DropNewest);
+        let (outgoing, _rx) = settings.outgoing_channel::<_, UdpConnectionHandle>(true);
+        let udp = UdpConnectionHandle::new(128, None);
+        let address: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let connection = EcsConnection {
+            _endpoint: PhantomData,
+            disconnect_task: CancellationToken::new(),
+            id: ConnectionId::next(),
+            published: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            packet_tx: outgoing,
+            transport: udp.clone(),
+            local_addr: address,
+            peer_addr: address,
+        };
+        assert!(incoming_tx
+            .try_send(IncomingMessage::Established(NewConnectionEvent {
+                address,
+                connection: connection.clone(),
+            }))
+            .is_ok());
+        assert!(incoming_tx
+            .try_send(IncomingMessage::Closed(DisconnectionEvent {
+                error: ReceiveError::IntentionalDisconnection,
+                connection: connection.clone(),
+            }))
+            .is_ok());
+        assert!(packet_tx
+            .try_send(
+                PacketReceiveEvent {
+                    connection: connection.clone(),
+                    packet: 7,
+                    received_at: Instant::now(),
+                },
+                1
+            )
+            .is_ok());
+        connection.disconnect();
+
+        let mut app = App::new();
+        app.insert_resource(settings);
+        app.insert_resource(ServerConnections::<Config>::new());
+        app.insert_resource(IncomingReceiver::<Config>(incoming_rx));
+        app.insert_resource(DatagramPacketReceiver::<Config> {
+            receiver: packet_rx,
+        });
+        app.insert_resource(PacketEvents::default());
+        configure_receive_systems::<Config>(&mut app);
+        app.add_observer(
+            |_: On<PacketReceiveEvent<Config>>, mut events: ResMut<PacketEvents>| {
+                events.0 += 1;
+            },
+        );
+
+        app.insert_resource(ServerSettings::<Config>::default().with_queues(
+            NetworkQueueSettings {
+                events_per_frame: 0,
+                ..settings
+            },
+        ));
+        app.update();
+        assert!(app
+            .world()
+            .resource::<ServerConnections<Config>>()
+            .is_empty());
+        assert_eq!(udp.stats().dropped_closed_before_delivery, 0);
+        app.world_mut().remove_resource::<ServerSettings<Config>>();
+
+        app.update();
+        assert_eq!(app.world().resource::<ServerConnections<Config>>().len(), 1);
+        assert_eq!(app.world().resource::<PacketEvents>().0, 0);
+        assert_eq!(udp.stats().dropped_closed_before_delivery, 1);
+        app.update();
+        assert!(app
+            .world()
+            .resource::<ServerConnections<Config>>()
+            .is_empty());
+        assert_eq!(app.world().resource::<PacketEvents>().0, 0);
     }
 }
+
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[path = "../benches/utils/server.rs"]
+pub mod bench_utils;

@@ -2,7 +2,7 @@
 //!
 //! Kept for compatibility only: bincode is unmaintained upstream. Prefer `serializer_bitcode`.
 
-use crate::serializer::ReadOnlySerializer;
+use crate::serializers::serializer::ReadOnlySerializer;
 pub use bincode::config;
 use bincode::config::Configuration;
 
@@ -15,6 +15,8 @@ pub struct BincodeSerializer {
 }
 
 impl BincodeSerializer {
+    /// Creates a serializer with its default configuration.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -37,8 +39,8 @@ where
     type EncodeError = bincode::error::EncodeError;
     type DecodeError = bincode::error::DecodeError;
 
-    fn serialize(&self, t: SendingPacket) -> Result<Vec<u8>, Self::EncodeError> {
-        bincode::encode_to_vec(&t, self.config)
+    fn serialize(&self, packet: SendingPacket) -> Result<Vec<u8>, Self::EncodeError> {
+        bincode::encode_to_vec(&packet, self.config)
     }
 
     fn deserialize(&self, bytes: &[u8]) -> Result<ReceivingPacket, Self::DecodeError> {
@@ -64,11 +66,11 @@ mod tests {
             message: "Hello".to_string(),
         };
 
-        let serialized =
+        let encoded =
             ReadOnlySerializer::<TestPacket, TestPacket>::serialize(&serializer, packet.clone())
                 .unwrap();
         let deserialized: TestPacket =
-            ReadOnlySerializer::<TestPacket, TestPacket>::deserialize(&serializer, &serialized)
+            ReadOnlySerializer::<TestPacket, TestPacket>::deserialize(&serializer, &encoded)
                 .unwrap();
 
         assert_eq!(packet, deserialized);
@@ -78,15 +80,15 @@ mod tests {
     fn test_large_packet() {
         let serializer = BincodeSerializer::default();
         let packet = TestPacket {
-            id: 999999,
+            id: 999_999,
             message: "A".repeat(10000),
         };
 
-        let serialized =
+        let encoded =
             ReadOnlySerializer::<TestPacket, TestPacket>::serialize(&serializer, packet.clone())
                 .unwrap();
         let deserialized: TestPacket =
-            ReadOnlySerializer::<TestPacket, TestPacket>::deserialize(&serializer, &serialized)
+            ReadOnlySerializer::<TestPacket, TestPacket>::deserialize(&serializer, &encoded)
                 .unwrap();
 
         assert_eq!(packet, deserialized);
@@ -100,11 +102,11 @@ mod tests {
             message: String::new(),
         };
 
-        let serialized =
+        let encoded =
             ReadOnlySerializer::<TestPacket, TestPacket>::serialize(&serializer, packet.clone())
                 .unwrap();
         let deserialized: TestPacket =
-            ReadOnlySerializer::<TestPacket, TestPacket>::deserialize(&serializer, &serialized)
+            ReadOnlySerializer::<TestPacket, TestPacket>::deserialize(&serializer, &encoded)
                 .unwrap();
 
         assert_eq!(packet, deserialized);

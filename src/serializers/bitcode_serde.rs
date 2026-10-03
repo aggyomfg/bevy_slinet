@@ -1,17 +1,16 @@
 //! A [`bitcode`]-based packet serializer with serde support.
 
-use crate::serializer::ReadOnlySerializer;
+use crate::serializers::serializer::ReadOnlySerializer;
 use serde::{Deserialize, Serialize};
 
-/// Bitcode serializer using serde traits.
-/// Provides compatibility with other serde-based formats.
-///
-/// For better performance without serde overhead, use `BitcodeSerializer` instead.
+/// Encodes packets through [`serde`] using the bitcode format.
 #[derive(Clone, Default)]
 pub struct BitcodeSerdeSerializer;
 
 impl BitcodeSerdeSerializer {
-    pub fn new() -> Self {
+    /// Creates a serializer with its default configuration.
+    #[must_use]
+    pub const fn new() -> Self {
         Self
     }
 }
@@ -25,8 +24,8 @@ where
     type EncodeError = bitcode::Error;
     type DecodeError = bitcode::Error;
 
-    fn serialize(&self, t: SendingPacket) -> Result<Vec<u8>, Self::EncodeError> {
-        bitcode::serialize(&t)
+    fn serialize(&self, packet: SendingPacket) -> Result<Vec<u8>, Self::EncodeError> {
+        bitcode::serialize(&packet)
     }
 
     fn deserialize(&self, bytes: &[u8]) -> Result<ReceivingPacket, Self::DecodeError> {
@@ -56,8 +55,8 @@ mod tests {
         T: Serialize + for<'de> Deserialize<'de> + Clone,
     {
         let serializer = BitcodeSerdeSerializer::new();
-        let serialized = ReadOnlySerializer::<T, T>::serialize(&serializer, packet).unwrap();
-        ReadOnlySerializer::<T, T>::deserialize(&serializer, &serialized).unwrap()
+        let encoded = ReadOnlySerializer::<T, T>::serialize(&serializer, packet).unwrap();
+        ReadOnlySerializer::<T, T>::deserialize(&serializer, &encoded).unwrap()
     }
 
     #[test]
@@ -72,7 +71,7 @@ mod tests {
     #[test]
     fn test_large_packet() {
         let packet = TestPacket {
-            id: 999999,
+            id: 999_999,
             message: "A".repeat(10000),
         };
         assert_eq!(roundtrip(packet.clone()), packet);

@@ -5,3 +5,8 @@
 /.cargo/config.toml
 /*.iml
 /.direnv
+
+# Local benchmark measurements and machine-specific reports
+/docs/benchmark-results/
+/docs/benchmark-baseline.md
+/criterion/

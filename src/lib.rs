@@ -4,64 +4,35 @@
 
 use std::{error::Error, fmt::Debug};
 
-use crate::packet_length_serializer::PacketLengthSerializer;
-use crate::protocol::Protocol;
-use bevy::prelude::SystemSet;
-use serializer::SerializerAdapter;
+use crate::protocols::protocol::Protocol;
+use crate::serializers::packet_length_serializer::PacketLengthSerializer;
+use serializers::serializer::SerializerAdapter;
 
 #[cfg(feature = "client")]
 pub mod client;
 pub mod connection;
-pub mod packet_length_serializer;
-pub mod protocol;
 pub mod protocols;
-pub mod serializer;
+#[cfg_attr(target_family = "wasm", path = "runtime/wasm.rs")]
+pub mod runtime;
+mod scheduling;
+
 pub mod serializers;
+pub use scheduling::{NetworkSystems, SystemSets};
 #[cfg(feature = "server")]
 pub mod server;
 
+// Preserve the original public module paths.
+pub use protocols::protocol;
+pub use serializers::{packet_length_serializer, serializer};
+
 #[cfg(all(
     test,
     feature = "client",
     feature = "server",
-    feature = "protocol_tcp",
+    any(feature = "protocol_tcp", feature = "protocol_udp"),
     feature = "serializer_bitcode_serde"
 ))]
 mod tests;
-#[cfg(all(
-    test,
-    feature = "client",
-    feature = "server",
-    feature = "protocol_tcp",
-    feature = "serializer_bitcode",
-    feature = "serializer_bitcode_serde"
-))]
-mod tests_mut_serializer;
-
-/// [`SystemSets`](bevy::ecs::schedule::SystemSet) in [`bevy`] are used for system ordering.
-/// See [System Sets][cheatbook_systemsets] on unofficial bevy cheatbook for details.
-/// For more details on what each SystemSet means, refer to the source code of
-#[cfg_attr(feature = "client", doc = "[`client`]")]
-#[cfg_attr(not(feature = "client"), doc = "`client`")]
-/// or
-#[cfg_attr(feature = "server", doc = "[`server`].")]
-#[cfg_attr(not(feature = "server"), doc = "`server`.")]
-///
-/// [cheatbook_systemsets]: https://bevy-cheatbook.github.io/programming/system-sets.html
-#[derive(Clone, Debug, Eq, Hash, PartialEq, SystemSet)]
-#[allow(missing_docs)]
-pub enum SystemSets {
-    ClientPacketReceive,
-    ClientConnectionEstablish,
-    ClientConnectionRemove,
-    ClientConnectionRequest,
-    ServerConnectionAdd,
-    ServerAcceptNewConnections,
-    ServerAcceptNewPackets,
-    ServerRemoveConnections,
-    SetMaxPacketSize,
-    MaxPacketSizeWarning,
-}
 
 /// A server plugin config.
 pub trait ServerConfig: Send + Sync + 'static {
@@ -108,3 +79,9 @@ pub trait ClientConfig: Send + Sync + 'static {
     /// A packet length serializer
     type LengthSerializer: PacketLengthSerializer + Default;
 }
+
+/// Unstable fixtures for this repository's benchmarks, excluded from normal builds.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[path = "../benches/utils/mod.rs"]
+pub mod bench_utils;

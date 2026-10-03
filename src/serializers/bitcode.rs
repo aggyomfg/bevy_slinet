@@ -2,17 +2,16 @@
 
 use std::convert::Infallible;
 
-use crate::serializer::ReadOnlySerializer;
+use crate::serializers::serializer::ReadOnlySerializer;
 
-/// Bitcode serializer using native [`bitcode::Encode`]/[`bitcode::Decode`] traits.
-/// This is the fastest and most compact option.
-///
-/// For serde compatibility, use `BitcodeSerdeSerializer` instead.
+/// Encodes packets using native [`bitcode::Encode`]/[`bitcode::Decode`] traits.
 #[derive(Clone, Default)]
 pub struct BitcodeSerializer;
 
 impl BitcodeSerializer {
-    pub fn new() -> Self {
+    /// Creates a serializer with its default configuration.
+    #[must_use]
+    pub const fn new() -> Self {
         Self
     }
 }
@@ -26,8 +25,8 @@ where
     type EncodeError = Infallible;
     type DecodeError = bitcode::Error;
 
-    fn serialize(&self, t: SendingPacket) -> Result<Vec<u8>, Self::EncodeError> {
-        Ok(bitcode::encode(&t))
+    fn serialize(&self, packet: SendingPacket) -> Result<Vec<u8>, Self::EncodeError> {
+        Ok(bitcode::encode(&packet))
     }
 
     fn deserialize(&self, bytes: &[u8]) -> Result<ReceivingPacket, Self::DecodeError> {
@@ -57,8 +56,8 @@ mod tests {
         T: bitcode::Encode + bitcode::DecodeOwned + Clone,
     {
         let serializer = BitcodeSerializer::new();
-        let serialized = ReadOnlySerializer::<T, T>::serialize(&serializer, packet).unwrap();
-        ReadOnlySerializer::<T, T>::deserialize(&serializer, &serialized).unwrap()
+        let encoded = ReadOnlySerializer::<T, T>::serialize(&serializer, packet).unwrap();
+        ReadOnlySerializer::<T, T>::deserialize(&serializer, &encoded).unwrap()
     }
 
     #[test]
@@ -73,7 +72,7 @@ mod tests {
     #[test]
     fn test_large_packet() {
         let packet = TestPacket {
-            id: 999999,
+            id: 999_999,
             message: "A".repeat(10000),
         };
         assert_eq!(roundtrip(packet.clone()), packet);
@@ -103,9 +102,9 @@ mod tests {
     #[test]
     fn test_tcp_echo() {
         use crate::client::{self, ClientPlugin, ConnectionEstablishEvent};
-        use crate::packet_length_serializer::LittleEndian;
         use crate::protocols::tcp::TcpProtocol;
-        use crate::serializer::SerializerAdapter;
+        use crate::serializers::packet_length_serializer::LittleEndian;
+        use crate::serializers::serializer::SerializerAdapter;
         use crate::server::{self, ServerAddress, ServerPlugin};
         use crate::{ClientConfig, ServerConfig};
         use bevy::prelude::*;

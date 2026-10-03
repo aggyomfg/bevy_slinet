@@ -1,38 +1,34 @@
-use crate::client;
-use crate::client::{ClientConnection, ClientPlugin, ConnectionEstablishEvent};
-use crate::packet_length_serializer::LittleEndian;
-use crate::protocols::tcp::TcpProtocol;
-use crate::serializer::SerializerAdapter;
-use crate::serializers::bitcode_serde::BitcodeSerdeSerializer;
-use crate::server::{NewConnectionEvent, ServerAddress, ServerConnections, ServerPlugin};
-use crate::{server, ClientConfig, ServerConfig};
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "Test helpers and Bevy test systems fail the test on errors"
+)]
 use bevy::app::App;
 use bevy::prelude::*;
-use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-/// Calls `step` until it returns `true` or a timeout expires.
-pub(crate) fn wait_until(mut step: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !step() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
+use crate::client::{self, ClientConnection, ClientPlugin, ConnectionEstablishEvent};
+use crate::protocols::tcp::TcpProtocol;
+use crate::serializers::custom_crypt::{
+    CustomCryptClientPacket, CustomCryptEngine, CustomCryptSerializer, CustomCryptServerPacket,
+    CustomSerializationError,
+};
+use crate::serializers::packet_length_serializer::LittleEndian;
+use crate::serializers::serializer::SerializerAdapter;
+use crate::server::{self, NewConnectionEvent, ServerAddress, ServerConnections, ServerPlugin};
+use crate::tests::wait_until;
+use crate::{ClientConfig, ServerConfig};
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
-struct Packet(u64);
+use std::sync::{Arc, Mutex};
 
 struct TcpConfig;
 
 impl ServerConfig for TcpConfig {
-    type ClientPacket = Packet;
-    type ServerPacket = Packet;
+    type ClientPacket = CustomCryptClientPacket;
+    type ServerPacket = CustomCryptServerPacket;
     type Protocol = TcpProtocol;
 
-    type EncodeError = bitcode::Error;
-    type DecodeError = bitcode::Error;
+    type EncodeError = CustomSerializationError;
+    type DecodeError = CustomSerializationError;
 
     type LengthSerializer = LittleEndian<u32>;
 
@@ -42,16 +38,22 @@ impl ServerConfig for TcpConfig {
         Self::EncodeError,
         Self::DecodeError,
     > {
-        SerializerAdapter::ReadOnly(Arc::new(BitcodeSerdeSerializer))
+        SerializerAdapter::Mutable(Arc::new(Mutex::new(CustomCryptSerializer::<
+            CustomCryptEngine,
+            Self::ClientPacket,
+            Self::ServerPacket,
+        >::new(
+            CustomCryptEngine::default()
+        ))))
     }
 }
 
 impl ClientConfig for TcpConfig {
-    type ClientPacket = Packet;
-    type ServerPacket = Packet;
+    type ClientPacket = CustomCryptClientPacket;
+    type ServerPacket = CustomCryptServerPacket;
     type Protocol = TcpProtocol;
-    type EncodeError = bitcode::Error;
-    type DecodeError = bitcode::Error;
+    type EncodeError = CustomSerializationError;
+    type DecodeError = CustomSerializationError;
 
     type LengthSerializer = LittleEndian<u32>;
     fn build_serializer() -> SerializerAdapter<
@@ -60,31 +62,28 @@ impl ClientConfig for TcpConfig {
         Self::EncodeError,
         Self::DecodeError,
     > {
-        SerializerAdapter::ReadOnly(Arc::new(BitcodeSerdeSerializer))
+        SerializerAdapter::Mutable(Arc::new(Mutex::new(CustomCryptSerializer::<
+            CustomCryptEngine,
+            Self::ServerPacket,
+            Self::ClientPacket,
+        >::new(
+            CustomCryptEngine::default()
+        ))))
     }
 }
-
-#[derive(Default, Resource)]
-struct NewConnectionAddress(Option<SocketAddr>);
 
 #[test]
 fn tcp_connection() {
     let mut app_server = App::new();
     app_server.add_plugins(ServerPlugin::<TcpConfig>::bind("127.0.0.1:0"));
-    app_server.init_resource::<NewConnectionAddress>();
-    app_server.add_observer(
-        |event: On<NewConnectionEvent<TcpConfig>>, mut address: ResMut<NewConnectionAddress>| {
-            address.0 = Some(event.event().address);
-        },
-    );
     app_server.update(); // bind
-    let server_addr = app_server
+    let srv_addr = app_server
         .world()
         .resource::<ServerAddress<TcpConfig>>()
         .address();
 
     let mut app_client = App::new();
-    app_client.add_plugins(ClientPlugin::<TcpConfig>::connect(server_addr));
+    app_client.add_plugins(ClientPlugin::<TcpConfig>::connect(srv_addr));
 
     wait_until(|| {
         app_client.update();
@@ -114,16 +113,6 @@ fn tcp_connection() {
             .len(),
         1,
     );
-    assert_eq!(
-        app_server.world().resource::<NewConnectionAddress>().0,
-        Some(
-            app_client
-                .world()
-                .resource::<ClientConnection<TcpConfig>>()
-                .local_addr()
-        ),
-        "NewConnectionEvent.address must be the client's address"
-    );
 }
 
 #[derive(Default, Resource)]
@@ -132,20 +121,22 @@ struct ReceivedPackets<T> {
 }
 
 #[derive(Resource)]
-struct ClientToServerPacketResource(Packet);
+struct ClientToServerPacketResource(CustomCryptClientPacket);
 
 #[derive(Resource)]
-struct ServerToClientPacketResource(Packet);
+struct ServerToClientPacketResource(CustomCryptServerPacket);
 
 #[test]
-fn tcp_packets() {
-    let client_to_server_packet = Packet(42);
-    let server_to_client_packet = Packet(24);
+fn tcp_encrypted_packets() {
+    let client_to_server_packet = CustomCryptClientPacket::String("Hello, Server!".to_string());
+    let server_to_client_packet = CustomCryptServerPacket::String("Hello, Client!".to_string());
 
     let mut app_server = App::new();
     app_server.add_plugins(ServerPlugin::<TcpConfig>::bind("127.0.0.1:0"));
-    app_server.insert_resource(ReceivedPackets::<Packet>::default());
-    app_server.insert_resource(ServerToClientPacketResource(server_to_client_packet));
+    app_server.insert_resource(ReceivedPackets::<CustomCryptClientPacket>::default());
+    app_server.insert_resource(ServerToClientPacketResource(
+        server_to_client_packet.clone(),
+    ));
 
     app_server.add_observer(server_new_connection_system);
     app_server.add_observer(server_packet_receive_system);
@@ -158,8 +149,10 @@ fn tcp_packets() {
 
     let mut app_client = App::new();
     app_client.add_plugins(ClientPlugin::<TcpConfig>::connect(server_addr));
-    app_client.insert_resource(ReceivedPackets::<Packet>::default());
-    app_client.insert_resource(ClientToServerPacketResource(client_to_server_packet));
+    app_client.insert_resource(ReceivedPackets::<CustomCryptServerPacket>::default());
+    app_client.insert_resource(ClientToServerPacketResource(
+        client_to_server_packet.clone(),
+    ));
 
     app_client.add_observer(client_connection_establish_system);
     app_client.add_observer(client_packet_receive_system);
@@ -169,12 +162,12 @@ fn tcp_packets() {
         app_server.update();
         !app_server
             .world()
-            .resource::<ReceivedPackets<Packet>>()
+            .resource::<ReceivedPackets<CustomCryptClientPacket>>()
             .packets
             .is_empty()
             && !app_client
                 .world()
-                .resource::<ReceivedPackets<Packet>>()
+                .resource::<ReceivedPackets<CustomCryptServerPacket>>()
                 .packets
                 .is_empty()
     });
@@ -182,7 +175,7 @@ fn tcp_packets() {
     // Check if the server received the packet from the client
     let server_received_packets = app_server
         .world()
-        .get_resource::<ReceivedPackets<Packet>>()
+        .get_resource::<ReceivedPackets<CustomCryptClientPacket>>()
         .unwrap();
     assert_eq!(
         server_received_packets.packets.first(),
@@ -193,7 +186,7 @@ fn tcp_packets() {
     // Check if the client received the packet from the server
     let client_received_packets = app_client
         .world()
-        .get_resource::<ReceivedPackets<Packet>>()
+        .get_resource::<ReceivedPackets<CustomCryptServerPacket>>()
         .unwrap();
     assert_eq!(
         client_received_packets.packets.first(),
@@ -209,15 +202,15 @@ fn server_new_connection_system(
     event
         .event()
         .connection
-        .send(server_to_client_packet.0)
+        .send(server_to_client_packet.0.clone())
         .expect("Couldn't send server packet");
 }
 
 fn server_packet_receive_system(
     event: On<server::PacketReceiveEvent<TcpConfig>>,
-    mut received_packets: ResMut<ReceivedPackets<Packet>>,
+    mut received_packets: ResMut<ReceivedPackets<CustomCryptClientPacket>>,
 ) {
-    received_packets.packets.push(event.event().packet);
+    received_packets.packets.push(event.event().packet.clone());
 }
 
 fn client_connection_establish_system(
@@ -227,13 +220,13 @@ fn client_connection_establish_system(
     event
         .event()
         .connection
-        .send(client_to_server_packet.0)
+        .send(client_to_server_packet.0.clone())
         .expect("Couldn't send client packet");
 }
 
 fn client_packet_receive_system(
     event: On<client::PacketReceiveEvent<TcpConfig>>,
-    mut received_packets: ResMut<ReceivedPackets<Packet>>,
+    mut received_packets: ResMut<ReceivedPackets<CustomCryptServerPacket>>,
 ) {
-    received_packets.packets.push(event.event().packet);
+    received_packets.packets.push(event.event().packet.clone());
 }

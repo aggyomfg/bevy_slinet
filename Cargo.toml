@@ -1,6 +1,6 @@
 [package]
 name = "bevy_slinet"
-version = "0.18.1"
+version = "0.19.0"
 authors = [
     "Sliman4 <4sliman4@gmail.com>",
     "aggyomfg <aggyomfg@yandex.com>"
@@ -29,32 +29,45 @@ features = [
 ]
 
 [dependencies]
+thiserror = "2"
 bevy = { version = "0.19", default-features = false, features = ["bevy_log"]}
 byteorder = "1"
 serde = { version = "1", features = ["derive"], optional = true }
 bincode = { version = "2.0", optional = true }
 bitcode = { version = "0.6", optional = true }
-dashmap = { version = "6", optional = true }
 tokio = { version = "1", features = [
     "io-util",
-    "rt-multi-thread",
+    "rt",
     "sync",
     "macros",
 ] }
+tokio-util = { version = "0.7", features = ["rt"] }
 async-trait = "0.1"
 futures = { version = "0.3" }
 
+[dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+stats_alloc = "0.1.10"
+getrandom = "0.3"
+tokio = { version = "1", features = ["time", "test-util"] }
+
 [features]
+# Internal fixtures only; not a supported application API.
+bench-internals = ["client", "server", "protocol_tcp", "protocol_udp", "serializer_bitcode"]
 serializer_bitcode = ["bitcode"]
 serializer_bitcode_serde = ["bitcode", "bitcode/serde", "serde"]
 serializer_bincode = ["bincode"]
 serializer_bincode_serde = ["bincode", "bincode/serde", "serde"]
 protocol_tcp = ["tokio/net"]
-protocol_udp = ["tokio/net", "dashmap"]
+protocol_udp = ["tokio/net", "tokio/time"]
 client = []
 server = []
 
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+
 [target.'cfg(target_family = "wasm")'.dependencies]
+bevy = { version = "0.19", default-features = false, features = ["web"] }
 wasm-bindgen-futures = "0.4.29"
 
 [[example]]
@@ -88,3 +101,41 @@ required-features = [
     "protocol_tcp",
     "serializer_bitcode",
 ]
+
+[[example]]
+name = "udp_application_sessions"
+path = "examples/udp_application_sessions.rs"
+required-features = ["client", "server", "protocol_udp", "serializer_bitcode"]
+
+[[bench]]
+name = "network"
+harness = false
+required-features = ["bench-internals"]
+
+[[bench]]
+name = "allocations"
+harness = false
+required-features = ["bench-internals"]
+
+[lints.rust]
+unused = { level = "deny", priority = -1 }
+dead_code = "deny"
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+wildcard_enum_match_arm = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+unreachable = "deny"
+unimplemented = "deny"
+unchecked_time_subtraction = "deny"
+todo = "deny"
+string_slice = "deny"
+panic_in_result_fn = "deny"
+panic = "deny"
+exit = "deny"
+needless_pass_by_value = "allow"
+future_not_send = "allow"
+
