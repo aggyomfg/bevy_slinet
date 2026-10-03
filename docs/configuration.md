@@ -20,7 +20,9 @@ Options, defaults and extension points:
 - [UDP options](../src/protocols/udp/settings.rs)
 - [System ordering and endpoint phases](../src/scheduling.rs)
 - Custom tasks: [RawConnectionParts](../src/connection/parts.rs), extracted with
-  `RawConnection::into_parts()` while preserving queued packets.
+  `RawConnection::into_parts()` while preserving queued packets. Create a matching
+  ECS handle with `RawConnection::with_queue`; use `with_endpoint::<Marker>()`
+  on the handle to distinguish your plugin's resource from other endpoints.
 - Configured sockets: [TCP](../src/protocols/tcp.rs),
   [UDP client](../src/protocols/udp/stream.rs) and
   [UDP listener](../src/protocols/udp/listener.rs); use their constructors from
@@ -46,3 +48,6 @@ it or supply an external multi-thread runtime. An external runtime must outlive 
 by its transports (I/O for TCP; I/O and timers for UDP). Shutdown cancels network tasks;
 it does not flush queues or forcibly stop blocking user code.
 
+Custom plugins can use `NetworkRuntimePlugin` without `client` / `server` features.
+Order task startup after `RuntimeSetup`, then use `NetworkRuntime::spawn` or
+`spawn_local`; these tasks participate in the same app shutdown.

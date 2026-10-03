@@ -138,7 +138,7 @@ pub trait ReadOnlySerializer<ReceivingPacket, SendingPacket>: Send + Sync + 'sta
     fn deserialize(&self, buffer: &[u8]) -> Result<ReceivingPacket, Self::DecodeError>;
 }
 /// Maintains connection-local codec state; datagram codecs must tolerate loss and reordering.
-pub trait MutableSerializer<ReceivingPacket, SendingPacket>: Send + Sync + 'static {
+pub trait MutableSerializer<ReceivingPacket, SendingPacket>: Send + 'static {
     /// Reports packets the codec cannot encode.
     type EncodeError: Error + Send + Sync;
     /// Reports bytes the codec cannot decode.

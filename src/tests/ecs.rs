@@ -5,6 +5,104 @@ use crate::protocols::tcp::TcpProtocol;
 test_config!(EcsTcpConfig, TcpProtocol);
 
 #[test]
+fn matching_packet_types_keep_endpoint_resources_independent() {
+    use crate::server::ServerConnection;
+    use std::any::TypeId;
+
+    test_config!(OtherConfig, TcpProtocol);
+    assert_ne!(
+        TypeId::of::<ClientConnection<EcsTcpConfig>>(),
+        TypeId::of::<ClientConnection<OtherConfig>>()
+    );
+    assert_ne!(
+        TypeId::of::<ClientConnection<EcsTcpConfig>>(),
+        TypeId::of::<ServerConnection<EcsTcpConfig>>()
+    );
+    assert_ne!(
+        TypeId::of::<ServerConnection<EcsTcpConfig>>(),
+        TypeId::of::<ServerConnection<OtherConfig>>()
+    );
+
+    let mut app = App::new();
+    app.add_plugins((
+        ServerPlugin::<EcsTcpConfig>::bind("127.0.0.1:0"),
+        ClientPlugin::<EcsTcpConfig>::new(),
+        ClientPlugin::<OtherConfig>::new(),
+    ));
+    app.add_observer(
+        |event: On<ConnectionEstablishEvent<EcsTcpConfig>>,
+         connection: Res<ClientConnection<EcsTcpConfig>>| {
+            assert_eq!(event.connection.id(), connection.id());
+        },
+    );
+    app.add_observer(
+        |event: On<ConnectionEstablishEvent<OtherConfig>>,
+         connection: Res<ClientConnection<OtherConfig>>| {
+            assert_eq!(event.connection.id(), connection.id());
+        },
+    );
+    app.update();
+    let address = app
+        .world()
+        .resource::<ServerAddress<EcsTcpConfig>>()
+        .address();
+    app.world_mut()
+        .trigger(client::ConnectionRequestEvent::<EcsTcpConfig>::new(address));
+    app.world_mut()
+        .trigger(client::ConnectionRequestEvent::<OtherConfig>::new(address));
+    wait_until(|| {
+        app.update();
+        app.world()
+            .contains_resource::<ClientConnection<EcsTcpConfig>>()
+            && app
+                .world()
+                .contains_resource::<ClientConnection<OtherConfig>>()
+    });
+
+    let first = app
+        .world()
+        .resource::<ClientConnection<EcsTcpConfig>>()
+        .clone();
+    let second = app
+        .world()
+        .resource::<ClientConnection<OtherConfig>>()
+        .clone();
+    assert_ne!(first.id(), second.id());
+    assert_eq!(
+        app.world()
+            .resource::<client::ClientConnections<EcsTcpConfig>>()
+            .first()
+            .unwrap()
+            .id(),
+        first.id()
+    );
+    assert_eq!(
+        app.world()
+            .resource::<client::ClientConnections<OtherConfig>>()
+            .first()
+            .unwrap()
+            .id(),
+        second.id()
+    );
+
+    first.disconnect();
+    wait_until(|| {
+        app.update();
+        !app.world()
+            .contains_resource::<ClientConnection<EcsTcpConfig>>()
+    });
+    assert!(app
+        .world()
+        .resource::<client::ClientConnections<EcsTcpConfig>>()
+        .is_empty());
+    assert_eq!(
+        app.world().resource::<ClientConnection<OtherConfig>>().id(),
+        second.id()
+    );
+    assert!(!second.is_closed());
+}
+
+#[test]
 fn receive_limits_follow_each_apps_resource_insertion_update_and_removal() {
     let mut first = App::new();
     first.insert_resource(MaxPacketSize(16));

@@ -130,7 +130,7 @@ fn constructor_attaches_handle_before_an_unpublished_connection_is_dropped() {
         receiver,
         ReceiveLimits::new(128),
     );
-    let connection = raw.ecs_connection(sender);
+    let connection = raw.ecs_connection::<()>(sender);
     assert_eq!(connection.send(7), Ok(()));
     assert!(drops.lock().unwrap().is_empty());
 
@@ -197,7 +197,7 @@ fn raw_disconnect_closes_ecs_clones_without_counting_rejected_packets() {
         receiver,
         ReceiveLimits::default(),
     );
-    let connection = raw.ecs_connection(sender);
+    let connection = raw.ecs_connection::<()>(sender);
     let retained = connection.clone();
     assert_eq!(connection.id(), raw.id());
     assert_eq!(retained.id(), raw.id());
@@ -265,7 +265,7 @@ async fn ecs_queue_snapshot_tracks_drain_eviction_and_close() {
             rx,
             ReceiveLimits::default(),
         );
-        let connection = raw.ecs_connection(tx);
+        let connection = raw.ecs_connection::<()>(tx);
         let retained = connection.clone();
         let mut parts = raw.into_parts();
         assert!(!connection.is_closed());
@@ -318,7 +318,7 @@ fn ecs_connection_component_removal_preserves_retained_handle() {
         rx,
         ReceiveLimits::default(),
     );
-    let retained = raw.ecs_connection(tx);
+    let retained = raw.ecs_connection::<()>(tx);
     let mut world = bevy::prelude::World::new();
     let entity = world.spawn(retained.clone()).id();
     let mut query = world.query::<&EcsConnection<u8, SharedHandle>>();

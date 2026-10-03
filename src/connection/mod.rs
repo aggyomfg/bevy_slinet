@@ -2,6 +2,7 @@
 
 use std::error::Error;
 use std::fmt::{Debug, Formatter};
+use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -72,8 +73,9 @@ impl ReceiveLimits {
 ///
 /// May be stored as a resource or on an entity. Removing the component does not
 /// disconnect retained clones; use [`Self::disconnect`] to request local closure.
+/// `Endpoint` distinguishes resource types for plugins sharing packet and transport types.
 #[derive(Resource)]
-pub struct EcsConnection<SendingPacket, H: TransportHandle>
+pub struct EcsConnection<SendingPacket, H: TransportHandle, Endpoint: Send + Sync + 'static = ()>
 where
     SendingPacket: Send + Sync + Debug + 'static,
 {
@@ -84,9 +86,11 @@ where
     pub(crate) transport: H,
     pub(crate) local_addr: SocketAddr,
     pub(crate) peer_addr: SocketAddr,
+    pub(crate) _endpoint: PhantomData<Endpoint>,
 }
 
-impl<SendingPacket, H: TransportHandle> Clone for EcsConnection<SendingPacket, H>
+impl<SendingPacket, H: TransportHandle, Endpoint: Send + Sync + 'static> Clone
+    for EcsConnection<SendingPacket, H, Endpoint>
 where
     SendingPacket: Send + Sync + Debug + 'static,
 {
@@ -99,11 +103,13 @@ where
             transport: self.transport.clone(),
             local_addr: self.local_addr,
             peer_addr: self.peer_addr,
+            _endpoint: PhantomData,
         }
     }
 }
 
-impl<SendingPacket, H: TransportHandle> Debug for EcsConnection<SendingPacket, H>
+impl<SendingPacket, H: TransportHandle, Endpoint: Send + Sync + 'static> Debug
+    for EcsConnection<SendingPacket, H, Endpoint>
 where
     SendingPacket: Send + Sync + Debug + 'static,
 {
@@ -112,10 +118,26 @@ where
     }
 }
 
-impl<SendingPacket, H: TransportHandle> EcsConnection<SendingPacket, H>
+impl<SendingPacket, H: TransportHandle, Endpoint: Send + Sync + 'static>
+    EcsConnection<SendingPacket, H, Endpoint>
 where
     SendingPacket: Send + Sync + Debug + 'static,
 {
+    /// Changes the ECS resource type without changing the shared connection.
+    #[must_use]
+    pub fn with_endpoint<E: Send + Sync + 'static>(self) -> EcsConnection<SendingPacket, H, E> {
+        EcsConnection {
+            disconnect_task: self.disconnect_task,
+            id: self.id,
+            published: self.published,
+            packet_tx: self.packet_tx,
+            transport: self.transport,
+            local_addr: self.local_addr,
+            peer_addr: self.peer_addr,
+            _endpoint: PhantomData,
+        }
+    }
+
     /// Identifies this connection independently of its peer address.
     #[must_use]
     pub const fn id(&self) -> ConnectionId {
@@ -310,6 +332,37 @@ where
         )
     }
 
+    /// Creates a matching task-side connection and ECS handle with a bounded queue.
+    /// `datagram` selects the queue's datagram overflow policy; use `Protocol::DATAGRAM`.
+    /// Custom tasks take ownership through [`Self::into_parts`].
+    #[must_use]
+    pub fn with_queue(
+        stream: NS,
+        serializer: Arc<
+            dyn Serializer<
+                ReceivingPacket,
+                SendingPacket,
+                EncodeError = EncErr,
+                DecodeError = DecErr,
+            >,
+        >,
+        packet_length_serializer: LS,
+        queues: NetworkQueueSettings,
+        receive_limits: ReceiveLimits,
+        datagram: bool,
+    ) -> (Self, EcsConnection<SendingPacket, NS::Handle>) {
+        let (sender, receiver) = queues.outgoing_channel(datagram);
+        let raw = Self::with_limits(
+            stream,
+            serializer,
+            packet_length_serializer,
+            receiver,
+            receive_limits,
+        );
+        let connection = raw.ecs_connection(sender);
+        (raw, connection)
+    }
+
     pub(crate) fn with_limits(
         stream: NS,
         serializer: Arc<
@@ -326,16 +379,7 @@ where
     ) -> Self {
         packets_rx.set_transport(stream.transport());
         Self {
-            disconnect_task: {
-                #[cfg(any(feature = "client", feature = "server"))]
-                {
-                    crate::runtime::connection_token()
-                }
-                #[cfg(not(any(feature = "client", feature = "server")))]
-                {
-                    CancellationToken::default()
-                }
-            },
+            disconnect_task: crate::runtime::connection_token(),
             stream,
             serializer,
             packet_length_serializer: Arc::new(packet_length_serializer),
@@ -345,11 +389,10 @@ where
         }
     }
 
-    #[cfg(any(feature = "client", feature = "server"))]
-    pub(crate) fn ecs_connection(
+    pub(crate) fn ecs_connection<Endpoint: Send + Sync + 'static>(
         &self,
         packet_tx: OutgoingSender<SendingPacket>,
-    ) -> EcsConnection<SendingPacket, NS::Handle> {
+    ) -> EcsConnection<SendingPacket, NS::Handle, Endpoint> {
         EcsConnection {
             disconnect_task: self.disconnect_task.clone(),
             id: self.id,
@@ -358,6 +401,7 @@ where
             transport: self.stream.transport(),
             local_addr: self.local_addr(),
             peer_addr: self.peer_addr(),
+            _endpoint: PhantomData,
         }
     }
 

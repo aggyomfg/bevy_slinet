@@ -16,6 +16,7 @@ fn outgoing_queue_reports_full_and_closed() {
         transport: (),
         local_addr: "127.0.0.1:1".parse().unwrap(),
         peer_addr: "127.0.0.1:2".parse().unwrap(),
+        _endpoint: std::marker::PhantomData::<()>,
     };
     connection.send(1).unwrap();
     assert!(matches!(connection.send(2), Err(SendError::Full(2))));
@@ -59,6 +60,7 @@ async fn udp_outgoing_policies_report_rejections_and_evictions() {
         transport: udp.clone(),
         local_addr: "127.0.0.1:1".parse().unwrap(),
         peer_addr: "127.0.0.1:2".parse().unwrap(),
+        _endpoint: std::marker::PhantomData::<()>,
     };
     connection.send(1).unwrap();
     assert!(matches!(connection.send(2), Err(SendError::Full(2))));
@@ -167,6 +169,7 @@ fn custom_handle_tracks_eviction_and_queued_packets_on_close() {
         transport: handle,
         local_addr: "127.0.0.1:1".parse().unwrap(),
         peer_addr: "127.0.0.1:2".parse().unwrap(),
+        _endpoint: std::marker::PhantomData::<()>,
     };
     let retained = connection.clone();
     connection.send(1).unwrap();
@@ -205,6 +208,7 @@ fn reliable_handle_reports_full_and_buffered_cancellation() {
         transport: handle,
         local_addr: "127.0.0.1:1".parse().unwrap(),
         peer_addr: "127.0.0.1:2".parse().unwrap(),
+        _endpoint: std::marker::PhantomData::<()>,
     };
     connection.send(String::from("buffered")).unwrap();
     let error = connection.send(String::from("full")).unwrap_err();

@@ -48,6 +48,7 @@ use crate::{PacketLengthSerializer, ServerConfig, SystemSets};
 pub type ServerConnection<Config> = EcsConnection<
     <Config as ServerConfig>::ServerPacket,
     <<Config as ServerConfig>::Protocol as Protocol>::Handle,
+    ServerPlugin<Config>,
 >;
 type RawServerConnection<Config> = RawConnection<
     <Config as ServerConfig>::ClientPacket,
@@ -857,6 +858,7 @@ mod udp_lifecycle_tests {
         let udp = UdpConnectionHandle::new(128, None);
         let address: SocketAddr = "127.0.0.1:1234".parse().unwrap();
         let connection = EcsConnection {
+            _endpoint: PhantomData,
             disconnect_task: CancellationToken::new(),
             id: ConnectionId::next(),
             published: Arc::new(std::sync::atomic::AtomicBool::new(false)),

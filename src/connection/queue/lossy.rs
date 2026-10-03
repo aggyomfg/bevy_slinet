@@ -59,13 +59,11 @@ impl<T> Drop for LossySender<T> {
 
 impl<T> LossySender<T> {
     /// Reports whether the receiver has closed.
-    #[cfg(any(feature = "client", feature = "server"))]
     pub fn is_closed(&self) -> bool {
         !self.0.lock().receiver_open
     }
 
     /// Samples outgoing packet occupancy under the queue lock.
-    #[cfg(any(feature = "client", feature = "server"))]
     pub fn snapshot(&self) -> crate::connection::QueueSnapshot {
         crate::connection::QueueSnapshot {
             queued: self.0.lock().items.len(),

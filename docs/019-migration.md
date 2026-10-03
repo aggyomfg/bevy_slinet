@@ -6,7 +6,8 @@
 
 - Use `ClientConnection<Config>` / `ServerConnection<Config>`, or replace
   `EcsConnection<Packet>` with `EcsConnection<Packet, Handle>` (`()` for TCP,
-  `UdpConnectionHandle` for UDP).
+  `UdpConnectionHandle` for UDP). The endpoint aliases also carry a third type
+  parameter for their role and config; prefer these aliases in application APIs.
 - `send()` returns `connection::SendError::{Full(packet), Closed(packet)}`.
   Replace Tokio error imports and `error.0` with `error.into_inner()`; handle
   bounded-queue overflow. See [configuration](configuration.md).

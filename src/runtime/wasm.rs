@@ -26,6 +26,7 @@ fn spawn_on<F: Future<Output = ()> + 'static>(stop: &CancellationToken, future: 
     );
 }
 
+#[cfg(any(feature = "client", feature = "server"))]
 pub(crate) fn spawn<F: Future<Output = ()> + 'static>(future: F) {
     CURRENT.with(|stop| spawn_on(stop, future));
 }
@@ -52,13 +53,15 @@ impl NetworkRuntime {
         !self.stop.is_cancelled()
     }
 
-    #[cfg(feature = "client")]
-    pub(crate) fn spawn<F: Future<Output = ()> + 'static>(&self, future: F) {
+    /// Runs a future on the event loop until completion or app shutdown.
+    /// An unavailable runtime drops the future without polling it.
+    pub fn spawn<F: Future<Output = ()> + 'static>(&self, future: F) {
         spawn_on(&self.stop, future);
     }
 
-    #[cfg(feature = "server")]
-    pub(crate) fn spawn_local<F, Fut>(&self, make_future: F)
+    /// Builds and runs a future on the event loop until completion or app shutdown.
+    /// An unavailable runtime drops the factory without invoking it.
+    pub fn spawn_local<F, Fut>(&self, make_future: F)
     where
         F: FnOnce() -> Fut + 'static,
         Fut: Future<Output = ()> + 'static,
@@ -73,21 +76,27 @@ impl Drop for NetworkRuntime {
     }
 }
 
+/// Initializes [`NetworkRuntime`] in `Startup`; start custom tasks after this set.
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct RuntimeSetup;
+pub struct RuntimeSetup;
 
-struct RuntimePlugin;
+/// Installs the app-scoped executor and cancels its tasks on `AppExit` or drop.
+///
+/// Client and server plugins add it automatically; custom plugins can add it
+/// after checking `app.is_plugin_added::<NetworkRuntimePlugin>()`.
+pub struct NetworkRuntimePlugin;
 
-impl Plugin for RuntimePlugin {
+impl Plugin for NetworkRuntimePlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, initialize.in_set(RuntimeSetup))
             .add_systems(Last, stop_on_exit);
     }
 }
 
+#[cfg(any(feature = "client", feature = "server"))]
 pub(crate) fn register(app: &mut App) {
-    if !app.is_plugin_added::<RuntimePlugin>() {
-        app.add_plugins(RuntimePlugin);
+    if !app.is_plugin_added::<NetworkRuntimePlugin>() {
+        app.add_plugins(NetworkRuntimePlugin);
     }
 }
 

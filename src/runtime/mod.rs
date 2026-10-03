@@ -130,6 +130,7 @@ where
 }
 
 /// Spawn a network child task and include it in this app's shutdown.
+#[cfg(any(feature = "client", feature = "server", test))]
 pub(crate) fn spawn<F>(future: F)
 where
     F: Future<Output = ()> + Send + 'static,
@@ -143,7 +144,7 @@ pub(crate) fn connection_token() -> CancellationToken {
         .unwrap_or_default()
 }
 
-/// App-scoped executor installed by the client and server plugins at startup.
+/// App-scoped executor installed by [`NetworkRuntimePlugin`] at startup.
 ///
 /// Tasks are cancelled on `AppExit` or drop. An external runtime stays owned by
 /// its caller and must outlive this resource.
@@ -261,9 +262,9 @@ impl NetworkRuntime {
         }
     }
 
-    /// Start a Send task on the common worker pool.
-    #[cfg(any(feature = "client", test))]
-    pub(crate) fn spawn<F>(&self, future: F)
+    /// Runs a task on the shared worker pool until completion or app shutdown.
+    /// An unavailable runtime drops the future without polling it.
+    pub fn spawn<F>(&self, future: F)
     where
         F: Future<Output = ()> + Send + 'static,
     {
@@ -272,9 +273,10 @@ impl NetworkRuntime {
         }
     }
 
-    /// Build and run a possibly non-Send listener future on the local thread.
-    #[cfg(any(feature = "server", test))]
-    pub(crate) fn spawn_local<F, Fut>(&self, make_future: F)
+    /// Builds and runs a possibly non-Send future on the runtime's local thread.
+    /// The factory crosses threads; create non-Send state inside it.
+    /// An unavailable runtime drops the factory without invoking it.
+    pub fn spawn_local<F, Fut>(&self, make_future: F)
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = ()> + 'static,
@@ -320,12 +322,18 @@ impl Drop for NetworkRuntime {
     }
 }
 
+/// Initializes [`NetworkRuntime`] in `Startup`.
+/// Configure settings before this set and start custom tasks after it.
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct RuntimeSetup;
+pub struct RuntimeSetup;
 
-struct RuntimePlugin;
+/// Installs the app-scoped executor and cancels its tasks on `AppExit` or drop.
+///
+/// Client and server plugins add it automatically; custom plugins can add it
+/// after checking `app.is_plugin_added::<NetworkRuntimePlugin>()`.
+pub struct NetworkRuntimePlugin;
 
-impl Plugin for RuntimePlugin {
+impl Plugin for NetworkRuntimePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<NetworkRuntimeSettings>()
             .add_systems(Startup, initialize.in_set(RuntimeSetup))
@@ -334,9 +342,10 @@ impl Plugin for RuntimePlugin {
 }
 
 /// Install the shared executor once for all endpoint plugins in one app.
+#[cfg(any(feature = "client", feature = "server", test))]
 pub(crate) fn register(app: &mut App) {
-    if !app.is_plugin_added::<RuntimePlugin>() {
-        app.add_plugins(RuntimePlugin);
+    if !app.is_plugin_added::<NetworkRuntimePlugin>() {
+        app.add_plugins(NetworkRuntimePlugin);
     }
 }
 

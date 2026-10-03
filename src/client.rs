@@ -49,6 +49,7 @@ use crate::{ClientConfig, PacketLengthSerializer, Protocol, SystemSets};
 pub type ClientConnection<Config> = EcsConnection<
     <Config as ClientConfig>::ClientPacket,
     <<Config as ClientConfig>::Protocol as Protocol>::Handle,
+    ClientPlugin<Config>,
 >;
 const MAX_CONNECTION_ATTEMPTS: usize = 8;
 type RawClientConnection<Config> = RawConnection<
@@ -853,6 +854,7 @@ mod udp_lifecycle_tests {
         let udp = UdpConnectionHandle::new(128, None);
         let address: SocketAddr = "127.0.0.1:1234".parse().unwrap();
         let connection = EcsConnection {
+            _endpoint: PhantomData,
             disconnect_task: CancellationToken::new(),
             id: ConnectionId::next(),
             published: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -935,6 +937,7 @@ mod udp_lifecycle_tests {
         let (outgoing, _rx) = settings.outgoing_channel::<_, UdpConnectionHandle>(true);
         let address = ([127, 0, 0, 1], 1234).into();
         let connection = EcsConnection {
+            _endpoint: PhantomData,
             disconnect_task: CancellationToken::new(),
             id: ConnectionId::next(),
             published: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1000,6 +1003,7 @@ mod udp_lifecycle_tests {
         packets_rx.set_transport(udp.clone());
         let address: SocketAddr = "127.0.0.1:1234".parse().unwrap();
         let connection = EcsConnection {
+            _endpoint: PhantomData::<ClientPlugin<Config>>,
             disconnect_task: CancellationToken::new(),
             id: ConnectionId::next(),
             published: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1049,6 +1053,7 @@ mod udp_lifecycle_tests {
         let udp = UdpConnectionHandle::new(128, None);
         let address: SocketAddr = "127.0.0.1:1234".parse().unwrap();
         let connection = EcsConnection {
+            _endpoint: PhantomData,
             disconnect_task: CancellationToken::new(),
             id: ConnectionId::next(),
             published: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1132,6 +1137,7 @@ mod tcp_lifecycle_tests {
         let (outgoing, _rx) = settings.outgoing_channel::<_, ()>(false);
         let address: SocketAddr = "127.0.0.1:1234".parse().unwrap();
         let connection = EcsConnection {
+            _endpoint: PhantomData,
             disconnect_task: CancellationToken::new(),
             id: ConnectionId::next(),
             published: Arc::new(std::sync::atomic::AtomicBool::new(false)),

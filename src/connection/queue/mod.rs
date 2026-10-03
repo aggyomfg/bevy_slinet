@@ -4,10 +4,8 @@ use bevy::prelude::Resource;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Receiver, Sender};
 
-#[cfg(any(feature = "client", feature = "server"))]
 use self::lossy::{lossy_channel, LossyReceiver, LossySender};
 
-#[cfg(any(feature = "client", feature = "server", feature = "protocol_udp", test))]
 pub mod lossy;
 
 use super::SendError;
@@ -40,10 +38,8 @@ pub struct QueueSnapshot {
 /// Sending endpoint for a transport-specific outgoing packet queue.
 pub struct OutgoingSender<T>(OutgoingSenderInner<T>);
 
-#[cfg_attr(not(any(feature = "client", feature = "server")), allow(dead_code))]
 enum OutgoingSenderInner<T> {
     Reliable(Sender<T>),
-    #[cfg(any(feature = "client", feature = "server"))]
     Lossy(LossySender<T>),
 }
 
@@ -51,7 +47,6 @@ impl<T> Clone for OutgoingSender<T> {
     fn clone(&self) -> Self {
         Self(match &self.0 {
             OutgoingSenderInner::Reliable(tx) => OutgoingSenderInner::Reliable(tx.clone()),
-            #[cfg(any(feature = "client", feature = "server"))]
             OutgoingSenderInner::Lossy(tx) => OutgoingSenderInner::Lossy(tx.clone()),
         })
     }
@@ -61,7 +56,6 @@ impl<T> OutgoingSender<T> {
     pub(super) fn is_closed(&self) -> bool {
         match &self.0 {
             OutgoingSenderInner::Reliable(tx) => tx.is_closed(),
-            #[cfg(any(feature = "client", feature = "server"))]
             OutgoingSenderInner::Lossy(tx) => tx.is_closed(),
         }
     }
@@ -75,17 +69,14 @@ impl<T> OutgoingSender<T> {
                     capacity,
                 }
             }
-            #[cfg(any(feature = "client", feature = "server"))]
             OutgoingSenderInner::Lossy(tx) => tx.snapshot(),
         }
     }
 
-    #[cfg(any(feature = "client", feature = "server", test))]
     const fn reliable(tx: Sender<T>) -> Self {
         Self(OutgoingSenderInner::Reliable(tx))
     }
 
-    #[cfg(any(feature = "client", feature = "server"))]
     const fn lossy(tx: LossySender<T>) -> Self {
         Self(OutgoingSenderInner::Lossy(tx))
     }
@@ -97,7 +88,6 @@ impl<T> OutgoingSender<T> {
     ) -> Result<(), SendError<T>> {
         let result = match &self.0 {
             OutgoingSenderInner::Reliable(tx) => tx.try_send(packet),
-            #[cfg(any(feature = "client", feature = "server"))]
             OutgoingSenderInner::Lossy(tx) => match tx.try_send(packet, 1) {
                 Ok(evicted) => {
                     for _ in evicted {
@@ -124,10 +114,8 @@ pub struct OutgoingReceiver<T, H: TransportHandle> {
     transport: Option<H>,
 }
 
-#[cfg_attr(not(any(feature = "client", feature = "server")), allow(dead_code))]
 enum OutgoingReceiverInner<T> {
     Reliable(Receiver<T>),
-    #[cfg(any(feature = "client", feature = "server"))]
     Lossy(LossyReceiver<T>),
 }
 
@@ -149,7 +137,6 @@ impl<T, H: TransportHandle> OutgoingReceiver<T, H> {
     pub async fn recv(&mut self) -> Option<T> {
         match &mut self.inner {
             OutgoingReceiverInner::Reliable(rx) => rx.recv().await,
-            #[cfg(any(feature = "client", feature = "server"))]
             OutgoingReceiverInner::Lossy(rx) => rx.recv().await,
         }
     }
@@ -167,7 +154,6 @@ impl<T, H: TransportHandle> Drop for OutgoingReceiver<T, H> {
                     transport.record_drop(QueueDropReason::ClosedBeforeDelivery);
                 }
             }
-            #[cfg(any(feature = "client", feature = "server"))]
             OutgoingReceiverInner::Lossy(rx) => {
                 let pending = rx.close_and_drain();
                 for _ in &pending {
@@ -212,7 +198,6 @@ impl Default for NetworkQueueSettings {
     }
 }
 
-#[cfg(any(feature = "client", feature = "server"))]
 impl NetworkQueueSettings {
     pub(crate) fn outgoing_channel<T, H: TransportHandle>(
         &self,
@@ -237,6 +222,7 @@ impl NetworkQueueSettings {
         }
     }
 
+    #[cfg(any(feature = "client", feature = "server"))]
     pub(crate) fn incoming_channel<T>(&self) -> (Sender<T>, Receiver<T>) {
         tokio::sync::mpsc::channel(self.receive_capacity.max(1))
     }

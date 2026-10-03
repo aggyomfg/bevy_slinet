@@ -133,6 +133,7 @@ impl<P: Protocol> Fixture<P> {
             .map(|_| {
                 let (packet_tx, rx) = settings.outgoing_channel(P::DATAGRAM);
                 let connection = EcsConnection {
+                    _endpoint: PhantomData,
                     disconnect_task: CancellationToken::new(),
                     id: ConnectionId::next(),
                     published: Arc::new(AtomicBool::new(false)),
