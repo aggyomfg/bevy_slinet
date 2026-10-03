@@ -326,7 +326,16 @@ where
     ) -> Self {
         packets_rx.set_transport(stream.transport());
         Self {
-            disconnect_task: CancellationToken::default(),
+            disconnect_task: {
+                #[cfg(any(feature = "client", feature = "server"))]
+                {
+                    crate::runtime::connection_token()
+                }
+                #[cfg(not(any(feature = "client", feature = "server")))]
+                {
+                    CancellationToken::default()
+                }
+            },
             stream,
             serializer,
             packet_length_serializer: Arc::new(packet_length_serializer),

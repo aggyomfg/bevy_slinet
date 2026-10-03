@@ -15,7 +15,8 @@ use crate::PacketLengthSerializer;
 ///
 /// Byte transports can use [`FramedReader`](super::protocol::FramedReader) for
 /// length-prefixed framing. Datagram transports implement this trait directly.
-#[async_trait]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
 pub trait PacketReader: Send + Sync + 'static {
     /// Stops transport background tasks before a disconnection event is queued.
     /// Implementations may retain their registration until this half is dropped.
@@ -62,7 +63,8 @@ pub trait PacketReader: Send + Sync + 'static {
 
 /// Sends packets using the transport's framing and delivery policy.
 /// Byte transports can use [`FramedWriter`](super::protocol::FramedWriter).
-#[async_trait]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
 pub trait PacketWriter: Send + Sync + 'static {
     /// Writes a packet to this stream.
     ///

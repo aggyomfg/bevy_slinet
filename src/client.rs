@@ -21,7 +21,6 @@ pub type ClientSettings<Config> = NetworkSettings<ClientPlugin<Config>>;
 /// ```
 pub type ClientSystems<Config> = crate::NetworkSystems<ClientPlugin<Config>>;
 
-use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
@@ -34,16 +33,15 @@ use bevy::prelude::*;
 use futures::StreamExt;
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::connection::tasks::{PacketCodecs, ReceiveTaskState, SendTaskState};
-use crate::connection::transport::PendingPacket;
+use crate::connection::tasks::{
+    run_connections, send_packets, PacketCodecs, ReceiveTaskState, SendTaskState,
+};
 use crate::connection::{lossy_channel, LossyReceiver, LossySender};
 use crate::connection::{
     ConnectionId, EcsConnection, NetworkQueueSettings, OutgoingReceiver, OutgoingSender,
     PacketForwarder, RawConnection, ReceiveLimits,
 };
-use crate::protocols::protocol::{
-    NetworkStream, PacketReader, PacketWriter, QueueDropReason, ReceiveError,
-};
+use crate::protocols::protocol::{NetworkStream, PacketReader, QueueDropReason, ReceiveError};
 use crate::serializers::serializer::Serializer;
 use crate::{ClientConfig, PacketLengthSerializer, Protocol, SystemSets};
 
@@ -52,6 +50,7 @@ pub type ClientConnection<Config> = EcsConnection<
     <Config as ClientConfig>::ClientPacket,
     <<Config as ClientConfig>::Protocol as Protocol>::Handle,
 >;
+const MAX_CONNECTION_ATTEMPTS: usize = 8;
 type RawClientConnection<Config> = RawConnection<
     <Config as ClientConfig>::ServerPacket,
     <Config as ClientConfig>::ClientPacket,
@@ -111,6 +110,7 @@ impl<Config: ClientConfig> Plugin for ClientPlugin<Config> {
     fn build(&self, app: &mut App) {
         let address = self.address;
         crate::scheduling::register_global_limits(app);
+        crate::runtime::register(app);
         app.init_resource::<EndpointReceiveLimits<Self>>()
             .insert_resource(ClientConnections::<Config>::new())
             // Startup: settings -> setup; warnings inspect the synchronized settings.
@@ -148,6 +148,10 @@ impl<Config: ClientConfig> Plugin for ClientPlugin<Config> {
             );
         // PreUpdate: all incoming events, using the protocol-specific graph below.
         configure_receive_systems::<Config>(app);
+        app.configure_sets(
+            Startup,
+            ClientSystems::<Config>::SETUP.after(crate::runtime::RuntimeSetup),
+        );
     }
 }
 
@@ -318,11 +322,25 @@ struct ConnectionAttempt<Config: ClientConfig> {
 }
 
 impl<Config: ClientConfig> ClientPlugin<Config> {
-    fn setup_system(commands: Commands, endpoint: EndpointSetup<Self>) {
-        Self::setup(commands, endpoint.queues(), endpoint.receive_limits());
+    fn setup_system(
+        commands: Commands,
+        endpoint: EndpointSetup<Self>,
+        runtime: Res<crate::runtime::NetworkRuntime>,
+    ) {
+        Self::setup(
+            commands,
+            endpoint.queues(),
+            endpoint.receive_limits(),
+            &runtime,
+        );
     }
 
-    fn setup(mut commands: Commands, queues: NetworkQueueSettings, limits: ReceiveLimits) {
+    fn setup(
+        mut commands: Commands,
+        queues: NetworkQueueSettings,
+        limits: ReceiveLimits,
+        runtime: &crate::runtime::NetworkRuntime,
+    ) {
         let (connection_request_tx, connection_request_rx) = queues.incoming_channel();
         commands.insert_resource(ConnectionRequestSender::<Config>(
             connection_request_tx,
@@ -344,14 +362,14 @@ impl<Config: ClientConfig> ClientPlugin<Config> {
         }
         commands.add_observer(ConnectionRequestSender::<Config>::observe);
 
-        Self::run_async(Self::process_connection_requests(
+        runtime.spawn(Self::process_connection_requests(
             connection_request_rx,
             queues,
             limits,
             incoming_tx.clone(),
             connection_sender,
         ));
-        Self::run_async(Self::process_connections(
+        runtime.spawn(Self::process_connections(
             incoming_connections,
             datagram_packet_tx,
             incoming_tx,
@@ -392,7 +410,7 @@ impl<Config: ClientConfig> ClientPlugin<Config> {
                     }
                 }
             })
-            .buffer_unordered(8);
+            .buffer_unordered(MAX_CONNECTION_ATTEMPTS);
         futures::pin_mut!(connections);
         while let Some(attempt) = connections.next().await {
             if !attempt.publish(&incoming, &connection_sender).await {
@@ -402,15 +420,16 @@ impl<Config: ClientConfig> ClientPlugin<Config> {
     }
 
     async fn process_connections(
-        mut incoming_connections: Receiver<ConnectedTransport<Config>>,
+        incoming_connections: Receiver<ConnectedTransport<Config>>,
         datagram_packets: LossySender<PacketReceiveEvent<Config>>,
         incoming: Sender<IncomingMessage<Config>>,
     ) {
-        while let Some(connection) = incoming_connections.recv().await {
-            connection
-                .run(datagram_packets.clone(), incoming.clone())
-                .await;
-        }
+        run_connections(
+            incoming_connections,
+            MAX_CONNECTION_ATTEMPTS,
+            |connection| connection.run(datagram_packets.clone(), incoming.clone()),
+        )
+        .await;
     }
 
     async fn create_connection(
@@ -518,7 +537,7 @@ impl<Config: ClientConfig> ConnectedTransport<Config> {
         };
         let transport = self.ecs_connection.transport().clone();
         let (send_error_tx, send_error_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(Self::receive_packets(
+        crate::runtime::spawn(Self::receive_packets(
             read,
             self.ecs_connection,
             ReceiveTaskState {
@@ -533,7 +552,7 @@ impl<Config: ClientConfig> ConnectedTransport<Config> {
             incoming,
             peer_addr,
         ));
-        tokio::spawn(Self::send_packets(
+        crate::runtime::spawn(send_packets(
             write,
             PacketCodecs {
                 serializer,
@@ -623,48 +642,6 @@ impl<Config: ClientConfig> ConnectedTransport<Config> {
             .await
         {
             log::debug!("({id:?}) Disconnection receiver closed: {err:?}");
-        }
-    }
-
-    async fn send_packets(
-        mut write: impl PacketWriter,
-        codecs: PacketCodecs<ClientSerializer<Config>, Config::LengthSerializer>,
-        state: SendTaskState<Config::ClientPacket, <Config::Protocol as Protocol>::Handle>,
-    ) {
-        let PacketCodecs {
-            serializer,
-            packet_length_serializer,
-        } = codecs;
-        let SendTaskState {
-            mut packets_rx,
-            disconnect_task,
-            id,
-            transport,
-            send_error,
-        } = state;
-        let _guard = disconnect_task.clone().drop_guard();
-        let sending = async {
-            while let Some(packet) = packets_rx.recv().await {
-                let mut pending = PendingPacket::new(transport.clone());
-                if disconnect_task.is_cancelled() {
-                    break;
-                }
-                log::trace!("({id:?}) Sending packet {packet:?}");
-                let result = write
-                    .send(packet, Arc::clone(&serializer), &*packet_length_serializer)
-                    .await;
-                pending.finish(&result);
-                if let Err(err) = result {
-                    log::error!("({id:?}) Error sending packet: {err}");
-                    let _ = send_error.send(err);
-                    break;
-                }
-            }
-        };
-        tokio::select! {
-            biased;
-            () = disconnect_task.cancelled() => {},
-            () = sending => {},
         }
     }
 }
@@ -810,56 +787,6 @@ pub struct PacketReceiveEvent<Config: ClientConfig> {
     /// When the built-in transport finished reading the packet, before decoding or queueing.
     /// Custom protocols use [`PacketReader::receive_with_timestamp`] semantics.
     pub received_at: Instant,
-}
-
-impl<Config: ClientConfig> ClientPlugin<Config> {
-    #[cfg(not(target_family = "wasm"))]
-    fn run_async<F>(future: F)
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        std::thread::spawn(move || {
-            let runtime_result = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build();
-
-            let runtime = match runtime_result {
-                Ok(rt) => rt,
-                Err(err) => {
-                    log::error!("Failed to create tokio runtime: {:?}", err);
-                    return;
-                }
-            };
-
-            runtime.block_on(async move {
-                let local = tokio::task::LocalSet::new();
-                local
-                    .run_until(async move {
-                        if let Err(err) = tokio::task::spawn_local(future).await {
-                            log::error!("Failed to run async task: {}", err);
-                        }
-                    })
-                    .await;
-            });
-        });
-    }
-
-    #[cfg(target_family = "wasm")]
-    fn run_async<F>(future: F)
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        wasm_bindgen_futures::spawn_local(async move {
-            let local = tokio::task::LocalSet::new();
-            local
-                .run_until(async move {
-                    if let Err(err) = tokio::task::spawn_local(future).await {
-                        log::error!("Failed to run async task: {:?}", err);
-                    }
-                })
-                .await;
-        });
-    }
 }
 
 #[cfg(all(test, feature = "protocol_udp", feature = "serializer_bitcode_serde"))]
@@ -1084,7 +1011,7 @@ mod udp_lifecycle_tests {
         connection.send(7).unwrap();
         connection.send(8).unwrap();
         let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let task = tokio::spawn(ConnectedTransport::<Config>::send_packets(
+        let task = tokio::spawn(send_packets(
             FramedWriter::new(PendingWrite(Arc::clone(&entered))),
             PacketCodecs {
                 serializer: Arc::new(Config::build_serializer()),

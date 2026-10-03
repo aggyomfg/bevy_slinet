@@ -92,7 +92,7 @@ fn main() -> std::thread::Result<()> {
             .run();
     });
     println!("Waiting 1000ms to make sure the server side has started");
-    std::thread::sleep(Duration::from_millis(1000));
+    std::thread::sleep(Duration::from_secs(1));
     let client = std::thread::spawn(move || {
         App::new()
             .insert_resource(MaxPacketSize(1200))

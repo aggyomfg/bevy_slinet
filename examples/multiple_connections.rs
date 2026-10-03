@@ -133,7 +133,7 @@ fn main() -> std::thread::Result<()> {
             .run();
     });
     println!("Waiting 1000ms to make sure the server has started");
-    std::thread::sleep(Duration::from_millis(1000));
+    std::thread::sleep(Duration::from_secs(1));
     for id in 0..10 {
         std::thread::spawn(move || {
             App::new()

@@ -34,7 +34,8 @@ pub use super::transport::{QueueDropReason, TransportHandle};
 
 /// In order to simplify protocol switching and implementation, there is a [`Protocol`] trait.
 /// Implement it or use built-in [`protocols`](crate::protocols).
-#[async_trait]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
 pub trait Protocol: Send + Sync + 'static {
     /// Shared controls and diagnostics for this protocol's connections.
     type Handle: TransportHandle;
@@ -60,7 +61,8 @@ pub trait Protocol: Send + Sync + 'static {
 }
 
 /// A listener that accepts connections from clients.
-#[async_trait]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
 pub trait Listener {
     /// A [`ServerStream`] that is returned by [`Self::accept()`]
     type Stream: ServerStream;
@@ -76,7 +78,8 @@ pub trait Listener {
 }
 
 /// A [NetworkStream](NetworkStream) that can be used client-side.
-#[async_trait]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
 pub trait ClientStream: NetworkStream {
     /// Connects to a server.
     async fn connect(addr: SocketAddr) -> io::Result<Self>
@@ -88,7 +91,8 @@ pub trait ClientStream: NetworkStream {
 pub trait ServerStream: NetworkStream {}
 
 /// A connection that splits into packet receive and send halves.
-#[async_trait]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
 pub trait NetworkStream: Send + Sync + 'static {
     /// Shared controls and diagnostics for this connection.
     type Handle: TransportHandle;

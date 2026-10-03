@@ -273,3 +273,134 @@ fn server_packet_ordering_does_not_depend_on_other_config_lifecycle() {
     );
     app.update();
 }
+
+#[test]
+fn rejected_runtime_keeps_endpoint_systems_valid() {
+    use crate::runtime::{NetworkRuntime, NetworkRuntimeMode, NetworkRuntimeSettings};
+
+    let external = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut app = App::new();
+    app.insert_resource(NetworkRuntimeSettings {
+        mode: NetworkRuntimeMode::External(external.handle().clone()),
+        ..Default::default()
+    });
+    app.add_plugins((
+        ClientPlugin::<EcsTcpConfig>::new(),
+        ServerPlugin::<EcsTcpConfig>::bind("127.0.0.1:0"),
+    ));
+    app.update();
+    app.update();
+    assert!(!app.world().resource::<NetworkRuntime>().is_available());
+    assert!(!app
+        .world()
+        .contains_resource::<ServerAddress<EcsTcpConfig>>());
+}
+
+fn external_runtime_app(handle: &tokio::runtime::Handle) -> App {
+    use crate::runtime::{NetworkRuntimeMode, NetworkRuntimeSettings};
+
+    let mut app = App::new();
+    app.insert_resource(NetworkRuntimeSettings {
+        mode: NetworkRuntimeMode::External(handle.clone()),
+        ..Default::default()
+    });
+    app.init_resource::<ReceivedPackets<Packet>>();
+    app
+}
+
+fn external_runtime_tcp_server(handle: &tokio::runtime::Handle) -> (App, std::net::SocketAddr) {
+    let mut app = external_runtime_app(handle);
+    app.add_plugins(ServerPlugin::<EcsTcpConfig>::bind("127.0.0.1:0"));
+    app.add_observer(server_packet_receive_system::<EcsTcpConfig>);
+    app.update();
+    let address = app
+        .world()
+        .resource::<ServerAddress<EcsTcpConfig>>()
+        .address();
+    (app, address)
+}
+
+#[test]
+fn dropping_one_app_releases_its_connections_and_preserves_shared_runtime_peers() {
+    use crate::runtime::NetworkRuntime;
+
+    let external = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (mut first, first_address) = external_runtime_tcp_server(external.handle());
+    let (mut second, second_address) = external_runtime_tcp_server(external.handle());
+    let mut client = external_runtime_app(external.handle());
+    client.add_plugins(ClientPlugin::<EcsTcpConfig>::connect(first_address));
+    client.add_observer(client_packet_receive_system::<EcsTcpConfig>);
+    client.update();
+    client
+        .world_mut()
+        .trigger(client::ConnectionRequestEvent::<EcsTcpConfig>::new(
+            second_address,
+        ));
+    wait_until(|| {
+        first.update();
+        second.update();
+        client.update();
+        first
+            .world()
+            .resource::<ServerConnections<EcsTcpConfig>>()
+            .len()
+            == 1
+            && second
+                .world()
+                .resource::<ServerConnections<EcsTcpConfig>>()
+                .len()
+                == 1
+            && client
+                .world()
+                .resource::<client::ClientConnections<EcsTcpConfig>>()
+                .len()
+                == 2
+    });
+    let first_connection = first
+        .world()
+        .resource::<ServerConnections<EcsTcpConfig>>()
+        .first()
+        .unwrap()
+        .clone();
+    let second_connection = second
+        .world()
+        .resource::<ServerConnections<EcsTcpConfig>>()
+        .first()
+        .unwrap()
+        .clone();
+    let client_connection = client
+        .world()
+        .resource::<client::ClientConnections<EcsTcpConfig>>()
+        .iter()
+        .find(|connection| connection.peer_addr() == second_address)
+        .unwrap()
+        .clone();
+
+    drop(first);
+    assert!(first_connection.is_closed());
+    assert!(matches!(
+        first_connection.send(Packet(1)),
+        Err(crate::connection::SendError::Closed(Packet(1)))
+    ));
+    let rebound = external
+        .block_on(tokio::net::TcpListener::bind(first_address))
+        .unwrap();
+    assert_eq!(rebound.local_addr().unwrap(), first_address);
+    assert!(second.world().resource::<NetworkRuntime>().is_available());
+    assert!(!second_connection.is_closed());
+    second_connection.send(Packet(24)).unwrap();
+    client_connection.send(Packet(42)).unwrap();
+    wait_until(|| {
+        second.update();
+        client.update();
+        second.world().resource::<ReceivedPackets<Packet>>().packets == [Packet(42)]
+            && client.world().resource::<ReceivedPackets<Packet>>().packets == [Packet(24)]
+    });
+}

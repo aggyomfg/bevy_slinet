@@ -14,14 +14,16 @@ use crate::serializers::serializer::Serializer;
 use crate::PacketLengthSerializer;
 
 /// Reads bytes from a continuous stream, without packet framing.
-#[async_trait]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
 pub trait ReadStream: Send + Sync + 'static {
     /// Fills the whole buffer, or returns a transport error.
     async fn read_exact(&mut self, buffer: &mut [u8]) -> io::Result<()>;
 }
 
 /// Writes bytes to a continuous stream, without packet framing.
-#[async_trait]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
 pub trait WriteStream: Send + Sync + 'static {
     /// Writes the whole buffer, or returns a transport error.
     async fn write_all(&mut self, buffer: &[u8]) -> io::Result<()>;
@@ -95,7 +97,8 @@ impl<W> FramedWriter<W> {
     }
 }
 
-#[async_trait]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
 impl<R: ReadStream> PacketReader for FramedReader<R> {
     async fn receive<ReceivingPacket, SendingPacket, S, LS>(
         &mut self,
@@ -178,7 +181,8 @@ impl<R: ReadStream> FramedReader<R> {
     }
 }
 
-#[async_trait]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
 impl<W: WriteStream> PacketWriter for FramedWriter<W> {
     async fn send<ReceivingPacket, SendingPacket, S, LS>(
         &mut self,

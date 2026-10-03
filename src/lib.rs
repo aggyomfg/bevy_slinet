@@ -12,7 +12,11 @@ use serializers::serializer::SerializerAdapter;
 pub mod client;
 pub mod connection;
 pub mod protocols;
+#[cfg(any(feature = "client", feature = "server"))]
+#[cfg_attr(target_family = "wasm", path = "runtime/wasm.rs")]
+pub mod runtime;
 mod scheduling;
+
 pub mod serializers;
 pub use scheduling::{NetworkSystems, SystemSets};
 #[cfg(feature = "server")]

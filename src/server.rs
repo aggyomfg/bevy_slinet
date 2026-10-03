@@ -21,7 +21,6 @@ pub type ServerSettings<Config> = NetworkSettings<ServerPlugin<Config>>;
 /// ```
 pub type ServerSystems<Config> = crate::NetworkSystems<ServerPlugin<Config>>;
 
-use std::future::Future;
 use std::marker::PhantomData;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
@@ -31,15 +30,16 @@ use bevy::{log, prelude::*};
 use tokio::select;
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::connection::tasks::{PacketCodecs, ReceiveTaskState, SendTaskState};
-use crate::connection::transport::PendingPacket;
+use crate::connection::tasks::{
+    run_connections, send_packets, PacketCodecs, ReceiveTaskState, SendTaskState,
+};
 use crate::connection::{lossy_channel, LossyReceiver, LossySender};
 use crate::connection::{
     ConnectionId, EcsConnection, NetworkQueueSettings, PacketForwarder, RawConnection,
     ReceiveLimits,
 };
 use crate::protocols::protocol::{
-    Listener, NetworkStream, PacketReader, PacketWriter, Protocol, QueueDropReason, ReceiveError,
+    Listener, NetworkStream, PacketReader, Protocol, QueueDropReason, ReceiveError,
 };
 use crate::serializers::serializer::Serializer;
 use crate::{PacketLengthSerializer, ServerConfig, SystemSets};
@@ -108,6 +108,7 @@ pub struct ServerPlugin<Config: ServerConfig> {
 impl<Config: ServerConfig> Plugin for ServerPlugin<Config> {
     fn build(&self, app: &mut App) {
         crate::scheduling::register_global_limits(app);
+        crate::runtime::register(app);
         app.init_resource::<EndpointReceiveLimits<Self>>()
             .insert_resource(ServerConnections::<Config>::new())
             // Startup: settings -> setup; warnings inspect the synchronized settings.
@@ -139,6 +140,15 @@ impl<Config: ServerConfig> Plugin for ServerPlugin<Config> {
             );
         // PreUpdate: all incoming events, using the protocol-specific graph below.
         configure_receive_systems::<Config>(app);
+        #[cfg(target_family = "wasm")]
+        app.add_systems(
+            PreUpdate,
+            publish_server_address::<Config>.before(ServerSystems::<Config>::RECEIVE),
+        );
+        app.configure_sets(
+            Startup,
+            ServerSystems::<Config>::SETUP.after(crate::runtime::RuntimeSetup),
+        );
     }
 }
 
@@ -217,17 +227,51 @@ struct DatagramPacketReceiver<Config: ServerConfig> {
     receiver: LossyReceiver<PacketReceiveEvent<Config>>,
 }
 
-impl<Config: ServerConfig> ServerPlugin<Config> {
-    fn setup_system(address: SocketAddr) -> impl Fn(Commands, EndpointSetup<Self>) {
-        #[cfg(target_family = "wasm")]
-        compile_error!("Why would you run a bevy_slinet server on WASM? If you really need this, please open an issue (https://github.com/aggyomfg/bevy_slinet/issues/new)");
+// Browser bind completes asynchronously, so publish its result in a later frame.
+#[cfg(target_family = "wasm")]
+#[derive(Resource)]
+struct PendingServerAddress<Config: ServerConfig> {
+    receiver: std::sync::Mutex<std::sync::mpsc::Receiver<SocketAddr>>,
+    _marker: PhantomData<Config>,
+}
 
-        move |commands, endpoint| {
+#[cfg(target_family = "wasm")]
+fn publish_server_address<Config: ServerConfig>(
+    pending: Option<Res<PendingServerAddress<Config>>>,
+    mut commands: Commands,
+) {
+    let Some(pending) = pending else { return };
+    let result = pending
+        .receiver
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .try_recv();
+    match result {
+        Ok(address) => {
+            commands.insert_resource(ServerAddress::<Config> {
+                address,
+                _marker: PhantomData,
+            });
+            commands.remove_resource::<PendingServerAddress<Config>>();
+        }
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            commands.remove_resource::<PendingServerAddress<Config>>();
+        }
+        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+    }
+}
+
+impl<Config: ServerConfig> ServerPlugin<Config> {
+    fn setup_system(
+        address: SocketAddr,
+    ) -> impl Fn(Commands, EndpointSetup<Self>, Res<crate::runtime::NetworkRuntime>) {
+        move |commands, endpoint, runtime| {
             Self::setup(
                 commands,
                 address,
                 endpoint.queues(),
                 endpoint.receive_limits(),
+                &runtime,
             );
         }
     }
@@ -237,6 +281,7 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
         address: SocketAddr,
         queues: NetworkQueueSettings,
         limits: ReceiveLimits,
+        runtime: &crate::runtime::NetworkRuntime,
     ) {
         let (incoming_tx, incoming_rx) = queues.incoming_channel();
         let (connection_sender, incoming_connections) = queues.incoming_channel();
@@ -252,12 +297,13 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
                 receiver: datagram_packet_rx,
             });
         }
-        // Wait for the listener's actual address before Startup completes.
+        // Native startup waits for bind; browsers must return to their event loop.
         let (listener_address_tx, listener_address_rx) = std::sync::mpsc::sync_channel(1);
 
-        Self::run_async(move || async move {
-            tokio::spawn(Self::process_connections(
+        runtime.spawn_local(move || async move {
+            crate::runtime::spawn(Self::process_connections(
                 incoming_connections,
+                queues.receive_capacity,
                 datagram_packet_tx,
                 incoming_tx.clone(),
                 disconnect_sender,
@@ -274,33 +320,19 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
             .await;
         });
 
-        // Clients may connect right after Startup, so the listener must exist by then.
+        #[cfg(target_family = "wasm")]
+        commands.insert_resource(PendingServerAddress::<Config> {
+            receiver: std::sync::Mutex::new(listener_address_rx),
+            _marker: PhantomData,
+        });
+        // Native clients may connect right after Startup, so bind must finish first.
+        #[cfg(not(target_family = "wasm"))]
         if let Ok(local_addr) = listener_address_rx.recv() {
             commands.insert_resource(ServerAddress::<Config> {
                 address: local_addr,
                 _marker: PhantomData,
             });
         }
-    }
-
-    // Build the future on its runtime thread: custom listeners need not be Send.
-    fn run_async<F>(make_future: impl FnOnce() -> F + Send + 'static)
-    where
-        F: Future<Output = ()>,
-    {
-        std::thread::spawn(move || {
-            let runtime = match tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(runtime) => runtime,
-                Err(err) => {
-                    log::error!("Failed to create tokio runtime: {}", err);
-                    return;
-                }
-            };
-            runtime.block_on(make_future());
-        });
     }
 
     async fn accept_connections(
@@ -326,7 +358,23 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
         let pending = Arc::new(tokio::sync::Semaphore::new(queues.receive_capacity.max(1)));
         loop {
             select! {
-                Ok(stream) = listener.accept() => {
+                result = listener.accept() => {
+                    let stream = match result {
+                        Ok(stream) => stream,
+                        Err(error) if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::Interrupted
+                                | std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::ConnectionReset
+                        ) => {
+                            tokio::task::yield_now().await;
+                            continue;
+                        }
+                        Err(error) => {
+                            log::error!("Listener at {} failed to accept: {error}", listener.address());
+                            break;
+                        }
+                    };
                     let Ok(permit) = Arc::clone(&pending).try_acquire_owned() else {
                         drop(stream);
                         continue;
@@ -337,7 +385,7 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
                     let limits = limits.clone();
                     let incoming = incoming.clone();
                     let connection_sender = connection_sender.clone();
-                    tokio::spawn(async move {
+                    crate::runtime::spawn(async move {
                         let _permit = permit;
                         ConnectedTransport::<Config>::establish(
                             stream,
@@ -358,20 +406,20 @@ impl<Config: ServerConfig> ServerPlugin<Config> {
     }
 
     async fn process_connections(
-        mut incoming_connections: Receiver<ConnectedTransport<Config>>,
+        incoming_connections: Receiver<ConnectedTransport<Config>>,
+        setup_limit: usize,
         datagram_packets: LossySender<PacketReceiveEvent<Config>>,
         incoming: Sender<IncomingMessage<Config>>,
         disconnect_sender: Sender<SocketAddr>,
     ) {
-        while let Some(connection) = incoming_connections.recv().await {
-            connection
-                .run(
-                    datagram_packets.clone(),
-                    incoming.clone(),
-                    disconnect_sender.clone(),
-                )
-                .await;
-        }
+        run_connections(incoming_connections, setup_limit, |connection| {
+            connection.run(
+                datagram_packets.clone(),
+                incoming.clone(),
+                disconnect_sender.clone(),
+            )
+        })
+        .await;
     }
 }
 
@@ -445,7 +493,7 @@ impl<Config: ServerConfig> ConnectedTransport<Config> {
         };
         let transport = self.ecs_connection.transport().clone();
         let (send_error_tx, send_error_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(Self::receive_packets(
+        crate::runtime::spawn(Self::receive_packets(
             read,
             self.ecs_connection,
             ReceiveTaskState {
@@ -460,7 +508,7 @@ impl<Config: ServerConfig> ConnectedTransport<Config> {
             incoming,
             disconnect_sender,
         ));
-        tokio::spawn(Self::send_packets(
+        crate::runtime::spawn(send_packets(
             write,
             PacketCodecs {
                 serializer,
@@ -552,48 +600,6 @@ impl<Config: ServerConfig> ConnectedTransport<Config> {
         }
         if let Err(err) = disconnect_sender.send(ecs_conn.peer_addr).await {
             log::debug!("({id:?}) Listener closed: {err}");
-        }
-    }
-
-    async fn send_packets(
-        mut write: impl PacketWriter,
-        codecs: PacketCodecs<ServerSerializer<Config>, Config::LengthSerializer>,
-        state: SendTaskState<Config::ServerPacket, <Config::Protocol as Protocol>::Handle>,
-    ) {
-        let PacketCodecs {
-            serializer,
-            packet_length_serializer,
-        } = codecs;
-        let SendTaskState {
-            mut packets_rx,
-            disconnect_task,
-            id,
-            transport,
-            send_error,
-        } = state;
-        let _guard = disconnect_task.clone().drop_guard();
-        let sending = async {
-            while let Some(packet) = packets_rx.recv().await {
-                let mut pending = PendingPacket::new(transport.clone());
-                if disconnect_task.is_cancelled() {
-                    break;
-                }
-                log::trace!("({id:?}) Sending packet {packet:?}");
-                let result = write
-                    .send(packet, Arc::clone(&serializer), &*packet_length_serializer)
-                    .await;
-                pending.finish(&result);
-                if let Err(err) = result {
-                    log::error!("({id:?}) Error sending packet: {err}");
-                    let _ = send_error.send(err);
-                    break;
-                }
-            }
-        };
-        tokio::select! {
-            biased;
-            () = disconnect_task.cancelled() => {},
-            () = sending => {},
         }
     }
 }
@@ -721,6 +727,94 @@ fn receive_datagram_packets<Config: ServerConfig>(
                 commands.trigger(packet);
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "protocol_tcp", feature = "serializer_bitcode_serde"))]
+mod listener_tests {
+    use super::*;
+    use crate::protocols::tcp::TcpNetworkStream;
+    use crate::serializers::bitcode_serde::BitcodeSerdeSerializer;
+    use crate::serializers::packet_length_serializer::LittleEndian;
+    use crate::serializers::serializer::SerializerAdapter;
+    use std::io::{self, ErrorKind};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static ACCEPTS: AtomicUsize = AtomicUsize::new(0);
+
+    struct ErrorListener(SocketAddr);
+
+    #[async_trait::async_trait]
+    impl Listener for ErrorListener {
+        type Stream = TcpNetworkStream;
+
+        async fn accept(&self) -> io::Result<Self::Stream> {
+            let error = match ACCEPTS.fetch_add(1, Ordering::SeqCst) {
+                0 => ErrorKind::Interrupted,
+                1 => ErrorKind::ConnectionAborted,
+                2 => ErrorKind::ConnectionReset,
+                _ => ErrorKind::PermissionDenied,
+            };
+            Err(error.into())
+        }
+
+        fn address(&self) -> SocketAddr {
+            self.0
+        }
+    }
+
+    struct ErrorProtocol;
+
+    #[async_trait::async_trait]
+    impl Protocol for ErrorProtocol {
+        type Handle = ();
+        type Listener = ErrorListener;
+        type ServerStream = TcpNetworkStream;
+        type ClientStream = TcpNetworkStream;
+
+        async fn bind(address: SocketAddr) -> io::Result<Self::Listener> {
+            Ok(ErrorListener(address))
+        }
+    }
+
+    struct Config;
+
+    impl ServerConfig for Config {
+        type ClientPacket = u8;
+        type ServerPacket = u8;
+        type Protocol = ErrorProtocol;
+        type EncodeError = bitcode::Error;
+        type DecodeError = bitcode::Error;
+        type LengthSerializer = LittleEndian<u32>;
+
+        fn build_serializer() -> SerializerAdapter<u8, u8, bitcode::Error, bitcode::Error> {
+            SerializerAdapter::ReadOnly(Arc::new(BitcodeSerdeSerializer))
+        }
+    }
+
+    #[tokio::test]
+    async fn listener_retries_transient_errors_and_stops_on_fatal_error() {
+        let queues = NetworkQueueSettings::default();
+        let (incoming, _messages) = queues.incoming_channel();
+        let (connections, _accepted) = queues.incoming_channel();
+        // Keep the channel open and empty, as it is before the first connection.
+        let (_disconnects, incoming_disconnects) = queues.incoming_channel();
+        let (address_tx, _address_rx) = std::sync::mpsc::sync_channel(1);
+        let task = ServerPlugin::<Config>::accept_connections(
+            ([127, 0, 0, 1], 1234).into(),
+            queues,
+            ReceiveLimits::default(),
+            incoming,
+            connections,
+            incoming_disconnects,
+            address_tx,
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                .await
+                .is_ok()
+        );
+        assert_eq!(ACCEPTS.load(Ordering::SeqCst), 4);
     }
 }
 
