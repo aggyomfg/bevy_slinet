@@ -34,4 +34,5 @@ TCP/UDP transports are native-only. See the [configuration guide](https://github
 | `0.17`         | `0.18`       |
 | `0.18`         | `0.19`       |
 | `0.19`         | `0.19`       |
-| `main`         | `0.19`       |
+| `0.20`         | `0.20`       |
+| `main`         | `0.20`       |
